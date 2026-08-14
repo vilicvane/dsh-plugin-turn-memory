@@ -111,12 +111,21 @@ debug writes pipeline traces to $DSH_HOME/turn-memory-debug.log.
 - Requires the fork and spawn subagent providers (both ship with
   @deepseek-ai/dsh-base).
 
-## Related skills
+## Bundled skills
 
-Operational knowledge for running this plugin (restarting the dsh web server,
-inspecting session logs, plugin configuration and behavior) lives in skills —
-see dsh-web-restart, dsh-session-log-inspect, and dsh-turn-memory in your
-skills directory.
+The plugin bundles its operational knowledge as runtime skills (rank 250),
+registered when the plugin loads:
+
+- dsh-web-restart — restarting the dsh web server after profile/plugin
+  changes.
+- dsh-session-log-inspect — inspecting session logs (zstd decompression,
+  event vocabulary, surface replacement checks).
+- dsh-turn-memory — this plugin's configuration, behavior, and known
+  degradation paths.
+
+They appear in the skill catalog as soon as the plugin loads. Project-level
+skills override them; user-level file skills with the same names are
+shadowed.
 
 ## License
 

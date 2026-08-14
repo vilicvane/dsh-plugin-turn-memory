@@ -46,7 +46,7 @@ function dbg(message) {
 const NL = String.fromCharCode(10);
 
 const name = 'turn-memory';
-const inject = ['subagents', 'sessions', 'systemPrompt', 'tools'];
+const inject = ['subagents', 'sessions', 'systemPrompt', 'tools', 'skills'];
 
 /** Format version stamped into every summary checkpoint source. */
 const TURN_SUMMARY_VERSION = 3;
@@ -299,6 +299,94 @@ function buildTurnTranscript(session, span, settings) {
   return lines.join(NL);
 }
 
+/** Operational skills bundled with the plugin (runtime rank 250; project-level skills override). */
+const PLUGIN_SKILLS = [
+  {
+    name: 'dsh-web-restart',
+    description: '重启本机 dsh web 服务器以加载 profile/插件变更。USE FOR: 修改了插件或 profile 配置需要生效；服务器异常需要重启；涉及 3080 端口、restart-web.sh、web-restart.log 时。',
+    content: [
+      '# 重启 dsh web 服务器',
+      '',
+      '服务器 = dsh web，默认监听 http://127.0.0.1:3080，agent 会话运行在服务器进程内。',
+      '',
+      '## 铁律',
+      '',
+      '- 绝不在自己当前 turn 内直接 kill 服务器——会切断自己的回复流。必须用延迟脱离脚本，让当前回复先完整送达。',
+      '- 重启会丢失所有插件内存态（turn-memory 的待替换摘要、未落盘状态）；这是预期降级，不补做。',
+      '- 页面一般不需要手动刷新：客户端自动重连；仅当连接错误提示持续不消失时才刷新。',
+      '',
+      '## 流程',
+      '',
+      '1. 复用现成脚本 $DSH_HOME/restart-web.sh（30 秒延迟 → kill 旧进程 → 重新拉起 → 健康检查）。没有该脚本时按同样结构写一个：sleep 30 → kill 旧进程（pgrep 匹配）→ 等待退出 → nohup 重新拉起 → curl 健康检查，全程输出追加到 $DSH_HOME/web-restart.log。',
+      '2. 调度方式（从 bash 工具）：',
+      '',
+      '   cd "$DSH_HOME" && setsid nohup ./restart-web.sh >/dev/null 2>&1 &',
+      '',
+      '3. 脚本启动 30 秒后才动手——期间正常完成当前回复。',
+      '4. 验证：tail $DSH_HOME/web-restart.log 应看到 relaunching dsh web 与 server healthy on http://127.0.0.1:3080/；',
+      "   pgrep -f 'dsh web' 拿到新 PID（其启动时间应晚于 relaunch 时间）。",
+      '',
+      '## 注意',
+      '',
+      '- 服务器经沙箱化 bash 用 setsid 启动会继承沙箱：/tmp 对该服务器进程是私有的。跨进程可见的日志/文件必须放 workspace 下。',
+      '- 服务器 stdout/stderr 经 nohup 重定向汇入 $DSH_HOME/web-restart.log。',
+    ].join(NL),
+  },
+  {
+    name: 'dsh-session-log-inspect',
+    description: '检查 dsh 会话持久化日志与事件。USE FOR: 核对摘要/替换节点、诊断 turn 边界、解压 session.jsonl.zstd、统计事件类型、重建 surface 折叠时。',
+    content: [
+      '# 检查 dsh 会话日志',
+      '',
+      '会话日志路径：$DSH_SESSION_JSONL（如 $DSH_HOME/sessions/--home-vilicvane--/<session-id>/session.jsonl.zstd）。',
+      '',
+      '## 解压（唯一验证可行的方式）',
+      '',
+      'zstd 多帧追加格式（每次 append 一个 frame）。fflate 只支持 deflate 系；zstd CLI 未必安装；python 未必有 zstandard 模块。用 python3 ctypes 调系统 libzstd.so.1 流式解压：',
+      '',
+      '- ZSTD_createDStream / ZSTD_initDStream / ZSTD_decompressStream / ZSTD_freeDStream；',
+      '- InBuf/OutBuf 结构体：{src/dst: c_void_p, size: c_size_t, pos: c_size_t}；',
+      '- 循环直到 inb.pos >= len(data) 且 outb.pos == 0 才停；每帧 ret==0 只表示当前帧完成，必须继续喂下一帧（早期踩过只解出第一帧的坑）。',
+      '',
+      '## 事件要点',
+      '',
+      '- 存储是折叠格式：chunk 事件合批成行，存储行数不等于事件数；内存中的 events 数组才是 seq==index 的完整事件。',
+      '- 常用事件：turn/start{turn}、turn/end{turn, reason}、user/message（即 UserMessage，带 source）、assistant/message{turn, step, message}、tool/call{callId, name, arguments}、tool/result{message.content[0]=ToolResultBlock{toolCallId, isError}}。',
+      '- surface 只有三种类型：user/message、assistant/message、tool/result；tool/call 不在 surface 上（配平校验必须遍历日志区间而非 surface 节点）。',
+      '- 替换节点 = user/message + surfaceOp {op: replace, start, end} + source 标记（plugin: turn-memory 或 compact）。',
+      '- 判断某 turn 是否已被替换：搜索 source.plugin 标记，不要用 seq 范围（替换节点的 seq 大于该 turn 的 turn/end seq）。',
+      '- 事件类型统计：解压后按行 json.loads，Counter(e[type])。',
+    ].join(NL),
+  },
+  {
+    name: 'dsh-turn-memory',
+    description: 'dsh-plugin-turn-memory 插件（turn 级摘要+延迟替换+expand_turn 召回）的运维、配置与行为约定。USE FOR: turn 摘要未生成/未替换、调试日志、插件修改、expand_turn 行为、turn-memory 相关排障时。',
+    content: [
+      '# dsh-plugin-turn-memory 运维',
+      '',
+      '本技能随插件分发（运行时注册，rank 250）。项目级技能（<项目>/.dsh/skills 或 <项目>/.agents/skills）可覆盖同名技能；用户级文件技能会被本内嵌版本遮蔽。',
+      '',
+      '## 配置（profile cordis.patch.yml 的 turn-memory 行）',
+      '',
+      '- debug: false（默认）。开 true 后管道轨迹写 $DSH_HOME/turn-memory-debug.log。用文件级日志是因为 cordis logger 只写内存缓冲、不落盘，且 /tmp 对服务器进程私有。',
+      '- 其余键与默认：summaryTimeoutMs 120000、recallTimeoutMs 180000、cheapProvider deepseek-official、cheapModel deepseek-chat、cheapMaxTokens 4096、recentTurnThreshold 3、maxRawChars 200000、toolResultCapChars 20000、maxRecallDepth 4。',
+      '',
+      '## 行为约定',
+      '',
+      '- turn 结束 → 主模型 fork 生成流水摘要（Timeline/Current State/Open Questions and Pending Input/Next Step）；下一条用户消息的 pre-step → 上一 turn 被 <turn-summary turn=N version=N> checkpoint 替换；最新用户消息永远逐字保留。',
+      '- 某 turn 没有替换节点的三种可能：(1) 该 turn 内发生过中途压缩（有意跳过）；(2) 摘要 fork 失败/超时；(3) 服务器重启（内存态丢失、fork 被中止）。重启恢复：根 agent 重建时，最后一个无 checkpoint 的已完成 turn 会被补摘要一次；更早的空缺保持原文。',
+      '- 替换节点 source = {kind: plugin, plugin: turn-memory, turn, turnSummaryId, version}。',
+      '- expand_turn 三档：fork（主模型延续、吃暖前缀、适合近期）、subagent（便宜模型定向总结）、raw（原文直读、最后手段）；auto 按 recentTurnThreshold 路由，模型自选。',
+      '- 摘要与操作说明的分工：摘要只记发生了什么/决定了什么；可复用操作步骤放技能，摘要里只留名字引用。',
+      '',
+      '## 修改插件后',
+      '',
+      '改 index.js → node --check 语法校验 → 走 dsh-web-restart 技能重启生效。',
+      '冒烟测试环境：headless profile $DSH_HOME/profiles/test-turn-memory（base + headless 启动 + 两轮测试驱动器 dsh-plugin-test-runner）。',
+    ].join(NL),
+  },
+];
+
 function apply(ctx, config) {
   const settings = resolveSettings(config);
   debugEnabled = settings.debug === true;
@@ -308,6 +396,15 @@ function apply(ctx, config) {
   const states = new Map();
 
   ctx.systemPrompt.section({ name: 'turn-memory', order: 120, text: MEMORY_SECTION });
+
+  for (const skill of PLUGIN_SKILLS) {
+    ctx.skills.register({
+      name: skill.name,
+      description: skill.description,
+      source: 'runtime',
+      content: skill.content,
+    });
+  }
 
   ctx.tools.register(defineTool({
     name: 'expand_turn',
@@ -613,19 +710,43 @@ function apply(ctx, config) {
     }
   });
 
+  /**
+   * Whether one surface node is another turn's summary checkpoint. A landed
+   * checkpoint's seq falls inside the NEXT turn's span (the replacement runs
+   * at that turn's first pre-step), so the plain seq-range walk would shadow
+   * the previous turn's checkpoint with this turn's replacement and silently
+   * erase its summary from the surface. Foreign checkpoints are excluded from
+   * the replaced span; a foreign checkpoint in the middle still makes the span
+   * non-contiguous and skips the replacement.
+   */
+  function foreignCheckpointOf(event, ownTurn) {
+    if (event === undefined || event.type !== 'user/message') return false;
+    const source = event.data?.source;
+    return source?.kind === 'plugin' && source.plugin === SUMMARY_MARKER_PLUGIN && typeof source.turn === 'number' && source.turn !== ownTurn;
+  }
+
   /** Replace one completed turn with its summary checkpoint; returns false when skipped. */
   function tryReplace(session, item) {
     const events = session.events;
     const spanSeqs = [];
+    const skippedForeign = [];
     let firstIdx = -1;
     let lastIdx = -1;
     session.surface.nodes.forEach((seq, index) => {
       if (seq > item.startSeq && seq <= item.endSeq) {
+        const event = events[seq];
+        if (foreignCheckpointOf(event, item.turn)) {
+          skippedForeign.push(seq);
+          return;
+        }
         spanSeqs.push(seq);
         if (firstIdx < 0) firstIdx = index;
         lastIdx = index;
       }
     });
+    if (skippedForeign.length > 0) {
+      dbg('tryReplace: turn ' + item.turn + ' excluding foreign turn-summary checkpoints ' + skippedForeign.join(',') + ' from span');
+    }
     if (spanSeqs.length === 0) {
       dbg('tryReplace: turn ' + item.turn + ' SKIP no surface nodes in span (' + item.startSeq + ', ' + item.endSeq + ']');
       return false;

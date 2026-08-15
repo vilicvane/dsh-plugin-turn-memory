@@ -3,7 +3,7 @@
 Turn-granular context memory for DeepSeek Harness: step 1 of a two-step
 context-compression plan.
 
-When a root session's turn completes, the turn is only marked pending — no
+When a top-level (root or resumed fork) session's turn completes, the turn is only marked pending — no
 summary runs yet. On the next turn, the runtime context carries a pending
 notice and the main agent itself — the current context, with the user's new
 message in view — composes the previous turn's whole-turn checkpoint
@@ -41,8 +41,8 @@ its request verbatim; this is the call the pending notice asks for. The
 checkpoint text is composed by the current context itself — the composing
 rules live in the bundled dsh-compact-turn skill and the text arrives as
 the tool's summary argument — so no fork or subagent summarizes the span.
-For the current-turn mode the tool validates the range (root session,
-tool-pair balance) and runs exclusively so the compaction transaction never
+For the current-turn mode the tool validates the range (tool-pair
+balance) and runs exclusively so the compaction transaction never
 races another tool call; the transaction itself — lock, whole-surface
 stability, shrink check, durability — stays in the mounted compaction
 backend through compactRegionWithSummary, and backends without that entry
@@ -191,11 +191,17 @@ best-effort cache retention of "a few hours to a few days" (lower bound).
 - The replacement is a user/message with the turn-memory source marker
   (turn number, summary id, format version). No custom session event type
   is introduced, so logs stay loadable by unmodified harnesses.
-- Restart recovery: when a root agent is (re)created, the last completed
+- Restart recovery: when a top-level agent is (re)created, the last completed
   turn that has no summary checkpoint is marked pending again, and the
   resumed main agent composes its summary at the start of the next turn
   (non-blocking). Older gaps stay raw by design.
-- Only root sessions are summarized; subagent sessions are ignored.
+- Turn-memory eligibility is decided by the durable session origin, not by
+  runtime ownership: sessions whose origin is not subagent — the main
+  session and forks, live or resumed — get the full turn-memory experience
+  (pending registration, notices, compact_turn). One-shot recall subagents
+  (origin subagent) are excluded from the pending machinery so their
+  throwaway sessions never cost a fallback fork; any agent may still
+  compact its own session with the current-turn mode.
 - Requires the fork and spawn subagent providers for the fallback fork and
   expand_turn recall (both ship with @deepseek-ai/dsh-base).
 

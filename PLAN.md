@@ -507,3 +507,31 @@ maxRawChars 500000 / toolResultCapChars 20000 / maxRecallDepth 4。
 - 本机 profile(cordis.patch.yml)已把 prefixDumpDir 指向本项目 .tmp/
   (.gitignore 排除);生效需 dsh web 重启,由下一 turn 的压缩以文件存在为证。
 - 状态:重启调度中;未提交。
+
+## 15. fork 算根会话(turn 25)
+
+- 现象:用户在 fork 会话里继续对话,compact_turn 报 only root sessions can
+  compact——插件按持久化 header 的 parentSession 判根,fork 的 header 带
+  parentSession,被误判为子会话。
+- 根因:dsh-agent 的 AgentRegistry.roots() 判运行时归属(顶层 agent = 创建时
+  无 owning agent context);resumed fork 的 header 保留 fork 血缘但运行时是
+  顶层 agent,应算根会话(agent-registry 注释原文:a resumed fork may still
+  be a root)。
+- 修复:index.ts 新增 isRuntimeRoot(agent)(ctx.agents.roots().includes
+  (agent),失败回退 header 判断);6 处按 header 的判断(turn 内压缩提醒、
+  pending 提示、compact_turn 门槛、idle 登记、agent/created 恢复、pre-step)
+  全部换成运行时判断。compact_turn 的根会话门槛直接删除(任何 agent 可压缩
+  自己的会话,turn 内模式对一次性 live child 无害);pending 机制仍只对运行时
+  顶层 agent 开放,避免为一次性召回 subagent 浪费 fork 兜底模型调用。
+- 文档:README(root-ness 段落、两处措辞)、包内运维技能(行为约定新增一条)
+  同步。
+- 验证:typecheck + 32/32 通过;线上验证靠重启后本 fork 会话下一 turn 开场
+  出现 pending 提示(说明 fork 被当根会话登记)且 compact_turn 可用。
+- turn 26 修正:线上验证发现 turn 25 的运行时归属判定对 live fork 失效——
+  live fork 的运行时 agent 被父 agent 拥有,ctx.agents.roots() 不含它,恢复
+  登记与 pending 全跳过(探针 compact_turn(turn=25) 报 no pending turn
+  record;fork header 无 origin 字段,召回 subagent 均带 origin subagent)。
+  改为按持久化 origin 判定:isRuntimeRoot 改名 isTurnMemorySession,
+  origin 非 subagent 即享完整待遇(主会话与 fork 含 live/resumed),5 处
+  调用点改名(486/518/886/952/1138)。用户重启后本 fork 下一 turn 开场出现
+  pending 提示、compact_turn(turn=26) 成功——修复生效的直接证据。

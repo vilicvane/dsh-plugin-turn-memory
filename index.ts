@@ -390,6 +390,7 @@ const PLUGIN_SKILLS = [
       '',
       '## 行为约定',
       '',
+      '- turn-memory 资格按持久化 origin 判定，不看运行时归属：origin 非 subagent 的会话（主会话与 fork，无论 live 还是 resumed）都享受完整待遇——pending 登记、压缩提醒、compact_turn 全模式可用；仅一次性召回 subagent（origin 为 subagent）不参与 pending 机制（避免为一次性会话浪费 fork 兜底模型调用），compact_turn 的 turn 内模式则任何 agent 都可以对自己会话用。',
       '- turn 结束 → 该 turn 登记为 pending，零模型调用、不生成摘要；下一条用户消息到来时，runtime 上下文出现 pending 提示，主 agent（当前上下文）先按 dsh-compact-turn 技能撰写上一 turn 的整 turn checkpoint（新消息是保留取舍的透镜；上一 turn 的用户原话必须逐字进摘要，或写 <verbatim kind="turn-prompt"/> 由替换时自动还原），再用 compact_turn(turn=N, summary) 立即把上一 turn（含其用户消息）替换为 <turn-summary turn=N version=N> checkpoint；最新用户消息永远逐字保留。主 agent 整个下一 turn 都没做 → 该 turn 结束时由主模型 fork 兜底补摘要（晚一个 turn，再下一个 pre-step 落地）。后验修正用自然语言括注（"我觉得这样可能不错。（但是后来发现不对）"），不用方括号标记；逐字保留维持上下文直觉的措辞（用户原话、自己做出的承诺、后续可能被引用的表述）。',
       '- 某 turn 长时间没有替换节点的可能：(1) 主 agent 未调用 compact_turn 或调用失败 → 下一 turn 结束时 fork 兜底，兜底摘要在再下一个 pre-step 落地；(2) 服务器重启（内存态丢失）→ 恢复时最后一个无 checkpoint 的已完成 turn 重新登记 pending，由恢复后的主 agent 在下一条用户消息到来时撰写。',
       '- compact_turn 模型工具：长 turn 中主动压缩当前 turn 已完成部分（turn 起始消息之后、当前 step 之前），只留起始消息逐字、当前 step 不动；独占执行保证压缩事务期间 surface 稳定。摘要由当前上下文（主模型自身）撰写——撰写规则在 dsh-compact-turn 技能里，随 summary 参数传入；工具只做范围/配平校验，事务仍走后端 compactRegionWithSummary（锁/稳定性/收缩校验全部复用）；后端不支持该入口时回退其自带摘要。带 turn 参数的整 turn 模式：把已完成 turn 的整段（含用户消息）替换为带 turn-memory 标记的 turn 摘要 checkpoint（复用 tryReplace 直接落盘，不走压缩后端、无收缩校验）。turn 内压缩产生的 checkpoint 会纳入该 turn 最终的 turn 摘要替换（收敛合并，不是原文重喂）；后续再次压缩时旧 checkpoint 以一条浓缩摘要参与合并。',
@@ -451,6 +452,23 @@ function apply(ctx, config) {
   /** sessionId -> { items: Map<turn, PendingSummary>, lastTurn: number } */
   const states = new Map();
 
+  /**
+   * Full-treatment test for the turn-memory machinery. Decided by durable
+   * origin, not runtime ownership: the main conversation and forks qualify —
+   * forks are continuable user-facing conversations, and a fork's header
+   * carries no `origin` field even while a live fork agent is owned by its
+   * parent agent at runtime (the agent registry's roots() only covers
+   * top-level agents, so it misclassifies live forks). Only subagent-origin
+   * sessions — one-shot recall children — are excluded.
+   */
+  function isTurnMemorySession(agent) {
+    try {
+      return agent !== undefined && agent.session?.header?.origin !== 'subagent';
+    } catch {
+      return false;
+    }
+  }
+
   ctx.systemPrompt.section({ name: 'turn-memory', order: 120, text: MEMORY_SECTION });
 
   // Conditional tail reminder for long turns: a runtime-context contribution
@@ -465,7 +483,7 @@ function apply(ctx, config) {
     text: (context) => {
       try {
         const session = context.agent?.session;
-        if (session === undefined || session.header.parentSession !== undefined) return '';
+        if (session === undefined || !isTurnMemorySession(context.agent)) return '';
         const turnStart = findLastEvent(session, 'turn/start');
         if (turnStart === undefined) return '';
         const turnEnd = findLastEvent(session, 'turn/end');
@@ -497,7 +515,7 @@ function apply(ctx, config) {
     text: (context) => {
       try {
         const session = context.agent?.session;
-        if (session === undefined || session.header.parentSession !== undefined) return '';
+        if (session === undefined || !isTurnMemorySession(context.agent)) return '';
         const state = states.get(session.id);
         if (state === undefined || state.items.size === 0) return '';
         const turnStart = findLastEvent(session, 'turn/start');
@@ -609,7 +627,11 @@ function apply(ctx, config) {
       const agent = exec.agent;
       if (agent === undefined) return 'compact_turn: no owning agent session';
       const session = agent.session;
-      if (session.header.parentSession !== undefined) return 'compact_turn: only root sessions can compact';
+      // Any agent may compact its own session — the current context composes
+      // the checkpoint itself and the backend runs on this session's own
+      // surface. Resumed forks run as top-level agents and are naturally
+      // covered; live one-shot children compacting their own throwaway
+      // context is harmless.
       const turnArg = typeof args.turn === 'number' && Number.isInteger(args.turn) ? args.turn : undefined;
       if (turnArg !== undefined) {
         // Whole-turn mode: the current context composed the checkpoint for a
@@ -861,7 +883,7 @@ function apply(ctx, config) {
     try {
       const session = agent.session;
       dbg('idle: agent status idle, session=' + String(session.id) + ' parentSession=' + String(session.header.parentSession));
-      if (session.header.parentSession !== undefined) return;
+      if (!isTurnMemorySession(agent)) return;
       const lastEnd = findLastEvent(session, 'turn/end');
       if (lastEnd === undefined) return;
       const turn = lastEnd.data.turn;
@@ -927,7 +949,7 @@ function apply(ctx, config) {
   ctx.on('agent/created', ({ agent }) => {
     try {
       const session = agent.session;
-      if (session.header.parentSession !== undefined) return;
+      if (!isTurnMemorySession(agent)) return;
       const lastEnd = findLastEvent(session, 'turn/end');
       if (lastEnd === undefined) return;
       const turn = lastEnd.data.turn;
@@ -1113,7 +1135,7 @@ function apply(ctx, config) {
   ctx.on('agent/pre-step', async ({ agent, messages, signal }, next) => {
     try {
       const session = agent.session;
-      const isRoot = session.header.parentSession === undefined;
+      const isRoot = isTurnMemorySession(agent);
       const state = isRoot ? states.get(session.id) : undefined;
       const messageKinds = Array.isArray(messages) ? messages.map((message) => message?.source?.kind).join(',') : 'not-array';
       dbg('pre-step: session=' + String(session.id) + ' isRoot=' + isRoot + ' state=' + (state === undefined ? 'MISSING' : 'present(' + state.items.size + ')') + ' messages=' + messageKinds);

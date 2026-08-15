@@ -114,8 +114,8 @@ function buildSummaryPrompt(turn) {
     '- If the turn ended waiting for the user, include the pending question and ALL its options VERBATIM as a timeline entry — the next answer will likely refer to these options by their wording.',
     '- End the timeline with the single next action when one is clear.',
     '- Preserve VERBATIM whatever keeps your intuition about the current context: the user\'s exact wording and emphasis, your own commitments and offers, and any phrasing a later turn is likely to refer back to. Commands, paths, identifiers, and error strings stay verbatim too. A summary that loses the wording loses the thread.',
-    '- Preserve read-in material (code, docs, config, output) that this turn relied on or that future turns will likely need, verbatim enough to avoid re-reading — judge relevance broadly: include what you expect to help later, not only what was used right now. For each kept passage, add ONE short line saying why it matters and what it is for. Do not duplicate what an earlier checkpoint, a loaded skill, or another entry of this summary already covers.',
-    '- Large verbatim passages: do not reproduce a passage longer than roughly 800 characters into the summary. Emit one placeholder tag instead — <verbatim kind="turn-prompt"/> for the message that started this turn, <verbatim kind="tool-result" callId="CALL_ID"/> for a tool result (the call id is visible on the tool-result block) — with ONE short line beside it saying what the passage is and why it matters. The harness replaces every tag with the original text when the checkpoint lands; tags exist only to save output tokens, never to omit content.',
+    '- Preserve read-in material (code, docs, config, output) as paths, not content: inline only short key snippets (a critical line, a value); for anything longer record the exact path plus ONE short line saying what it is and why it matters, and re-read the file with the read tool when the content is needed again — copied text goes stale, the file stays current. Do not duplicate what an earlier checkpoint, a loaded skill, or another entry of this summary already covers.',
+    '- The message that started this turn: reproduce it verbatim as the first timeline entry; when it is long, write the placeholder tag <verbatim kind="turn-prompt"/> instead, with one short line beside it saying what the message asks and why it matters. This summary lands as a whole-turn replacement, which swaps the tag back to the original message — the tag only saves output tokens, never drops content.',
     '- Name skills and procedures instead of restating their steps ("restarted dsh web per the dsh-web-restart skill"); when unsure of the name, check the skill catalog with the skill tool.',
     '- Output only the summary text. Do not call any tool unless you must verify details of the turn you are summarizing; when detail is uncertain, verify it with the expand_turn tool (mode raw) rather than guessing.',
   ].join(NL);
@@ -133,7 +133,7 @@ const MEMORY_SECTION = [
   '',
   'During a long turn, compact proactively with the compact_turn tool before context pressure forces the automatic compactor. Compose the checkpoint text yourself from your current context, following the dsh-compact-turn skill, and pass it to compact_turn as the summary argument; the tool replaces the completed part of the current turn (everything after the turn-starting message, up to the current step) with that checkpoint. The turn-starting message and the current step stay verbatim.',
   '',
-  'When the runtime context carries a pending-turn notice (a completed previous turn has no summary checkpoint yet), compose that turn\'s whole-turn checkpoint FIRST, following the dsh-compact-turn skill: the message that just opened this turn is your lens for what the previous turn must retain, and the previous turn\'s own user message must be preserved verbatim inside the checkpoint (a <verbatim kind="turn-prompt"/> placeholder resolves to the original text when the checkpoint lands). Then call compact_turn with the turn number and the checkpoint text as the summary argument — the call replaces the entire previous turn on the surface, its user message included, and frees context for the rest of this turn.',
+  'When the runtime context carries a pending-turn notice (a completed previous turn has no summary checkpoint yet), compose that turn\'s whole-turn checkpoint FIRST, following the dsh-compact-turn skill: the message that just opened this turn is your lens for what the previous turn must retain, and the previous turn\'s own user message must be preserved verbatim inside the checkpoint (or write <verbatim kind="turn-prompt"/> and the original message is restored when the checkpoint lands). Then call compact_turn with the turn number and the checkpoint text as the summary argument — the call replaces the entire previous turn on the surface, its user message included, and frees context for the rest of this turn.',
   '',
   'The recall modes:',
   '',
@@ -187,35 +187,22 @@ function findLastEvent(session, type, beforeSeq?) {
 }
 
 const VERBATIM_KIND_PATTERN = /kind="([^"]*)"/;
-const VERBATIM_CALL_ID_PATTERN = /callId="([^"]*)"/;
 
 /** Resolve one verbatim tag against the turn's log events; undefined when unresolvable. */
-function resolveVerbatim(session, item, kind, callId) {
+function resolveVerbatim(session, item, kind) {
+  if (kind !== 'turn-prompt') return undefined;
   const events = session.events;
-  if (kind === 'turn-prompt') {
-    for (let seq = item.startSeq + 1; seq <= item.endSeq; seq += 1) {
-      const event = events[seq];
-      if (event === undefined) break;
-      if (event.type === 'user/message' && event.surfaceOp === 'append') {
-        return extractText(event.data?.content ?? []);
-      }
+  for (let seq = item.startSeq + 1; seq <= item.endSeq; seq += 1) {
+    const event = events[seq];
+    if (event === undefined) break;
+    if (event.type === 'user/message' && event.surfaceOp === 'append') {
+      return extractText(event.data?.content ?? []);
     }
-    return undefined;
-  }
-  if (kind === 'tool-result' && typeof callId === 'string') {
-    for (let seq = item.startSeq + 1; seq <= item.endSeq; seq += 1) {
-      const event = events[seq];
-      if (event === undefined) break;
-      if (event.type === 'tool/result' && event.data?.message?.content?.[0]?.toolCallId === callId) {
-        return extractText(event.data.message.content[0].content ?? []);
-      }
-    }
-    return undefined;
   }
   return undefined;
 }
 
-/** Replace every verbatim tag in a summary with the turn's original text. */
+/** Replace every turn-prompt verbatim tag in a summary with the turn's original message. */
 function resolveVerbatimTags(session, item, summary) {
   if (summary.indexOf('<verbatim ') < 0) return summary;
   let result = '';
@@ -234,8 +221,7 @@ function resolveVerbatimTags(session, item, summary) {
     result += summary.slice(cursor, open);
     const tag = summary.slice(open, close + 2);
     const kind = VERBATIM_KIND_PATTERN.exec(tag)?.[1];
-    const callId = VERBATIM_CALL_ID_PATTERN.exec(tag)?.[1];
-    const resolved = resolveVerbatim(session, item, kind, callId);
+    const resolved = resolveVerbatim(session, item, kind);
     if (resolved === undefined) {
       dbg('tryReplace: turn ' + item.turn + ' verbatim tag unresolved, kept as-is: ' + tag);
       result += tag;
@@ -438,12 +424,12 @@ const PLUGIN_SKILLS = [
       '## turn 内模式（无 turn 参数）',
       '',
       '- 起始消息与当前 step 不在区间内，摘要不必复述它们。',
-      '- 不用 <verbatim> 占位标签：turn 内压缩后端按原样落盘，不做标签还原。',
+      '- 不要写 <verbatim> 标签：turn 内压缩不会还原标签，写什么就原样留下什么。',
       '- 后端有收缩校验，checkpoint 不比原区间小会整笔失败。',
       '',
       '## 整 turn 模式（带 turn 参数）',
       '',
-      '- 目标 turn 的用户消息属于被替换区间：其原话必须逐字成为 timeline 的第一条；也可以只写 <verbatim kind="turn-prompt"/> 占位，替换时会自动还原成原文。',
+      '- 目标 turn 的用户消息属于被替换区间：其原话必须逐字成为 timeline 的第一条；也可以只写 <verbatim kind="turn-prompt"/> 标签，替换时会被自动还原成原文。',
       '- 当前 turn 的用户新消息不属于被替换区间，不要写进摘要；它只作为取舍透镜——凡与新问题相关的目标 turn 细节务必保留，无关的可以压掉。',
       '- 只在 runtime 上下文出现 pending 提示时使用；一次调用只处理一个 turn，按 turn 号从小到大逐个处理。',
       '- 整 turn 替换不走压缩后端，没有收缩校验；checkpoint 仍应明显短于被替换的 turn。',

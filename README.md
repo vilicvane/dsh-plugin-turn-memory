@@ -81,14 +81,16 @@ Marking rules:
   user wording and emphasis, the assistant's own commitments and offers, and
   any phrasing later turns are likely to refer back to — plus commands,
   paths, identifiers, and error strings.
-- Read-in material (code, docs, config, output) that the turn relied on or
-  future turns will likely need is preserved verbatim enough to avoid
-  re-reading, each passage with one line saying why it matters.
-- Long verbatim passages (roughly over 800 characters) become placeholder
-  tags — <verbatim kind="turn-prompt"/> for the message that started the
-  turn, <verbatim kind="tool-result" callId="CALL_ID"/> for a tool result —
-  and the harness replaces every tag with the original text when the
-  checkpoint lands. Tags save output tokens, never omit content.
+- Read-in material (code, docs, config, output) is preserved as paths, not
+  content: short key snippets (a critical line, a value) may be inline, but
+  anything longer is recorded as the exact path plus one line saying what it
+  is and why it matters — re-read the file with the read tool when the
+  content is needed again, since copied text goes stale.
+- The message that started the turn is reproduced verbatim as the first
+  timeline entry; when it is long, a placeholder tag
+  <verbatim kind="turn-prompt"/> takes its place and the harness swaps the
+  tag back to the original message when the checkpoint lands. The tag saves
+  output tokens, never omits content.
 - Reusable procedures are referenced by name (skill or script path) instead
   of being restated; the steps live in skills loaded on demand.
 

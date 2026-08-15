@@ -3,20 +3,26 @@
  *
  * Step 1 of a two-step context-compression plan:
  *
- *  - When a root agent's turn completes, a one-shot FORK (same model as the
- *    conversation, sharing the warm request prefix) writes an independent
- *    structured summary of that turn alone.
- *  - Replacement is deferred to the pre-step of the next user-initiated turn:
- *    each summarized turn is replaced on the model-visible surface by its
- *    summary checkpoint, so the newest user message always stays verbatim.
+ *  - When a root agent's turn completes, the turn is only marked pending. On
+ *    the next turn the runtime context carries a pending notice, and the MAIN
+ *    agent — the current context itself, with the user's new message in view —
+ *    composes the previous turn's whole-turn checkpoint per the bundled
+ *    dsh-compact-turn skill and compacts that turn through
+ *    compact_turn(turn, summary). A one-shot FORK (same model as the
+ *    conversation, sharing the warm request prefix) summarizes a turn only as
+ *    a fallback when the main agent leaves it unsummarized for a whole turn.
+ *  - Replacement covers the summarized turn's whole span, its user message
+ *    included, so the newest user message always stays verbatim.
  *  - The replacement checkpoint is a user/message carrying the turn-memory
  *    source marker (turn number, summary id, format version). The raw events
  *    remain in the append-only log for replay and recall; the checkpoint is
  *    the durable summary record. No custom session event type is introduced,
  *    so logs stay loadable by unmodified harnesses.
- *  - The expand_turn tool recalls a turn's full transcript in three modes:
- *    fork (main-model continuation), subagent (cheap-model directed read),
- *    raw (transcript into context). The model picks the mode itself.
+ *  - The expand_turn tool recalls a turn's full transcript in two modes:
+ *    agentic (routed by the turn's age: recent turns answer from a warm fork
+ *    whose context replays the completed-turn log verbatim, older turns are
+ *    read in full by a cheap model) and raw (the transcript straight into
+ *    context). The model calls the tool with the mode of its choice.
  *
  * Replacement of a turn that experienced mid-turn compaction includes the
  * turn's own compaction checkpoints in the span, so the final turn summary
@@ -25,11 +31,21 @@
  * Note on style: this file intentionally uses plain string concatenation and
  * String.fromCharCode(10) for newlines (no template literals, no backslash
  * escapes) so it can be embedded and generated without quoting hazards.
+ *
+ * The file is TypeScript with erasable-only syntax: node runs it natively via
+ * type stripping (no build step), so the edit-reload loop stays single-source.
+ * Pure boundary logic lives in lib/ and is unit-tested under test/ — run
+ * `pnpm test` and `pnpm typecheck` after edits. The entry file consumes the
+ * harness runtime structurally and is typed incrementally; lib/ is fully typed.
  */
 import { randomUUID } from 'node:crypto';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 
 import { defineTool } from '@deepseek-ai/dsh-tools';
+
+import { checkToolPairBalance, computeSpanBoundaries, computeWalkRange } from './lib/bounds.ts';
+import { appendDumpBlock, renderPrefixBoundary } from './lib/prefix.ts';
+import { routeRecallByAge } from './lib/routing.ts';
 
 /** File-based debug trace (the cordis logger buffer is not file-visible, and /tmp is per-process private). */
 const DEBUG_LOG = (process.env.DSH_HOME ?? '/home/vilicvane/.dsh') + '/turn-memory-debug.log';
@@ -60,25 +76,28 @@ const DEFAULT_SETTINGS = {
   summaryTimeoutMs: 120000,
   /** How long one recall fork/subagent may run before it is aborted. */
   recallTimeoutMs: 180000,
-  /** Cheap model used by the recall tool's subagent mode. */
+  /** Cheap model used by the recall tool's agentic-old-turn path. */
   cheapProvider: 'deepseek-official',
   cheapModel: 'deepseek-chat',
-  cheapMaxTokens: 4096,
-  /** Recent window for auto mode: turns this close to the newest turn use fork. */
-  recentTurnThreshold: 3,
+  /** Output-token ceiling for the cheap recall model (raised from 4096 after a huge-turn recall stopped at max-tokens). */
+  cheapMaxTokens: 8192,
+  /** Agentic recall window: a turn whose end lies within this many milliseconds of now is answered by a fork whose context replays the completed-turn log verbatim (warm only while the provider's disk cache still holds the prefix units persisted when those turns ran); older turns are read in full by the cheap model. Default calibrated against DeepSeek's documented best-effort cache retention of "a few hours to a few days" — the official lower bound. */
+  recallRecentWindowMs: 7200000,
   /** Cap on the raw transcript returned into context. */
-  maxRawChars: 200000,
+  maxRawChars: 500000,
   /** Cap per tool result inside a transcript. */
   toolResultCapChars: 20000,
   /** Absolute delegation-depth cap for recall children. */
   maxRecallDepth: 4,
   /** Write pipeline traces to /home/vilicvane/.dsh/turn-memory-debug.log. */
   debug: false,
+  /** When non-empty, every landed compaction replacement appends one block to request-prefix.txt in this directory (the checkpoint node and the first kept node after it, separated by a divider line, accumulating forever) — a debug aid for eyeballing where each folded span ends and the kept content begins. */
+  prefixDumpDir: '',
   /** Surface-node count of the current turn that triggers the compact_turn tail reminder; the second tier fires at 1.5x. */
   reminderNodeThreshold: 30,
 };
 
-/** Summary instruction sent to the per-turn summary fork. */
+/** Summary instruction for the fallback per-turn summary fork (spawned only when the main agent leaves a completed turn unsummarized). */
 function buildSummaryPrompt(turn) {
   return [
     'You are writing the running record for the turn that just completed in this coding-assistant session.',
@@ -114,13 +133,14 @@ const MEMORY_SECTION = [
   '',
   'During a long turn, compact proactively with the compact_turn tool before context pressure forces the automatic compactor. Compose the checkpoint text yourself from your current context, following the dsh-compact-turn skill, and pass it to compact_turn as the summary argument; the tool replaces the completed part of the current turn (everything after the turn-starting message, up to the current step) with that checkpoint. The turn-starting message and the current step stay verbatim.',
   '',
-  'The recall modes, in order of fidelity:',
+  'When the runtime context carries a pending-turn notice (a completed previous turn has no summary checkpoint yet), compose that turn\'s whole-turn checkpoint FIRST, following the dsh-compact-turn skill: the message that just opened this turn is your lens for what the previous turn must retain, and the previous turn\'s own user message must be preserved verbatim inside the checkpoint (a <verbatim kind="turn-prompt"/> placeholder resolves to the original text when the checkpoint lands). Then call compact_turn with the turn number and the checkpoint text as the summary argument — the call replaces the entire previous turn on the surface, its user message included, and frees context for the rest of this turn.',
   '',
-  '1. fork — the main model continues from the conversation state at that turn, with the warm request prefix. Best for deep questions about a recent turn. Use only for recent turns; for older ones it may be slow.',
-  '2. subagent — a cheaper model reads the full text of the turn and answers a targeted question or produces a directed summary. Best for specific lookups.',
-  '3. raw — the full text of the turn is returned into the conversation. Most direct, most context consumed; very large turns are truncated. Last resort.',
+  'The recall modes:',
   '',
-  'Choose the mode yourself: prefer fork for recent turns, subagent for targeted detail, raw only when you need to work with the full text directly. Routine continuation must not require recall — summaries are written to support it. Recall exists for deep verification and rarely needed detail.',
+  '1. agentic — the tool routes by the turn\'s age itself: a turn that ended recently (within recallRecentWindowMs, default 2h) is answered by a fork whose context replays the completed turns verbatim — the target turn\'s full text is already in that fork context, and the fork is cheap only while the provider\'s disk cache still holds the prefix units persisted when those turns ran (best for deep questions about recent turns); an older turn is read in full by a cheap model that answers your question or produces a directed summary. Give agentic a focused question.',
+  '2. raw — the full text of the turn is returned into the conversation. Most direct, most context consumed; very large turns are truncated. Last resort.',
+  '',
+  'Prefer agentic for lookups; use raw only when you need to work with the full text directly. Routine continuation must not require recall — summaries are written to support it. Recall exists for deep verification and rarely needed detail.',
 ].join(NL);
 
 function resolveSettings(config) {
@@ -136,7 +156,7 @@ function resolveSettings(config) {
 /** Extract joined text from content blocks (images render as a marker). */
 function extractText(blocks) {
   if (!Array.isArray(blocks)) return '';
-  const parts = [];
+  const parts: string[] = [];
   for (const block of blocks) {
     if (block === null || typeof block !== 'object') continue;
     if (block.type === 'text' && typeof block.text === 'string') parts.push(block.text);
@@ -151,7 +171,13 @@ function truncate(text, maxChars) {
 }
 
 /** Find the last event of a type in a session log (live seq === index). */
-function findLastEvent(session, type, beforeSeq) {
+/** Render an unknown thrown value for user-visible messages. */
+function errorText(error, includeStack = false) {
+  if (!(error instanceof Error)) return String(error);
+  const text = error.message ?? String(error);
+  return includeStack && error.stack !== undefined ? text + ' STACK ' + error.stack.slice(0, 300) : text;
+}
+function findLastEvent(session, type, beforeSeq?) {
   const events = session.events;
   const limit = beforeSeq === undefined ? events.length : Math.min(beforeSeq, events.length);
   for (let index = limit - 1; index >= 0; index -= 1) {
@@ -221,16 +247,24 @@ function resolveVerbatimTags(session, item, summary) {
   return result;
 }
 
-/** Locate one turn's event span: (turn/start seq, turn/end seq]; open turns extend to the log tail. */
+/** Locate one turn's event span: (turn/start seq, turn/end seq]; open turns extend to the log tail. Also carries the boundary timestamps for age-based recall routing. */
 function findTurnSpan(session, turn) {
   let startSeq;
   let endSeq;
+  let startTime;
+  let endTime;
   for (const event of session.events) {
-    if (event.type === 'turn/start' && event.data?.turn === turn) startSeq = event.seq;
-    if (event.type === 'turn/end' && event.data?.turn === turn) endSeq = event.seq;
+    if (event.type === 'turn/start' && event.data?.turn === turn) {
+      startSeq = event.seq;
+      startTime = event.time;
+    }
+    if (event.type === 'turn/end' && event.data?.turn === turn) {
+      endSeq = event.seq;
+      endTime = event.time;
+    }
   }
   if (startSeq === undefined) return undefined;
-  return { startSeq, endSeq: endSeq ?? session.events.length - 1 };
+  return { startSeq, endSeq: endSeq ?? session.events.length - 1, startTime, endTime };
 }
 
 /** Whether any event of the given type sits inside (startSeq, endSeq]. */
@@ -278,7 +312,7 @@ function renderTranscriptEvent(event, settings) {
 
 /** Build the human-readable transcript of one turn. */
 function buildTurnTranscript(session, span, settings) {
-  const lines = [];
+  const lines: string[] = [];
   let total = 0;
   for (let seq = span.startSeq + 1; seq <= span.endSeq; seq += 1) {
     const event = session.events[seq];
@@ -365,22 +399,23 @@ const PLUGIN_SKILLS = [
       '## 配置（profile cordis.patch.yml 的 turn-memory 行）',
       '',
       '- debug: false（默认）。开 true 后管道轨迹写 $DSH_HOME/turn-memory-debug.log。用文件级日志是因为 cordis logger 只写内存缓冲、不落盘，且 /tmp 对服务器进程私有。',
-      '- 其余键与默认：summaryTimeoutMs 120000、recallTimeoutMs 180000、cheapProvider deepseek-official、cheapModel deepseek-chat、cheapMaxTokens 4096、recentTurnThreshold 3、maxRawChars 200000、toolResultCapChars 20000、maxRecallDepth 4、reminderNodeThreshold 30。',
+      '- 其余键与默认：summaryTimeoutMs 120000、recallTimeoutMs 180000、cheapProvider deepseek-official、cheapModel deepseek-chat、cheapMaxTokens 8192、recallRecentWindowMs 7200000、maxRawChars 500000、toolResultCapChars 20000、maxRecallDepth 4、reminderNodeThreshold 30、prefixDumpDir 留空（默认关闭）。',
       '',
       '## 行为约定',
       '',
-      '- turn 结束 → 主模型 fork 生成纯时间线摘要（无固定 section，一条条按时间顺序排列；尾部自然承载当前状态、待决问题与下一步）；下一条用户消息的 pre-step → 上一 turn 被 <turn-summary turn=N version=N> checkpoint 替换；最新用户消息永远逐字保留。后验修正用自然语言括注（"我觉得这样可能不错。（但是后来发现不对）"），不用方括号标记；逐字保留维持上下文直觉的措辞（用户原话、自己做出的承诺、后续可能被引用的表述）。',
-      '- 某 turn 没有替换节点的两种可能：(1) 摘要 fork 失败/超时；(2) 服务器重启（内存态丢失、fork 被中止）。重启恢复：根 agent 重建时，最后一个无 checkpoint 的已完成 turn 会被补摘要一次；更早的空缺保持原文。',
-      '- compact_turn 模型工具：长 turn 中主动压缩当前 turn 已完成部分（turn 起始消息之后、当前 step 之前），只留起始消息逐字、当前 step 不动；独占执行保证压缩事务期间 surface 稳定。摘要由当前上下文（主模型自身）撰写——撰写规则在 dsh-compact-turn 技能里，随 summary 参数传入；工具只做范围/配平校验，事务仍走后端 compactRegionWithSummary（锁/稳定性/收缩校验全部复用）；后端不支持该入口时回退其自带摘要。turn 内压缩产生的 checkpoint 会纳入该 turn 最终的 turn 摘要替换（收敛合并，不是原文重喂）；后续再次压缩时旧 checkpoint 以一条浓缩摘要参与合并。',
+      '- turn 结束 → 该 turn 登记为 pending，零模型调用、不生成摘要；下一条用户消息到来时，runtime 上下文出现 pending 提示，主 agent（当前上下文）先按 dsh-compact-turn 技能撰写上一 turn 的整 turn checkpoint（新消息是保留取舍的透镜；上一 turn 的用户原话必须逐字进摘要，或写 <verbatim kind="turn-prompt"/> 由替换时自动还原），再用 compact_turn(turn=N, summary) 立即把上一 turn（含其用户消息）替换为 <turn-summary turn=N version=N> checkpoint；最新用户消息永远逐字保留。主 agent 整个下一 turn 都没做 → 该 turn 结束时由主模型 fork 兜底补摘要（晚一个 turn，再下一个 pre-step 落地）。后验修正用自然语言括注（"我觉得这样可能不错。（但是后来发现不对）"），不用方括号标记；逐字保留维持上下文直觉的措辞（用户原话、自己做出的承诺、后续可能被引用的表述）。',
+      '- 某 turn 长时间没有替换节点的可能：(1) 主 agent 未调用 compact_turn 或调用失败 → 下一 turn 结束时 fork 兜底，兜底摘要在再下一个 pre-step 落地；(2) 服务器重启（内存态丢失）→ 恢复时最后一个无 checkpoint 的已完成 turn 重新登记 pending，由恢复后的主 agent 在下一条用户消息到来时撰写。',
+      '- compact_turn 模型工具：长 turn 中主动压缩当前 turn 已完成部分（turn 起始消息之后、当前 step 之前），只留起始消息逐字、当前 step 不动；独占执行保证压缩事务期间 surface 稳定。摘要由当前上下文（主模型自身）撰写——撰写规则在 dsh-compact-turn 技能里，随 summary 参数传入；工具只做范围/配平校验，事务仍走后端 compactRegionWithSummary（锁/稳定性/收缩校验全部复用）；后端不支持该入口时回退其自带摘要。带 turn 参数的整 turn 模式：把已完成 turn 的整段（含用户消息）替换为带 turn-memory 标记的 turn 摘要 checkpoint（复用 tryReplace 直接落盘，不走压缩后端、无收缩校验）。turn 内压缩产生的 checkpoint 会纳入该 turn 最终的 turn 摘要替换（收敛合并，不是原文重喂）；后续再次压缩时旧 checkpoint 以一条浓缩摘要参与合并。',
       '- 条件式尾部提醒：当前 turn 的 surface 节点数超过 reminderNodeThreshold（默认 30，按节点数不按 token）时，runtime 快照末尾出现一行提醒；超过 1.5 倍时升级为更直接的警告。低于阈值时零贡献、零 token；压缩落地后 turn 缩回阈值以下，提醒自行消失。',
+'- prefixDumpDir 非空时，每次压缩替换落盘后把接缝处最后两个节点（新 checkpoint + 其后第一个保留节点，按它们在 request 前缀里的文本形态渲染）追加写入 <prefixDumpDir>/request-prefix.txt（每个替换一块、块间以分隔线隔开，文件只增不减、最早的替换边界在最前），肉眼确认替换边界用。',
       '- 替换节点 source = {kind: plugin, plugin: turn-memory, turn, turnSummaryId, version}。',
-      '- expand_turn 三档：fork（主模型延续、吃暖前缀、适合近期）、subagent（便宜模型定向总结）、raw（原文直读、最后手段）；auto 按 recentTurnThreshold 路由，模型自选。',
+      '- expand_turn 双模式：agentic（默认；工具按 turn 的时间内部路由——end 距今 ≤ recallRecentWindowMs（默认 7200000，2 小时）的近期 turn 由 fork 回答，fork 的上下文是已完成 turn 的原始全文重放（不是 checkpoint），且仅当 provider 磁盘缓存还保留着这些 turn 直播时持久化的 prefix unit 时才是暖的、零额外模型调用；更早的 turn 由 cheap 模型读完整转录定向回答；question 必填）与 raw（原文直读、最后手段、超长按 maxRawChars 截断；question 忽略）。',
       '- 摘要与操作说明的分工：摘要只记发生了什么/决定了什么；可复用操作步骤放技能，摘要里只留名字引用。',
-      '- 压缩后端：host 层由本体系第二步插件 dsh-plugin-replay-compaction 提供 ctx.compaction（web 的 cordis.patch.yml 已禁用 harness 自带 dsh-compaction-basic）。注意：内置 agent preset（standard / code=「PTC 模式」）各自带一个 isolate 组重新挂载 compaction-basic + command-compact + tool-result-pruner，host 补丁够不到它——这些 preset 的会话里手动 /compact 与压力压缩走 basic 引擎，不是 fold。个人 preset `vilicvane`（~/.dsh/.agent-presets/vilicvane，code 的 fork，删除了该 isolate 组、command-compact 独立成行）三入口（/compact、压力自动压缩、compact_turn）统一走 replay fold；新会话建议选它。曾有一次针对 compaction-basic 的指令补丁，经查是死代码，已用 npm 原版 tarball 还原并删除补丁脚本。模型分工：turn 内压缩（compact_turn）摘要 = 当前上下文自拟（规则见 dsh-compact-turn 技能），session 压缩摘要 = cheap 模型（replay-compaction 的 chat 默认），互不牵扯。',
+      '- 压缩后端：host 层由本体系第二步插件 dsh-plugin-replay-compaction 提供 ctx.compaction（web 的 cordis.patch.yml 已禁用 harness 自带 dsh-compaction-basic）。注意：内置 agent preset（standard / code=「PTC 模式」）各自带一个 isolate 组重新挂载 compaction-basic + command-compact + tool-result-pruner，host 补丁够不到它——这些 preset 的会话里手动 /compact 与压力压缩走 basic 引擎，不是 fold。个人 preset `vilicvane`（~/.dsh/.agent-presets/vilicvane，code 的 fork，删除了该 isolate 组、command-compact 独立成行）三入口（/compact、压力自动压缩、compact_turn）统一走 replay fold；新会话建议选它。曾有一次针对 compaction-basic 的指令补丁，经查是死代码，已用 npm 原版 tarball 还原并删除补丁脚本。模型分工：turn 内压缩与整 turn 替换的摘要 = 当前上下文自拟（规则见 dsh-compact-turn 技能）；fork 只作整 turn 摘要兜底（同样主模型）；session 压缩摘要 = cheap 模型（replay-compaction 的 chat 默认），互不牵扯。',
       '',
       '## 修改插件后',
       '',
-      '改 index.js → node --check 语法校验 → 走 dsh-web-restart 技能重启生效。',
+      '改 index.ts / lib/*.ts → pnpm typecheck 类型校验 + pnpm test 单元测试 → 走 dsh-web-restart 技能重启生效。',
       '冒烟测试环境：headless profile $DSH_HOME/profiles/test-turn-memory（base + headless 启动 + 两轮测试驱动器 dsh-plugin-test-runner）。',
     ].join(NL),
   },
@@ -390,20 +425,32 @@ const PLUGIN_SKILLS = [
     content: [
       '# dsh-compact-turn:为 compact_turn 撰写 checkpoint',
       '',
-      'compact_turn 把你随 summary 参数传入的文本变成当前 turn 的一个 checkpoint，替换 turn 起始消息之后、当前 step 之前的所有内容；起始消息与当前 step 保持逐字。你是撰写这段文本的人——你当前的上下文就是被压缩的区间本身，压缩前不需要任何额外读取或工具调用。',
+      'compact_turn 把你随 summary 参数传入的文本落成 checkpoint：不带 turn 参数时替换当前 turn 起始消息之后、当前 step 之前的已完成部分（起始消息与当前 step 逐字保留）；带 turn=N 时替换整个已完成 turn N（含该 turn 的用户消息），此后该 turn 在 surface 上只以这份摘要存在。你就是撰写这份文本的人——你当前的上下文就是被压缩区间（或其绝大部分）本身，压缩前不需要额外读取或工具调用。',
       '',
-      '## 撰写规则',
+      '## 撰写规则（两种模式通用）',
       '',
-      '- 用 ONE 条流动的时间线写，不加 section 标题、不填表格：每次用户请求、决定、发现、修复或有意义的产出一条，按发生顺序排列；只保留这个 turn 后续还需要的内容，丢掉单次工具调用、中间输出、例行检查等临时细节。',
+      '- 用 ONE 条流动的时间线写，不加 section 标题、不填表格：每次用户请求、决定、发现、修复或有意义的产出一条，按发生顺序排列；只保留这个区间后续还需要的内容，丢掉单次工具调用、中间输出、例行检查等临时细节。',
       '- 后来被证明错了的条目留在原处，在出错的位置加自然语言修正（"我觉得 X 可行。（后来发现不对。）"）；永远不要删条目。假设按当时的感觉陈述（"我当时假设 X，未验证"），后面的条目推翻它时在那里补一句修正。',
       '- 逐字保留维持上下文直觉的措辞：用户原话与强调、自己做出的承诺与提议、后续可能被引用的表述；命令、路径、标识符、错误串也逐字保留。',
       '- 可复用流程只写技能名/脚本路径，不重述步骤。',
-      '- checkpoint 会取代区间内容，必须能独立承载这段记录；保持它明显短于被替换的区间——后端有收缩校验，checkpoint 不比原区间小会整笔失败。',
+      '- checkpoint 必须能独立承载这段记录，并保持明显短于被替换的区间。',
+      '',
+      '## turn 内模式（无 turn 参数）',
+      '',
+      '- 起始消息与当前 step 不在区间内，摘要不必复述它们。',
       '- 不用 <verbatim> 占位标签：turn 内压缩后端按原样落盘，不做标签还原。',
+      '- 后端有收缩校验，checkpoint 不比原区间小会整笔失败。',
+      '',
+      '## 整 turn 模式（带 turn 参数）',
+      '',
+      '- 目标 turn 的用户消息属于被替换区间：其原话必须逐字成为 timeline 的第一条；也可以只写 <verbatim kind="turn-prompt"/> 占位，替换时会自动还原成原文。',
+      '- 当前 turn 的用户新消息不属于被替换区间，不要写进摘要；它只作为取舍透镜——凡与新问题相关的目标 turn 细节务必保留，无关的可以压掉。',
+      '- 只在 runtime 上下文出现 pending 提示时使用；一次调用只处理一个 turn，按 turn 号从小到大逐个处理。',
+      '- 整 turn 替换不走压缩后端，没有收缩校验；checkpoint 仍应明显短于被替换的 turn。',
       '',
       '## 调用',
       '',
-      '把摘要全文作为 summary 参数调用 compact_turn，不要附带其他文字或解释。',
+      '把摘要全文作为 summary 参数调用 compact_turn；整 turn 模式另把目标 turn 号作为 turn 参数传入。不要附带其他文字或解释。',
     ].join(NL),
   },
 ];
@@ -451,6 +498,37 @@ function apply(ctx, config) {
     },
   });
 
+  // Pending-turn notice: while a completed previous turn still has no summary
+  // checkpoint, every step's runtime context carries this instruction until
+  // the main agent compacts that turn itself (compact_turn with the turn
+  // argument). Self-replacing: the notice disappears the moment the turn is
+  // replaced.
+  ctx.systemPrompt.context({
+    name: 'turn-summary-pending',
+    order: 131,
+    text: (context) => {
+      try {
+        const session = context.agent?.session;
+        if (session === undefined || session.header.parentSession !== undefined) return '';
+        const state = states.get(session.id);
+        if (state === undefined || state.items.size === 0) return '';
+        const turnStart = findLastEvent(session, 'turn/start');
+        if (turnStart === undefined) return '';
+        const currentTurn = turnStart.data?.turn;
+        if (typeof currentTurn !== 'number') return '';
+        const pendingTurns: number[] = [];
+        for (const item of state.items.values()) {
+          if (!item.replaced && item.summary === undefined && item.turn < currentTurn) pendingTurns.push(item.turn);
+        }
+        if (pendingTurns.length === 0) return '';
+        pendingTurns.sort((a, b) => a - b);
+        return 'Pending turn summary: turn ' + pendingTurns.join(', ') + ' still ' + (pendingTurns.length === 1 ? 'has' : 'have') + ' no summary checkpoint. Before anything else, compose ' + (pendingTurns.length === 1 ? 'that turn\'s' : 'those turns\'') + ' checkpoint' + (pendingTurns.length === 1 ? '' : 's') + ' following the dsh-compact-turn skill — the message that opened this turn is your lens for what to retain, but it is not part of the replaced span — then call compact_turn once per turn with the turn number and the checkpoint text as the summary argument. Doing this first frees context for the rest of the turn.';
+      } catch {
+        return '';
+      }
+    },
+  });
+
   for (const skill of PLUGIN_SKILLS) {
     ctx.skills.register({
       name: skill.name,
@@ -465,10 +543,9 @@ function apply(ctx, config) {
     description: [
       'Recall the full information of a past conversation turn, which is otherwise represented by a summary in the context.',
       'Modes:',
-      '- fork: the main model continues from the conversation state at that turn, with the warm request prefix. Best for deep questions about a recent turn.',
-      '- subagent: a cheaper model reads the full text of the turn and answers a targeted question or produces a directed summary.',
+      '- agentic: the tool routes by the turn\'s age itself — a turn that ended recently (within recallRecentWindowMs, default 2h) is answered by a fork whose context replays the completed turns verbatim, so the target turn\'s full text is already in that context; an older turn is read in full by a cheap model. Give it a focused question.',
       '- raw: the full text of the turn is returned directly into the conversation (very large turns are truncated); the most context-consuming, use as a last resort.',
-      'Default mode auto picks fork for recent turns and subagent otherwise. question is required for fork and subagent modes and ignored for raw.',
+      'Defaults to agentic. question is required for agentic mode and ignored for raw.',
     ].join(' '),
     parameters: {
       turn: {
@@ -478,12 +555,12 @@ function apply(ctx, config) {
       },
       question: {
         type: 'string',
-        description: 'What to ask or look up about that turn. Required for fork and subagent modes; ignored for raw.',
+        description: 'What to ask or look up about that turn. Required for agentic mode; ignored for raw.',
       },
       mode: {
         type: 'string',
-        enum: ['auto', 'fork', 'subagent', 'raw'],
-        description: 'Recall mode; defaults to auto.',
+        enum: ['agentic', 'raw'],
+        description: 'Recall mode; defaults to agentic.',
       },
     },
     output: {
@@ -496,19 +573,22 @@ function apply(ctx, config) {
       const session = agent.session;
       const span = findTurnSpan(session, args.turn);
       if (span === undefined) return 'expand_turn: turn ' + args.turn + ' was not found in this session';
-      const mode = (args.mode ?? 'auto') === 'auto' ? resolveAutoMode(session, args.turn) : args.mode;
+      const mode = args.mode ?? 'agentic';
       if (mode === 'raw') return buildTurnTranscript(session, span, settings);
-      const question = (args.question ?? '').trim();
-      if (question === '') return 'expand_turn: a question is required for ' + mode + ' mode';
-      if (mode === 'fork') return recallViaFork(agent, exec.signal, args.turn, question);
-      if (mode === 'subagent') return recallViaSubagent(agent, exec.signal, session, span, args.turn, question);
+      if (mode === 'agentic') {
+        const question = (args.question ?? '').trim();
+        if (question === '') return 'expand_turn: a question is required for agentic mode';
+        const route = routeAgenticRecall(session, args.turn, span);
+        if (route === 'fork') return recallViaFork(agent, exec.signal, args.turn, question);
+        return recallViaSubagent(agent, exec.signal, session, span, args.turn, question);
+      }
       return 'expand_turn: unknown mode ' + String(mode);
     },
     presentCall: (args) => ({
       card: 'generic',
       title: 'Recall turn ' + args.turn,
       kind: 'other',
-      rawInput: { turn: args.turn, mode: args.mode ?? 'auto' },
+      rawInput: { turn: args.turn, mode: args.mode ?? 'agentic' },
     }),
   }));
 
@@ -518,6 +598,7 @@ function apply(ctx, config) {
       'Compactly summarize the completed portion of the CURRENT turn into one checkpoint, freeing context during a long turn.',
       'Compose the checkpoint text yourself from your current context, following the dsh-compact-turn skill, and pass it as the summary argument — no subagent summarizes the span for you.',
       'The compacted range is everything after the turn-starting message up to (excluding) the current step; the turn-starting message stays verbatim and the current step is untouched.',
+      'With the optional turn argument, compact a COMPLETED previous turn whole instead: its entire span — that turn\'s own user message included — is replaced by your checkpoint, so preserve that turn\'s user request verbatim.',
       'Use it proactively when the turn is getting long and more work lies ahead, before automatic pressure compaction forces a less-informed cut. It runs exclusively, so other tool calls wait for it.',
     ].join(' '),
     parameters: {
@@ -525,6 +606,10 @@ function apply(ctx, config) {
         type: 'string',
         required: true,
         description: 'The checkpoint text replacing the completed part of the current turn: ONE flowing chronological timeline composed per the dsh-compact-turn skill. It must stand alone as the record of the span it replaces.',
+      },
+      turn: {
+        type: 'integer',
+        description: 'Optional target turn number: compact that COMPLETED turn whole (its user message included) instead of the current turn\'s completed portion. Use only for turns the runtime context lists as pending.',
       },
     },
     output: {
@@ -537,6 +622,30 @@ function apply(ctx, config) {
       if (agent === undefined) return 'compact_turn: no owning agent session';
       const session = agent.session;
       if (session.header.parentSession !== undefined) return 'compact_turn: only root sessions can compact';
+      const turnArg = typeof args.turn === 'number' && Number.isInteger(args.turn) ? args.turn : undefined;
+      if (turnArg !== undefined) {
+        // Whole-turn mode: the current context composed the checkpoint for a
+        // COMPLETED previous turn; replace that turn's whole span (its user
+        // message included) with the turn-memory summary checkpoint. This
+        // path reuses the same replacement as the fork fallback (tryReplace)
+        // and does not run a compaction transaction.
+        const summary = typeof args.summary === 'string' ? args.summary.trim() : '';
+        if (summary === '') return 'compact_turn: summary is required — compose the checkpoint text following the dsh-compact-turn skill and pass it as the summary argument';
+        const openTurn = findLastEvent(session, 'turn/start');
+        if (openTurn !== undefined && openTurn.data?.turn === turnArg) return 'compact_turn: turn ' + turnArg + ' is the open turn — call compact_turn without the turn argument to compact the current turn';
+        const state = states.get(session.id);
+        const item = state?.items.get(turnArg);
+        if (item === undefined) return 'compact_turn: turn ' + turnArg + ' has no pending turn record in this session';
+        if (item.replaced) return 'compact_turn: turn ' + turnArg + ' is already replaced by its summary checkpoint';
+        item.summary = summary;
+        item.settled = true;
+        const replaced = tryReplace(session, item, 'whole-turn (compact_turn, turn ' + turnArg + ')');
+        if (!replaced) {
+          item.summary = undefined;
+          return 'compact_turn: turn ' + turnArg + ' could not be replaced right now (see the turn-memory debug log); the turn stays pending and can be retried';
+        }
+        return 'compact_turn: turn ' + turnArg + ' replaced by the provided summary (' + item.replacedNodes + ' surface nodes converged into one turn-summary checkpoint)';
+      }
       const compaction = ctx.get('compaction');
       if (compaction === undefined) return 'compact_turn: no compaction backend is mounted';
       const turnStart = findLastEvent(session, 'turn/start');
@@ -545,51 +654,15 @@ function apply(ctx, config) {
       if (turnEnd !== undefined && turnEnd.seq > turnStart.seq) return 'compact_turn: no open turn';
       const events = session.events;
       const nodes = session.surface.nodes;
-      const spanStart = nodes.findIndex((seq) => seq > turnStart.seq);
-      if (spanStart < 0) return 'compact_turn: nothing to compact yet';
-      // The current step's assistant message (the last assistant node) carries
-      // open tool calls, so it and everything after stay verbatim.
-      let assistantIdx = -1;
-      for (let index = nodes.length - 1; index > spanStart; index -= 1) {
-        if (events[nodes[index]]?.type === 'assistant/message') {
-          assistantIdx = index;
-          break;
-        }
+      const boundary = computeSpanBoundaries(nodes, events, turnStart.seq);
+      if (!boundary.ok) {
+        if (boundary.error === 'no-assistant-content') return 'compact_turn: no assistant content to compact yet';
+        return 'compact_turn: nothing to compact yet';
       }
-      if (assistantIdx < 0) return 'compact_turn: no assistant content to compact yet';
-      if (assistantIdx <= spanStart + 1) return 'compact_turn: nothing to compact yet';
-      const startSeq = nodes[spanStart + 1];
-      const endSeq = nodes[assistantIdx - 1];
-      // The slice endpoints are surface positions: the backend shadows the
-      // surface slice between them. The pairing walk, however, needs log
-      // positions — after an earlier in-turn checkpoint, surface order and seq
-      // order diverge (the checkpoint's seq exceeds the seqs of the kept step
-      // that follows it in surface order), so walking [startSeq, endSeq] as a
-      // raw seq interval would split the kept step's own tool pair. Walk the
-      // slice's seq span instead.
-      let walkStart = startSeq;
-      let walkEnd = endSeq;
-      for (let index = spanStart + 1; index < assistantIdx; index += 1) {
-        const seq = nodes[index];
-        if (seq < walkStart) walkStart = seq;
-        if (seq > walkEnd) walkEnd = seq;
-      }
-      // Balance over the log range: every tool call/result inside must pair
-      // inside, so no open pair crosses the cut.
-      const openCalls = new Set();
-      for (let seq = walkStart; seq <= walkEnd; seq += 1) {
-        const event = events[seq];
-        if (event === undefined) return 'compact_turn: session events incomplete; compact later';
-        if (event.type === 'tool/call') {
-          openCalls.add(event.data?.callId);
-        } else if (event.type === 'tool/result') {
-          const callId = event.data?.message?.content?.[0]?.toolCallId;
-          if (callId === undefined || !openCalls.has(callId)) return 'compact_turn: the cut would cross an open tool pair; compact later';
-          openCalls.delete(callId);
-        }
-      }
-      if (openCalls.size > 0) return 'compact_turn: the cut would leave an open tool call; compact later';
-      const nodeCount = assistantIdx - spanStart - 1;
+      const { startSeq, endSeq, nodeCount } = boundary.bounds;
+      const { walkStart, walkEnd } = computeWalkRange(nodes, boundary.bounds);
+      const pairError = checkToolPairBalance(events, walkStart, walkEnd);
+      if (pairError !== null) return pairError;
       // The checkpoint text is composed by the current context itself, per
       // the dsh-compact-turn skill, and arrives as the summary argument; no
       // subagent summarizes the span. The compaction transaction stays in
@@ -607,8 +680,24 @@ function apply(ctx, config) {
           await compaction.compactRegion(startSeq, endSeq, agent, exec.signal);
         }
       } catch (error) {
-        return 'compact_turn: ' + (error?.message ?? error);
+        return 'compact_turn: ' + errorText(error);
       }
+      // Debug aid: the landed replacement boundary, for eyeballing. After the
+      // transaction the checkpoint sits where startSeq was (position
+      // spanStart + 1) and the kept current step follows it.
+      const surfaceAfter = session.surface.nodes;
+      const checkpointPos = boundary.bounds.spanStart + 1;
+      const checkpointSeq = surfaceAfter[checkpointPos];
+      const nextSeq = surfaceAfter[checkpointPos + 1] ?? null;
+      dumpPrefixBoundary(
+        session,
+        'in-turn (current turn)',
+        checkpointSeq,
+        nextSeq,
+        nodeCount,
+        '[' + startSeq + ', ' + endSeq + ']',
+        'turn-starting user message seq ' + boundary.bounds.spanStartSeq + ' stays verbatim BEFORE the checkpoint',
+      );
       return 'compact_turn: compacted ' + nodeCount + ' surface nodes of the current turn into one checkpoint; the turn-starting message and the current step stay verbatim';
     },
     presentCall: () => ({
@@ -618,11 +707,18 @@ function apply(ctx, config) {
     }),
   }));
 
-  /** Route auto mode: recent turns fork, older turns use the cheap subagent. */
-  function resolveAutoMode(session, turn) {
-    const lastEnd = findLastEvent(session, 'turn/end');
-    const newest = lastEnd?.data?.turn ?? 0;
-    return turn >= newest - settings.recentTurnThreshold + 1 ? 'fork' : 'subagent';
+  /**
+   * Agentic recall routing by the turn's age: a turn whose end lies inside
+   * recallRecentWindowMs is answered by a fork whose context replays the
+   * completed-turn log verbatim (cheap only while the provider's disk cache
+   * still holds the prefix units persisted when those turns ran); an older
+   * turn is read in full by the cheap model (subagent). Falls back to
+   * turn-number distance when the boundary events carry no timestamp.
+   */
+  function routeAgenticRecall(session, turn, span) {
+    const endTime = span.endTime ?? span.startTime;
+    const newest = findLastEvent(session, 'turn/end')?.data?.turn ?? 0;
+    return routeRecallByAge({ turn, endTime, newestTurn: newest, now: Date.now(), recentWindowMs: settings.recallRecentWindowMs });
   }
 
   /** AbortController fused with a timeout and the caller's signal. */
@@ -646,7 +742,7 @@ function apply(ctx, config) {
       '',
       question,
       '',
-      'The question concerns turn ' + turn + '. Earlier turns are stored as summaries; the full raw transcript of every completed turn is available in this session log. If the summaries do not contain the detail you need, use the expand_turn tool with mode raw to read the full text of turn ' + turn + ' before answering. Answer the question directly and concisely; quote exact paths, commands, error strings, and values where relevant.',
+      'Your context is a verbatim replay of the completed turns of the parent session, so the full original text of turn ' + turn + ' (its user message and every assistant and tool event) is already in your context. Answer the question directly from that full text. If part of it was compacted away inside this fork, use the expand_turn tool with mode raw to read the full text of turn ' + turn + ' before answering. Answer directly and concisely; quote exact paths, commands, error strings, and values where relevant.',
     ].join(NL);
   }
 
@@ -675,7 +771,7 @@ function apply(ctx, config) {
       });
     } catch (error) {
       fused.dispose();
-      return 'expand_turn (fork): could not start the recall fork: ' + (error?.message ?? error);
+      return 'expand_turn (fork): could not start the recall fork: ' + errorText(error);
     }
     try {
       const result = await run.result;
@@ -683,7 +779,7 @@ function apply(ctx, config) {
       const text = extractText(result.output);
       return text === '' ? 'expand_turn (fork): the recall fork produced no answer' : text;
     } catch (error) {
-      return 'expand_turn (fork): recall failed: ' + (error?.message ?? error);
+      return 'expand_turn (fork): recall failed: ' + errorText(error);
     } finally {
       fused.dispose();
       try { await run.dispose(); } catch { /* resource release is best-effort */ }
@@ -710,7 +806,7 @@ function apply(ctx, config) {
       });
     } catch (error) {
       fused.dispose();
-      return 'expand_turn (subagent): could not start the recall subagent: ' + (error?.message ?? error);
+      return 'expand_turn (subagent): could not start the recall subagent: ' + errorText(error);
     }
     try {
       const result = await run.result;
@@ -718,7 +814,7 @@ function apply(ctx, config) {
       const text = extractText(result.output);
       return text === '' ? 'expand_turn (subagent): the recall subagent produced no answer' : text;
     } catch (error) {
-      return 'expand_turn (subagent): recall failed: ' + (error?.message ?? error);
+      return 'expand_turn (subagent): recall failed: ' + errorText(error);
     } finally {
       fused.dispose();
       try { await run.dispose(); } catch { /* resource release is best-effort */ }
@@ -737,21 +833,25 @@ function apply(ctx, config) {
       });
     } catch (error) {
       item.settled = true;
-      dbg('summarizeTurn: start failed for turn ' + item.turn + ': ' + (error?.message ?? error));
-      ctx.logger.warn('turn-memory: could not start summary fork for turn ' + item.turn + ': ' + (error?.message ?? error));
+      item.forkInFlight = false;
+      dbg('summarizeTurn: start failed for turn ' + item.turn + ': ' + errorText(error));
+      ctx.logger.warn('turn-memory: could not start summary fork for turn ' + item.turn + ': ' + errorText(error));
       return;
     }
     dbg('summarizeTurn: fork started for turn ' + item.turn);
+    item.forkInFlight = true;
     try {
       const result = await run.result;
       item.settled = true;
       dbg('summarizeTurn: fork settled for turn ' + item.turn + ' stopReason=' + String(result.stopReason));
       if (result.stopReason !== 'completed') {
+        item.forkInFlight = false;
         ctx.logger.warn('turn-memory: summary fork for turn ' + item.turn + ' ended with ' + JSON.stringify(result.stopReason) + '; the turn stays raw');
         return;
       }
       const text = extractText(result.output);
       if (text === '') {
+        item.forkInFlight = false;
         ctx.logger.warn('turn-memory: summary fork for turn ' + item.turn + ' produced no text; the turn stays raw');
         return;
       }
@@ -760,8 +860,9 @@ function apply(ctx, config) {
       ctx.logger.info('turn-memory: turn ' + item.turn + ' summarized (' + item.summary.length + ' chars)');
     } catch (error) {
       item.settled = true;
-      dbg('summarizeTurn: result failed for turn ' + item.turn + ': ' + (error?.message ?? error));
-      ctx.logger.warn('turn-memory: summary fork for turn ' + item.turn + ' failed: ' + (error?.message ?? error) + '; the turn stays raw');
+      item.forkInFlight = false;
+      dbg('summarizeTurn: result failed for turn ' + item.turn + ': ' + errorText(error));
+      ctx.logger.warn('turn-memory: summary fork for turn ' + item.turn + ' failed: ' + errorText(error) + '; the turn stays raw');
     } finally {
       try { await run.dispose(); } catch { /* resource release is best-effort */ }
     }
@@ -793,32 +894,47 @@ function apply(ctx, config) {
         dbg('idle: turn ' + turn + ' has no assistant content; skipping');
         return;
       }
+      // Fallback: an older turn the main agent left unsummarized during the
+      // turn that just ended gets a fork summary now (lands one turn late).
+      for (const item of state.items.values()) {
+        if (item.turn < turn && !item.replaced && item.summary === undefined && item.forkInFlight !== true) {
+          item.settled = false;
+          dbg('idle: turn ' + item.turn + ' left unsummarized by the main agent; spawning fallback summary fork');
+          void summarizeTurn(agent, item);
+        }
+      }
+      // The turn that just completed waits for the MAIN agent: the next
+      // turn's runtime context carries a pending notice, and the agent
+      // composes the whole-turn checkpoint itself (dsh-compact-turn skill)
+      // and compacts the turn with compact_turn(turn, summary). No fork here.
       const controller = new AbortController();
       const item = {
         turn,
         startSeq: startEvent.seq,
         endSeq: lastEnd.seq,
         controller,
-        settled: false,
+        settled: true,
         summary: undefined,
         replaced: false,
+        forkInFlight: false,
         turnSummaryId: randomUUID(),
       };
       state.items.set(turn, item);
-      dbg('idle: spawning summary fork for turn ' + turn);
-      void summarizeTurn(agent, item);
+      dbg('idle: turn ' + turn + ' marked pending for main-session summarization');
     } catch (error) {
-      dbg('idle: handling failed: ' + (error?.message ?? error));
-      ctx.logger.warn('turn-memory: idle handling failed: ' + (error?.message ?? error));
+      dbg('idle: handling failed: ' + errorText(error));
+      ctx.logger.warn('turn-memory: idle handling failed: ' + errorText(error));
     }
   });
 
   /**
    * Resume recovery: a server restart aborts in-flight summary forks and
    * drops in-memory state, so the last completed turn of a resumed session
-   * may have no summary at all. Re-summarize it once when the root agent is
-   * (re)created. Recovery items never block the next pre-step — the
-   * replacement lands at the first user pre-step where the summary is ready.
+   * may have no summary at all. Mark it pending once when the root agent is
+   * (re)created; the resumed main agent sees the pending notice in its next
+   * runtime context and composes the whole-turn checkpoint itself. Recovery
+   * items never block the next pre-step — the replacement lands whenever
+   * the agent compacts the turn.
    */
   ctx.on('agent/created', ({ agent }) => {
     try {
@@ -851,18 +967,18 @@ function apply(ctx, config) {
         startSeq: startEvent.seq,
         endSeq: lastEnd.seq,
         controller,
-        settled: false,
+        settled: true,
         summary: undefined,
         replaced: false,
+        forkInFlight: false,
         recovery: true,
         turnSummaryId: randomUUID(),
       };
       state.items.set(turn, item);
-      dbg('recovery: respawning summary fork for turn ' + turn + ' after session resume');
-      void summarizeTurn(agent, item);
+      dbg('recovery: turn ' + turn + ' marked pending after session resume');
     } catch (error) {
-      dbg('recovery: handling failed: ' + (error?.message ?? error));
-      ctx.logger.warn('turn-memory: resume recovery failed: ' + (error?.message ?? error));
+      dbg('recovery: handling failed: ' + errorText(error));
+      ctx.logger.warn('turn-memory: resume recovery failed: ' + errorText(error));
     }
   });
 
@@ -881,11 +997,46 @@ function apply(ctx, config) {
     return source?.kind === 'plugin' && source.plugin === SUMMARY_MARKER_PLUGIN && typeof source.turn === 'number' && source.turn !== ownTurn;
   }
 
+  /**
+   * Append the request-prefix boundary dump after a replacement lands: the
+   * checkpoint node and the first kept node after it — the last two nodes at
+   * the boundary — rendered the way their text reaches the front of the next
+   * request. Blocks accumulate in one file, oldest first, separated by a
+   * divider line. Disabled unless prefixDumpDir is set; best-effort.
+   */
+  function dumpPrefixBoundary(session, mode, checkpointSeq, nextSeq, replacedNodes, replacedSpan, note) {
+    const dir = settings.prefixDumpDir;
+    if (typeof dir !== 'string' || dir === '') return;
+    try {
+      mkdirSync(dir, { recursive: true });
+      const file = dir + '/request-prefix.txt';
+      const text = renderPrefixBoundary(
+        {
+          timestamp: new Date().toISOString(),
+          sessionId: String(session.id),
+          mode,
+          checkpointSeq,
+          nextSeq,
+          replacedNodes,
+          replacedSpan,
+          note,
+        },
+        session.events[checkpointSeq],
+        nextSeq === null ? undefined : session.events[nextSeq],
+      );
+      const existing = existsSync(file) ? readFileSync(file, 'utf8') : '';
+      writeFileSync(file, appendDumpBlock(existing, text));
+      dbg('prefix-dump: request-prefix.txt appended (' + mode + '; checkpoint seq ' + checkpointSeq + ', next seq ' + String(nextSeq) + ')');
+    } catch (error) {
+      dbg('prefix-dump: FAILED ' + errorText(error));
+    }
+  }
+
   /** Replace one completed turn with its summary checkpoint; returns false when skipped. */
-  function tryReplace(session, item) {
+  function tryReplace(session, item, via) {
     const events = session.events;
-    const spanSeqs = [];
-    const skippedForeign = [];
+    const spanSeqs: number[] = [];
+    const skippedForeign: number[] = [];
     let firstIdx = -1;
     let lastIdx = -1;
     session.surface.nodes.forEach((seq, index) => {
@@ -960,6 +1111,11 @@ function apply(ctx, config) {
       sourceEventSeqs: spanSeqs,
     });
     item.replaced = true;
+    item.replacedNodes = spanSeqs.length;
+    const surfaceAfter = session.surface.nodes;
+    const checkpointSeq = surfaceAfter[firstIdx];
+    const nextSeq = surfaceAfter[firstIdx + 1] ?? null;
+    dumpPrefixBoundary(session, via, checkpointSeq, nextSeq, spanSeqs.length, '[' + spanSeqs[0] + ', ' + spanSeqs[spanSeqs.length - 1] + ']', undefined);
     dbg('tryReplace: turn ' + item.turn + ' REPLACED span [' + spanSeqs[0] + ', ' + spanSeqs[spanSeqs.length - 1] + '] (' + spanSeqs.length + ' nodes)');
     ctx.logger.info('turn-memory: replaced turn ' + item.turn + ' (shadowed ' + spanSeqs.length + ' surface nodes)');
     return true;
@@ -982,7 +1138,7 @@ function apply(ctx, config) {
       const pending = [...state.items.values()].filter((item) => !item.settled && item.recovery !== true);
       if (pending.length > 0) {
         await Promise.race([
-          Promise.allSettled(pending.map((item) => new Promise((resolve) => {
+          Promise.allSettled(pending.map((item) => new Promise<void>((resolve) => {
             const poll = () => {
               if (item.settled) resolve();
               else setTimeout(poll, 50);
@@ -1007,10 +1163,10 @@ function apply(ctx, config) {
         .filter((item) => item.summary !== undefined && !item.replaced && !replaced.has(item.turn))
         .sort((a, b) => a.turn - b.turn);
       dbg('pre-step: replaceable items=' + items.map((item) => 'turn ' + item.turn).join(','));
-      for (const item of items) tryReplace(session, item);
+      for (const item of items) tryReplace(session, item, 'whole-turn (fork fallback, turn ' + item.turn + ')');
     } catch (error) {
-      dbg('pre-step: handling failed: ' + (error?.message ?? error) + ' STACK ' + String(error?.stack).slice(0, 300));
-      ctx.logger.warn('turn-memory: pre-step handling failed: ' + (error?.message ?? error));
+      dbg('pre-step: handling failed: ' + errorText(error, true));
+      ctx.logger.warn('turn-memory: pre-step handling failed: ' + errorText(error));
     }
     return next();
   });

@@ -3,38 +3,53 @@
 Turn-granular context memory for DeepSeek Harness: step 1 of a two-step
 context-compression plan.
 
-Every time a root session's turn completes, a one-shot fork (same model as the
-conversation, sharing its warm request prefix) writes an independent flowing
-summary of that turn alone. At the pre-step of the next user-initiated turn,
-each summarized turn is replaced on the model-visible surface by its summary
-checkpoint. The newest user message always stays verbatim, and the raw events
-remain in the append-only log for replay and recall.
+When a root session's turn completes, the turn is only marked pending — no
+summary runs yet. On the next turn, the runtime context carries a pending
+notice and the main agent itself — the current context, with the user's new
+message in view — composes the previous turn's whole-turn checkpoint
+following the bundled dsh-compact-turn skill, then compacts that turn with
+compact_turn(turn, summary). The replacement covers the turn's whole span,
+its own user message included, so the newest user message always stays
+verbatim. A one-shot fork (same model as the conversation, sharing its warm
+request prefix) writes the summary only as a fallback when the main agent
+leaves a turn unsummarized for a whole turn. Raw events remain in the
+append-only log for replay and recall.
 
-The expand_turn tool recalls a turn's full transcript in three modes:
+The expand_turn tool recalls a turn's full transcript in two modes:
 
-- fork — the main model continues from the conversation state at that turn,
-  with the warm request prefix; best for deep questions about a recent turn.
-- subagent — a cheap model reads the turn's full text and answers a targeted
-  question or produces a directed summary.
+- agentic — the model asks a question and the recall routes by the turn's
+  age: recent turns (ended within recallRecentWindowMs, default 2h) use a
+  fork whose context replays the completed turns verbatim — the target
+  turn's full original text is already in that context, and the fork is
+  cheap only while the provider's disk cache still holds the prefix units
+  persisted when those turns ran; older turns use a subagent, where a
+  cheap model reads the turn's full text and answers the targeted
+  question.
 - raw — the turn's full text is returned directly into the conversation;
-  very large turns are truncated; last resort.
+  very large turns are truncated; the fallback when the agentic answer
+  needs the full text.
 
-The model picks the mode itself (default auto routes recent turns to fork and
-older turns to subagent).
+The default mode is agentic; the time routing is internal to the tool.
 
 The compact_turn tool lets the model compact proactively during a long turn:
 it replaces the completed part of the current turn (everything after the
 turn-starting message, up to the current step) with one checkpoint, keeping
-the turn-starting message and the current step verbatim. The checkpoint text
-is composed by the current context itself — the composing rules live in the
-bundled dsh-compact-turn skill and the text arrives as the tool's summary
-argument — so no fork or subagent summarizes the span. The tool validates
-the range (root session, tool-pair balance) and runs exclusively so the
-compaction transaction never races another tool call; the transaction
-itself — lock, whole-surface stability, shrink check, durability — stays in
-the mounted compaction backend through compactRegionWithSummary, and
-backends without that entry summarize the range themselves. Session
-compaction keeps its own cheap-model summarizer; the two never mix.
+the turn-starting message and the current step verbatim. With the optional
+turn argument it compacts a completed previous turn whole instead — the
+span includes that turn's own user message, so the checkpoint must preserve
+its request verbatim; this is the call the pending notice asks for. The
+checkpoint text is composed by the current context itself — the composing
+rules live in the bundled dsh-compact-turn skill and the text arrives as
+the tool's summary argument — so no fork or subagent summarizes the span.
+For the current-turn mode the tool validates the range (root session,
+tool-pair balance) and runs exclusively so the compaction transaction never
+races another tool call; the transaction itself — lock, whole-surface
+stability, shrink check, durability — stays in the mounted compaction
+backend through compactRegionWithSummary, and backends without that entry
+summarize the range themselves. The whole-turn mode reuses the same
+replacement path as the fallback fork (turn-memory marker checkpoint, no
+compaction transaction). Session compaction keeps its own cheap-model
+summarizer; the two never mix.
 
 A conditional tail reminder backs it up: once the current turn spans more
 than reminderNodeThreshold surface nodes (default 30, counted by nodes, not
@@ -98,6 +113,29 @@ plugin depends on @deepseek-ai/dsh-tools; run pnpm install inside the plugin
 directory once so that dependency resolves. Git/npm installs resolve
 dependencies normally.
 
+## Development (TypeScript)
+
+The plugin is TypeScript with erasable-only syntax and has NO build step:
+node (>= 23.6; this machine runs 24.x) executes the sources directly via
+native type stripping, so the entry stays index.ts and the edit-reload loop
+stays single-source.
+
+    index.ts        plugin entry (structurally typed, incremental)
+    lib/bounds.ts   pure span-boundary logic for compact_turn
+    lib/routing.ts  pure agentic-recall age routing
+    test/*.test.ts  node:test unit tests for the lib modules
+
+Run both checks after edits, then restart per the dsh-web-restart skill:
+
+    pnpm test        # unit tests (node --test, type stripping)
+    pnpm typecheck   # tsc --noEmit
+
+tsconfig enforces erasableSyntaxOnly (no enums/namespaces — node's type
+stripper rejects them) and allowImportingTsExtensions (imports spell out the
+.ts extension, which is what the stripper requires). The lib/ modules are
+fully strict-typed; the entry file consumes the harness runtime structurally
+and is typed incrementally.
+
 ## Config
 
 All keys optional, with defaults:
@@ -106,23 +144,38 @@ All keys optional, with defaults:
     recallTimeoutMs: 180000
     cheapProvider: deepseek-official
     cheapModel: deepseek-chat
-    cheapMaxTokens: 4096
-    recentTurnThreshold: 3
-    maxRawChars: 200000
+    cheapMaxTokens: 8192
+    recallRecentWindowMs: 7200000
+    maxRawChars: 500000
     toolResultCapChars: 20000
     maxRecallDepth: 4
     debug: false
     reminderNodeThreshold: 30
+    prefixDumpDir: ''
 
 debug writes pipeline traces to $DSH_HOME/turn-memory-debug.log.
 reminderNodeThreshold is the surface-node count of the current turn that
 triggers the compact_turn tail reminder (second tier at 1.5x).
+prefixDumpDir, when non-empty, makes every landed compaction replacement
+append one block to request-prefix.txt in that directory: the checkpoint
+node and the first kept node after it — the last two nodes at the
+replacement boundary — rendered the way their text reaches the front of
+the next request. Blocks accumulate oldest-first, separated by a divider
+line, so the file keeps every replacement boundary on record. A debug aid
+for eyeballing where folded spans end and kept content begins.
+recallRecentWindowMs is the agentic mode's recent-turn window: turns that
+ended within it route to fork (whose context replays the completed turns
+verbatim and is warm only while the provider's disk cache retains the
+prefix units persisted when those turns ran), older ones to the
+cheap-model subagent. The 2h default follows DeepSeek's documented
+best-effort cache retention of "a few hours to a few days" (lower bound).
 
 ## Behavior notes
 
-- Summaries are best-effort. A failed, timed-out, or cancelled summary fork
-  leaves the turn raw; step 2 of the plan then falls back to the raw
-  transcript for that turn.
+- Summaries are best-effort. If the main agent leaves a turn unsummarized
+  for a whole turn, a fallback fork summarizes it (one turn late); a failed,
+  timed-out, or cancelled fork leaves the turn raw and step 2 of the plan
+  falls back to the raw transcript for that turn.
 - A turn that experienced mid-turn compaction (proactive compact_turn or
   automatic pressure) is still replaced at its end: the span includes the
   turn's own compaction checkpoints, so the final turn summary converges the
@@ -131,11 +184,12 @@ triggers the compact_turn tail reminder (second tier at 1.5x).
   (turn number, summary id, format version). No custom session event type
   is introduced, so logs stay loadable by unmodified harnesses.
 - Restart recovery: when a root agent is (re)created, the last completed
-  turn that has no summary checkpoint is re-summarized once (recovery fork,
-  non-blocking for the next message). Older gaps stay raw by design.
+  turn that has no summary checkpoint is marked pending again, and the
+  resumed main agent composes its summary at the start of the next turn
+  (non-blocking). Older gaps stay raw by design.
 - Only root sessions are summarized; subagent sessions are ignored.
-- Requires the fork and spawn subagent providers (both ship with
-  @deepseek-ai/dsh-base).
+- Requires the fork and spawn subagent providers for the fallback fork and
+  expand_turn recall (both ship with @deepseek-ai/dsh-base).
 
 ## Bundled skills
 
@@ -149,8 +203,9 @@ registered when the plugin loads:
 - dsh-turn-memory — this plugin's configuration, behavior, and known
   degradation paths.
 - dsh-compact-turn — how to compose the compact_turn checkpoint for the
-  completed part of the current turn; read it before every proactive
-  compaction, then pass the text as the tool's summary argument.
+  completed part of the current turn and for whole completed turns; read it
+  before every proactive compaction, then pass the text as the tool's
+  summary argument.
 
 They appear in the skill catalog as soon as the plugin loads. Project-level
 skills override them; user-level file skills with the same names are

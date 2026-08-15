@@ -10,10 +10,11 @@
   },
   "type": "module",
   "files": [
-    "index.js"
+    "index.ts",
+    "lib/*.ts"
   ],
   "exports": {
-    ".": "./index.js",
+    ".": "./index.ts",
     "./package.json": "./package.json"
   },
   "dependencies": {
@@ -26,5 +27,13 @@
     "memory",
     "summarization",
     "compaction"
-  ]
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "@types/node": "^24.10.0"
+  }
 }

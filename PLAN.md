@@ -3,7 +3,9 @@
 > 本文档是"两步式上下文压缩改造"的持久化记录,保存所有设计决策、语义规则、
 > 实测结论与待办,防止对话丢失导致信息遗失。最后更新:2026-08-15(第二步实现完成,
 > 四轮 headless 冒烟 exit 0;新增小模型折叠后的主模型 fork 终审(3.6)并冒烟
-> 通过,见 3.8;compact_turn 主体改为当前上下文自拟摘要,见 8/10)。
+> 通过,见 3.8;compact_turn 主体改为当前上下文自拟摘要,见 8/10;
+> turn 结束摘要改为下一条用户消息到来时由主 agent 自拟、fork 只作兜底,见 11;
+> expand_turn 改为 raw/agentic 双模式、agentic 按 turn 时间路由,见 12)。
 
 ## 1. 背景与总体架构
 
@@ -15,7 +17,7 @@ compacted-summary 替换,原始事件保留在追加日志中。
 
 | 步骤 | 插件 | 状态 | 职责 |
 |---|---|---|---|
-| 第一步 | dsh-plugin-turn-memory | 已实现、已实测 | turn 级独立摘要、延迟替换、expand_turn 三档召回 |
+| 第一步 | dsh-plugin-turn-memory | 已实现、已实测 | turn 级独立摘要、延迟替换、expand_turn 双模式召回(时间路由) |
 | 第二步 | dsh-plugin-replay-compaction | 已实现、已冒烟 | 逐段重放修正式 session 压缩,完全替代 summarize() |
 
 第二步注册 ctx.compaction,与 dsh-compaction-basic 互斥——切换方式就是在 profile
@@ -47,12 +49,18 @@ Open Questions and Pending User Input / Next Step。
 强制规则:以等待用户结束的 turn,待决问题及全部选项必须逐字保留;用户纠错、
 路径、命令、错误串、标识符、数值逐字保留。
 
-### 2.3 召回(expand_turn,一个工具三个 mode,模型自选)
+### 2.3 召回(expand_turn,raw / agentic 双模式,agentic 按时间路由)
 
-- fork:主模型从当前会话状态继续(暖前缀),适合最近 turn 的深挖;
-- subagent:便宜模型(deepseek-chat)读全文定向回答,成本隔离在子上下文;
-- raw:全文直读,超长截断,最后手段;
-- auto 模式按 recentTurnThreshold(默认 3)路由:近 turn → fork,远 turn → subagent。
+- agentic(默认,须带 question):turn 结束时间(无则开始时间)距今 ≤
+  recallRecentWindowMs(默认 7200000,2 小时)走 fork——fork 的上下文是已完成
+  turn 的原始全文重放(不是 checkpoint),目标 turn 全文直接作答;仅当 provider
+  磁盘缓存还保留着这些 turn 直播时持久化的 prefix unit 时才是暖前缀、零额外
+  模型调用(DeepSeek 官方:缓存 best-effort,"不再使用后自动清除,通常几小时至
+  几天"——窗口取官方下限"几小时"附近);更早的 turn 走 subagent——便宜模型
+  (deepseek-chat)读完整转录定向回答,成本隔离在子上下文;无时间戳时回退
+  newest−2 轮距。
+- raw:全文直读,超长截断(maxRawChars),最后手段;主会话上下文里本就有所有
+  checkpoint,agentic 答不上时模型可按需升级为 raw 读全文。
 - 原文取自会话追加日志(排除 reasoning chunks 与 replacement 副本);
   fork 子会话自带父会话原始事件种子,因此摘要 fork 与 recall fork 都能读全文。
 
@@ -69,8 +77,8 @@ Open Questions and Pending User Input / Next Step。
 ### 2.5 配置项(均可选)
 
 summaryTimeoutMs 120000 / recallTimeoutMs 180000 / cheapProvider deepseek-official /
-cheapModel deepseek-chat / cheapMaxTokens 4096 / recentTurnThreshold 3 /
-maxRawChars 200000 / toolResultCapChars 20000 / maxRecallDepth 4。
+cheapModel deepseek-chat / cheapMaxTokens 8192 / recallRecentWindowMs 7200000 /
+maxRawChars 500000 / toolResultCapChars 20000 / maxRecallDepth 4。
 
 ### 2.6 实测结论(headless 冒烟 profile,两轮真实模型 turn,exit 0)
 
@@ -257,7 +265,9 @@ maxRawChars 200000 / toolResultCapChars 20000 / maxRecallDepth 4。
 
 - [ ] 第一、二步在 web 环境试运行(需重启 dsh web;观察 turn-memory 与
       replay-compaction 日志、摘要质量、expand_turn 调用日志;据此迭代提示语);
-- [ ] 标定 recentTurnThreshold(依据日志中模型主动调用的 mode 分布);
+- [x] 标定 recallRecentWindowMs:DeepSeek 官方文档无固定缓存时长数字,只说
+      "不再使用后自动清除,通常几小时至几天"(best-effort,命中需完整匹配已持久化
+      的 cache prefix unit);取官方下限附近 7200000(2 小时)为默认值,可配置。
 - [x] 第二步插件实现(见第 3 节);compaction/summary 多调用信封 schema 扩展
       (pnpm patch 形式,见 3.5);
 - [x] 主模型 fork 终审实现并冒烟(review 落盘记录、shrink 预检拒绝路径实测,
@@ -328,7 +338,8 @@ maxRawChars 200000 / toolResultCapChars 20000 / maxRecallDepth 4。
   checkpoint);连续压缩语义由 surface 机制背书(turn 47/48 已钉死):
   已压缩部分不会再次进入压缩输入,旧 checkpoint 若再次被选中则以一条浓缩
   摘要参与合并。
-- 工具性质:模型工具 compact_turn,参数 summary(必填,checkpoint 文本);
+- 工具性质:模型工具 compact_turn,参数 summary(必填,checkpoint 文本),
+  可选 turn 参数(整 turn 模式,见 11);
   isConcurrencySafe: () => false 独占执行,保证 compactRegion 的
   whole-surface stability 事务不被并发工具破坏;范围经日志区间工具配对
   平衡走查后才提交;root 会话专用。
@@ -382,6 +393,7 @@ maxRawChars 200000 / toolResultCapChars 20000 / maxRecallDepth 4。
 - 附带收益:慢的问题消失——主模型 fork 与 turn 摘要同路径(约 30 秒),
   不再触发 deepseek-chat 的 reasoning 慢路径。
 - 状态:实现于 turn 60,两插件 node --check 通过;未重启、未提交。
+- 后续:turn 结束摘要同样改由主会话自拟、fork 退为兜底,见 11。
 
 - 变更(当前上下文自拟,替代 fork 主体):用户要求 compact_turn 的主体
   不再走 fork——当前上下文(主模型自身)在调用前按 dsh-compact-turn
@@ -393,3 +405,101 @@ maxRawChars 200000 / toolResultCapChars 20000 / maxRecallDepth 4。
   replay-compaction 后端契约零改动;MEMORY_SECTION 与工具描述都点名
   该技能,模型压缩前先 skill 加载再自拟。状态:node --check 通过;
   未重启、未提交。
+
+## 11. 整 turn 摘要改由主会话自拟(fork 只作兜底)
+
+- 需求:turn 结束摘要与 turn 内压缩统一由主会话(当前上下文)撰写;时机选在
+  下一条用户消息到来时——用户的新问题进入上下文,作为"保留什么"的取舍透镜,
+  帮助 agent 写摘要。
+- 行为:
+  - turn/end(idle)→ 该 turn 只登记 pending,零模型调用;
+  - 下一条消息 → runtime 上下文(context contributor,order 131)出现 pending
+    提示,主 agent 先按 dsh-compact-turn 技能撰写上一 turn 的整 turn
+    checkpoint(上一 turn 用户原话逐字进摘要,或写 <verbatim kind="turn-prompt"/>
+    由替换时还原),再调 compact_turn(turn=N, summary);
+  - compact_turn 新增可选 turn 参数:整 turn 模式复用 tryReplace 直接落盘
+    (turn-memory 标记 checkpoint,与 fork 兜底同一替换路径),不走压缩后端、
+    无收缩校验;turn 内模式(无 turn 参数)不变;
+  - 主 agent 整个下一 turn 都没做 → 该 turn 结束时主模型 fork 兜底补摘要
+    (晚一个 turn,再下一个 pre-step 落地);fork 失败后每 turn 重试一次;
+  - 服务器重启恢复:最后一个无 checkpoint 的已完成 turn 重新登记 pending,
+    由恢复后的主 agent 撰写(不再 spawn 恢复 fork)。
+- 理由:与 turn 内压缩对齐(同一撰写者、同一技能);用户下一个问题进入提示,
+  摘要能保留与后续相关的内容;fork 退化为兜底,正常路径零额外模型调用。
+- 状态:实现于 2026-08-15;node --check 通过;未重启、未提交(等重启后实测)。
+
+## 12. expand_turn 双模式 + 时间路由(2026-08-15)
+
+- 需求(turn 8):mode 只留 raw、agentic 两种;agentic 内部根据 turn 的时间
+  决定是用之前的 checkpoint + 提示词由主会话回答,还是用 cheap 模型回答;
+  用户明确倾向放宽种种限制。
+- 实现:
+  - mode enum ['agentic','raw'],默认 agentic;question 仅 agentic 必填;
+    auto/fork/subagent 三种显式 mode 删除,路由内化为实现细节;
+  - findTurnSpan 顺带返回 turn/start、turn/end 的 time(SessionEvent 自带
+    epoch ms);routeAgenticRecall:span.endTime ?? span.startTime 距今 ≤
+    recallRecentWindowMs(默认 7200000,2 小时)→ fork,否则 → subagent
+    (cheap 模型读完整转录);无时间戳回退 newest−2 轮距;
+  - recallForkPrompt:上下文是父会话已完成 turn 的原始全文重放(不是
+    checkpoint),目标 turn 全文直接作答;fork 内缺失部分可用 expand_turn
+    mode raw 补齐;
+  - turn 9 修正:初版"fork 凭 checkpoint 回答、窗口 3600000"基于错误假设
+    (fork seed = 父会话原始日志事件,读 dsh-subagent-fork-in-process 的
+    completedTurnPrefix 确认);fork 仅当 provider 磁盘缓存保留着这些 turn
+    直播时持久化的 prefix unit 时才是暖的;DeepSeek 官方缓存无固定时长
+    ("不再使用后自动清除,通常几小时至几天",best-effort),窗口改取官方下限
+    附近 2 小时;raw 定位改为"主会话上下文本就有所有 checkpoint"的质量兜底。
+  - 放宽:cheapMaxTokens 4096→8192(旧值实测 max-tokens 失败)、maxRawChars
+    200000→500000、近期窗口从 recentTurnThreshold 轮数制改为时间制;
+  - 保留的守卫:tool-pair 平衡校验、收缩校验、toolResultCapChars 20000、
+    recallTimeoutMs 180000、maxRecallDepth 4。
+- 状态:turn 9 修正后 node --check 通过;未提交。
+
+## 13. compact_turn turn 内边界 bug 修复 + TS 化与单元测试(turn 10)
+
+- 现象:turn 内 compact_turn 承诺"turn 起始消息逐字保留",实测 turns 7/8/9 的
+  turn 内折叠区间都恰好从该 turn 的用户消息 seq 开始(204683/262046/308409),
+  用户消息被折进 checkpoint、脱离 surface;撰写 turn 8/9 摘要时上下文里已看
+  不到目标 turn 的用户消息,只能从日志恢复(turn 7 摘要首行因此是转述而非逐字)。
+- 根因:spanStart = nodes.findIndex(seq > turnStart.seq) 按 position 顺序查找;
+  前序 turn 的替换 checkpoint 位置在 open turn 之前、其 seq 又大于当前
+  turn/start,查找提前一步停在 checkpoint 上,startSeq = nodes[spanStart+1]
+  恰好是用户消息,被纳入折叠区间。佐证:4 条 turn 内折叠中除第一条(11707,当时
+  surface 尚无 checkpoint)外,替换起点全部等于各自 turn 的用户消息 seq。
+- 修复:改为找 surface 上 seq 大于 turn/start 的最小 seq 节点(open turn 的
+  用户消息),再取其下一张作为折叠起点。
+- 随修复把插件 TS 化(index.js → index.ts,git mv 保留历史):纯边界逻辑抽到
+  lib/bounds.ts(computeSpanBoundaries / computeWalkRange / checkToolPairBalance)
+  与 lib/routing.ts(routeRecallByAge),入口只做调用;node 24 原生 type stripping
+  直接跑 .ts、零构建(入口 exports 指 index.ts);tsconfig 开 erasableSyntaxOnly,
+  lib 全量严格定型,入口文件增量定型(noImplicitAny 关,消费 harness 运行时用
+  结构类型)。
+- 单元测试 test/bounds.test.ts + test/routing.test.ts(node:test,17 例,含
+  spanStart 回归用例:前序 checkpoint 大 seq 下用户消息绝不入折叠区间),
+  pnpm test 17/17 通过;pnpm typecheck 通过(dsh-tools 自带 .d.ts,tsc 首次跑出
+  34 个真实类型错误——findLastEvent 可选参、catch 变量、空数组 never[]、
+  Promise<void> 等——已全部修正)。
+- 工作流改为:改 index.ts / lib/*.ts → pnpm typecheck + pnpm test → 走
+  dsh-web-restart 重启生效(包内技能文案、README 已同步)。
+- 状态:typecheck + 17 测试通过;重启调度中(30 秒延迟,由下一 turn 以运行时
+  证据验证新代码生效);未提交。
+
+## 14. 压缩边界 request-prefix dump(turn 11)
+
+- 需求:compact_turn 落盘后,把"等价于下一 request 前缀"的接缝信息写进项目内
+  临时目录,只留最后两个节点(checkpoint + 其后第一个保留节点),肉眼确认边界。
+- 实现:新增配置 prefixDumpDir(默认 ''=关闭);三个替换路径(turn 内压缩事务、
+  compact_turn 整 turn 替换、fork 兜底替换)落盘后,把接缝两节点按 request
+  前缀里的文本形态渲染(lib/prefix.ts 纯函数 renderBoundaryNode /
+  renderPrefixBoundary)追加写入 <dir>/request-prefix.txt。turn 内模式的
+  header 另注一行:保留在 checkpoint 之前的 turn 起始用户消息 seq。tool/result
+  节点只占一行占位(名字或 callId),不发全文,保持接缝可读。
+- turn 13 变更:用户要求保留全部边界记录——dump 从单文件覆盖改为追加:新增
+  纯函数 appendDumpBlock(existing, block)(lib/prefix.ts),首块原样写入、后续
+  块接在分隔线(DUMP_BLOCK_SEPARATOR)之后;dumpPrefixBoundary 改为读旧文件
+  再拼接写回。旧文件内容保留,新块接在末尾,文件只增不减。
+- 测试:test/prefix.test.ts(12 例,含 next=null 的 surface 尾部场景与
+  appendDumpBlock 的累积/分隔/顺序)。
+- 本机 profile(cordis.patch.yml)已把 prefixDumpDir 指向本项目 .tmp/
+  (.gitignore 排除);生效需 dsh web 重启,由下一 turn 的压缩以文件存在为证。
+- 状态:重启调度中;未提交。

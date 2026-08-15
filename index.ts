@@ -44,7 +44,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
 import { checkToolPairBalance, computeSpanBoundaries, computeWalkRange } from './lib/bounds.ts';
-import { appendDumpBlock, renderPrefixBoundary } from './lib/prefix.ts';
+import { appendDumpBlock, buildDumpFileName, renderPrefixBoundary } from './lib/prefix.ts';
 import { routeRecallByAge } from './lib/routing.ts';
 
 /** File-based debug trace (the cordis logger buffer is not file-visible, and /tmp is per-process private). */
@@ -91,7 +91,7 @@ const DEFAULT_SETTINGS = {
   maxRecallDepth: 4,
   /** Write pipeline traces to /home/vilicvane/.dsh/turn-memory-debug.log. */
   debug: false,
-  /** When non-empty, every landed compaction replacement appends one block to request-prefix.txt in this directory (the checkpoint node and the first kept node after it, separated by a divider line, accumulating forever) — a debug aid for eyeballing where each folded span ends and the kept content begins. */
+  /** When non-empty, every landed compaction replacement appends one block to request-prefix-<sessionId>.txt in this directory — one accumulating file per session (the checkpoint node and the first kept node after it, separated by a divider line) — a debug aid for eyeballing where each folded span ends and the kept content begins. */
   prefixDumpDir: '',
   /** Surface-node count of the current turn that triggers the compact_turn tail reminder; the second tier fires at 1.5x. */
   reminderNodeThreshold: 30,
@@ -394,7 +394,7 @@ const PLUGIN_SKILLS = [
       '- 某 turn 长时间没有替换节点的可能：(1) 主 agent 未调用 compact_turn 或调用失败 → 下一 turn 结束时 fork 兜底，兜底摘要在再下一个 pre-step 落地；(2) 服务器重启（内存态丢失）→ 恢复时最后一个无 checkpoint 的已完成 turn 重新登记 pending，由恢复后的主 agent 在下一条用户消息到来时撰写。',
       '- compact_turn 模型工具：长 turn 中主动压缩当前 turn 已完成部分（turn 起始消息之后、当前 step 之前），只留起始消息逐字、当前 step 不动；独占执行保证压缩事务期间 surface 稳定。摘要由当前上下文（主模型自身）撰写——撰写规则在 dsh-compact-turn 技能里，随 summary 参数传入；工具只做范围/配平校验，事务仍走后端 compactRegionWithSummary（锁/稳定性/收缩校验全部复用）；后端不支持该入口时回退其自带摘要。带 turn 参数的整 turn 模式：把已完成 turn 的整段（含用户消息）替换为带 turn-memory 标记的 turn 摘要 checkpoint（复用 tryReplace 直接落盘，不走压缩后端、无收缩校验）。turn 内压缩产生的 checkpoint 会纳入该 turn 最终的 turn 摘要替换（收敛合并，不是原文重喂）；后续再次压缩时旧 checkpoint 以一条浓缩摘要参与合并。',
       '- 条件式尾部提醒：当前 turn 的 surface 节点数超过 reminderNodeThreshold（默认 30，按节点数不按 token）时，runtime 快照末尾出现一行提醒；超过 1.5 倍时升级为更直接的警告。低于阈值时零贡献、零 token；压缩落地后 turn 缩回阈值以下，提醒自行消失。',
-'- prefixDumpDir 非空时，每次压缩替换落盘后把接缝处最后两个节点（新 checkpoint + 其后第一个保留节点，按它们在 request 前缀里的文本形态渲染）追加写入 <prefixDumpDir>/request-prefix.txt（每个替换一块、块间以分隔线隔开，文件只增不减、最早的替换边界在最前），肉眼确认替换边界用。',
+'- prefixDumpDir 非空时，每次压缩替换落盘后把接缝处最后两个节点（新 checkpoint + 其后第一个保留节点，按它们在 request 前缀里的文本形态渲染）追加写入 <prefixDumpDir>/request-prefix-<sessionId>.txt——按 session 各建一个文件（每个替换一块、块间以分隔线隔开，文件只增不减、最早的替换边界在最前），肉眼确认替换边界用。',
       '- 替换节点 source = {kind: plugin, plugin: turn-memory, turn, turnSummaryId, version}。',
       '- expand_turn 双模式：agentic（默认；工具按 turn 的时间内部路由——end 距今 ≤ recallRecentWindowMs（默认 7200000，2 小时）的近期 turn 由 fork 回答，fork 的上下文是已完成 turn 的原始全文重放（不是 checkpoint），且仅当 provider 磁盘缓存还保留着这些 turn 直播时持久化的 prefix unit 时才是暖的、零额外模型调用；更早的 turn 由 cheap 模型读完整转录定向回答；question 必填）与 raw（原文直读、最后手段、超长按 maxRawChars 截断；question 忽略）。',
       '- 摘要与操作说明的分工：摘要只记发生了什么/决定了什么；可复用操作步骤放技能，摘要里只留名字引用。',
@@ -989,15 +989,16 @@ function apply(ctx, config) {
    * Append the request-prefix boundary dump after a replacement lands: the
    * checkpoint node and the first kept node after it — the last two nodes at
    * the boundary — rendered the way their text reaches the front of the next
-   * request. Blocks accumulate in one file, oldest first, separated by a
-   * divider line. Disabled unless prefixDumpDir is set; best-effort.
+   * request. Blocks accumulate in one file per session, oldest first,
+   * separated by a divider line. Disabled unless prefixDumpDir is set;
+   * best-effort.
    */
   function dumpPrefixBoundary(session, mode, checkpointSeq, nextSeq, replacedNodes, replacedSpan, note) {
     const dir = settings.prefixDumpDir;
     if (typeof dir !== 'string' || dir === '') return;
     try {
       mkdirSync(dir, { recursive: true });
-      const file = dir + '/request-prefix.txt';
+      const file = dir + '/' + buildDumpFileName(String(session.id));
       const text = renderPrefixBoundary(
         {
           timestamp: new Date().toISOString(),
@@ -1014,7 +1015,7 @@ function apply(ctx, config) {
       );
       const existing = existsSync(file) ? readFileSync(file, 'utf8') : '';
       writeFileSync(file, appendDumpBlock(existing, text));
-      dbg('prefix-dump: request-prefix.txt appended (' + mode + '; checkpoint seq ' + checkpointSeq + ', next seq ' + String(nextSeq) + ')');
+      dbg('prefix-dump: ' + file + ' appended (' + mode + '; checkpoint seq ' + checkpointSeq + ', next seq ' + String(nextSeq) + ')');
     } catch (error) {
       dbg('prefix-dump: FAILED ' + errorText(error));
     }

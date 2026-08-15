@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { appendDumpBlock, DUMP_BLOCK_SEPARATOR, renderBoundaryNode, renderPrefixBoundary } from '../lib/prefix.ts';
+import { appendDumpBlock, buildDumpFileName, DUMP_BLOCK_SEPARATOR, renderBoundaryNode, renderPrefixBoundary } from '../lib/prefix.ts';
 import type { BoundaryNodeLike, PrefixBoundaryMeta } from '../lib/prefix.ts';
 
 const userMessage = (text: string): BoundaryNodeLike => ({
@@ -104,5 +104,26 @@ describe('appendDumpBlock', () => {
     assert.ok(a >= 0 && b > a && c > b, 'blocks stay in chronological order');
     assert.ok(sep >= 0 && lastSep > sep, 'one divider per appended block');
     assert.ok(text.endsWith('BLOCK-C\n'));
+  });
+});
+
+describe('buildDumpFileName', () => {
+  it('wraps a session id in the request-prefix name', () => {
+    assert.equal(
+      buildDumpFileName('9ef62b3f-178e-43b3-9a30-c67c036b7a05'),
+      'request-prefix-9ef62b3f-178e-43b3-9a30-c67c036b7a05.txt',
+    );
+  });
+
+  it('replaces characters outside the safe set with underscores', () => {
+    assert.equal(buildDumpFileName('a/b:c*d?e'), 'request-prefix-a_b_c_d_e.txt');
+  });
+
+  it('keeps dots, dashes and underscores', () => {
+    assert.equal(buildDumpFileName('a.b-c_d'), 'request-prefix-a.b-c_d.txt');
+  });
+
+  it('falls back to unknown for an empty session id', () => {
+    assert.equal(buildDumpFileName(''), 'request-prefix-unknown.txt');
   });
 });

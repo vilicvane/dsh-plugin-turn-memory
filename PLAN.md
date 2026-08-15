@@ -500,6 +500,10 @@ maxRawChars 500000 / toolResultCapChars 20000 / maxRecallDepth 4。
   再拼接写回。旧文件内容保留,新块接在末尾,文件只增不减。
 - 测试:test/prefix.test.ts(12 例,含 next=null 的 surface 尾部场景与
   appendDumpBlock 的累积/分隔/顺序)。
+- turn 23 变更:用户要求按 session 建文件——新增纯函数 buildDumpFileName
+  (lib/prefix.ts,把 sessionId 消毒后拼成 request-prefix-<sessionId>.txt),
+  dumpPrefixBoundary 改为写入该文件;每 session 一个只增文件,旧的单文件
+  request-prefix.txt 保留为历史不再更新。
 - 本机 profile(cordis.patch.yml)已把 prefixDumpDir 指向本项目 .tmp/
   (.gitignore 排除);生效需 dsh web 重启,由下一 turn 的压缩以文件存在为证。
 - 状态:重启调度中;未提交。

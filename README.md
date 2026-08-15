@@ -164,7 +164,8 @@ debug writes pipeline traces to $DSH_HOME/turn-memory-debug.log.
 reminderNodeThreshold is the surface-node count of the current turn that
 triggers the compact_turn tail reminder (second tier at 1.5x).
 prefixDumpDir, when non-empty, makes every landed compaction replacement
-append one block to request-prefix.txt in that directory: the checkpoint
+append one block to request-prefix-<sessionId>.txt in that directory — one
+accumulating file per session: the checkpoint
 node and the first kept node after it — the last two nodes at the
 replacement boundary — rendered the way their text reaches the front of
 the next request. Blocks accumulate oldest-first, separated by a divider

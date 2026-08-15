@@ -3,7 +3,7 @@
  * appended after each compaction replacement lands: the checkpoint node and
  * the first kept node after it — the last two nodes at the boundary —
  * rendered the way their message text reaches the front of the next request.
- * Blocks accumulate in one file, separated by a divider line, so every
+ * Blocks accumulate per session file, separated by a divider line, so every
  * replacement boundary stays on record. Extracted from the plugin entry so
  * the rendering is unit-testable without booting the plugin.
  *
@@ -54,6 +54,12 @@ export interface PrefixBoundaryMeta {
 }
 
 const NL = String.fromCharCode(10);
+
+/** Name of one session's dump file: request-prefix-<sessionId>.txt, with any character outside [A-Za-z0-9._-] replaced by "_". */
+export function buildDumpFileName(sessionId: string): string {
+  const safe = String(sessionId).replace(/[^A-Za-z0-9._-]+/g, '_');
+  return 'request-prefix-' + (safe === '' ? 'unknown' : safe) + '.txt';
+}
 
 /** Render one surface node the way its text reaches the request front. */
 export function renderBoundaryNode(event: BoundaryNodeLike | undefined): string {

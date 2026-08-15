@@ -116,6 +116,7 @@ function buildSummaryPrompt(turn) {
     '- Preserve VERBATIM whatever keeps your intuition about the current context: the user\'s exact wording and emphasis, your own commitments and offers, and any phrasing a later turn is likely to refer back to. Commands, paths, identifiers, and error strings stay verbatim too. A summary that loses the wording loses the thread.',
     '- Preserve read-in material (code, docs, config, output) as paths, not content: inline only short key snippets (a critical line, a value); for anything longer record the exact path plus ONE short line saying what it is and why it matters, and re-read the file with the read tool when the content is needed again — copied text goes stale, the file stays current. Do not duplicate what an earlier checkpoint, a loaded skill, or another entry of this summary already covers.',
     '- The message that started this turn: reproduce it verbatim as the first timeline entry; when it is long, write the placeholder tag <verbatim kind="turn-prompt"/> instead, with one short line beside it saying what the message asks and why it matters. This summary lands as a whole-turn replacement, which swaps the tag back to the original message — the tag only saves output tokens, never drops content.',
+    '- Once this summary lands, it is the only trace of this turn the main context sees: the original text is gone and can only be recovered with an expand_turn recall (or by re-reading files), each costing tokens and time. Keep whatever a future turn is likely to reference, verify, or continue — a line kept now is cheaper than a recall later.',
     '- Name skills and procedures instead of restating their steps ("restarted dsh web per the dsh-web-restart skill"); when unsure of the name, check the skill catalog with the skill tool.',
     '- Output only the summary text. Do not call any tool unless you must verify details of the turn you are summarizing; when detail is uncertain, verify it with the expand_turn tool (mode raw) rather than guessing.',
   ].join(NL);
@@ -131,7 +132,7 @@ const MEMORY_SECTION = [
   '',
   'Summaries annotate hindsight in natural language: entries later proven wrong carry an inline correction ("I thought X might work. It later turned out wrong."), and assumptions are stated as they were felt at the time. Treat later corrections as authoritative over earlier entries.',
   '',
-  'During a long turn, compact proactively with the compact_turn tool before context pressure forces the automatic compactor. Compose the checkpoint text yourself from your current context, following the dsh-compact-turn skill, and pass it to compact_turn as the summary argument; the tool replaces the completed part of the current turn (everything after the turn-starting message, up to the current step) with that checkpoint. The turn-starting message and the current step stay verbatim.',
+  'During a long turn, compact proactively with the compact_turn tool before context pressure forces the automatic compactor. Compose the checkpoint text yourself from your current context, following the dsh-compact-turn skill, and pass it to compact_turn as the summary argument; the tool replaces the completed part of the current turn (everything after the turn-starting message, up to the current step) with that checkpoint. What the checkpoint replaces leaves your context; recovering it later costs an expand_turn recall — keep in the checkpoint what a future step is likely to need. The turn-starting message and the current step stay verbatim.',
   '',
   'When the runtime context carries a pending-turn notice (a completed previous turn has no summary checkpoint yet), compose that turn\'s whole-turn checkpoint FIRST, following the dsh-compact-turn skill: the message that just opened this turn is your lens for what the previous turn must retain, and the previous turn\'s own user message must be preserved verbatim inside the checkpoint (or write <verbatim kind="turn-prompt"/> and the original message is restored when the checkpoint lands). Then call compact_turn with the turn number and the checkpoint text as the summary argument — the call replaces the entire previous turn on the surface, its user message included, and frees context for the rest of this turn.',
   '',
@@ -420,6 +421,7 @@ const PLUGIN_SKILLS = [
       '- 逐字保留维持上下文直觉的措辞：用户原话与强调、自己做出的承诺与提议、后续可能被引用的表述；命令、路径、标识符、错误串也逐字保留。',
       '- 可复用流程只写技能名/脚本路径，不重述步骤。',
       '- checkpoint 必须能独立承载这段记录，并保持明显短于被替换的区间。',
+      '- 压缩即移出视野：checkpoint 落地后，被替换区间的原文就不再出现在你的上下文里，日后只能靠 expand_turn 召回（近期 fork 直接回答、更早由小模型读全文）或重读文件，每次都有 token 与时间成本；将来很可能被引用、核对、延续的细节，现在多留一行比以后花一次召回便宜。',
       '',
       '## turn 内模式（无 turn 参数）',
       '',
@@ -585,7 +587,7 @@ function apply(ctx, config) {
       'Compose the checkpoint text yourself from your current context, following the dsh-compact-turn skill, and pass it as the summary argument — no subagent summarizes the span for you.',
       'The compacted range is everything after the turn-starting message up to (excluding) the current step; the turn-starting message stays verbatim and the current step is untouched.',
       'With the optional turn argument, compact a COMPLETED previous turn whole instead: its entire span — that turn\'s own user message included — is replaced by your checkpoint, so preserve that turn\'s user request verbatim.',
-      'Use it proactively when the turn is getting long and more work lies ahead, before automatic pressure compaction forces a less-informed cut. It runs exclusively, so other tool calls wait for it.',
+      'Use it proactively when the turn is getting long and more work lies ahead, before automatic pressure compaction forces a less-informed cut. After the call the compacted span leaves your context; recover it later only via expand_turn (or re-reading files) — keep in the checkpoint what a future step is likely to need. It runs exclusively, so other tool calls wait for it.',
     ].join(' '),
     parameters: {
       summary: {

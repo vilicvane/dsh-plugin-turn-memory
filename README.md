@@ -86,6 +86,11 @@ Marking rules:
   anything longer is recorded as the exact path plus one line saying what it
   is and why it matters — re-read the file with the read tool when the
   content is needed again, since copied text goes stale.
+- Once the checkpoint lands, it is the only trace of the turn the main
+  context sees: the original text can only be recovered with an expand_turn
+  recall (or by re-reading files), each costing tokens and time. Keep
+  whatever a future turn is likely to reference, verify, or continue — a
+  line kept now is cheaper than a recall later.
 - The message that started the turn is reproduced verbatim as the first
   timeline entry; when it is long, a placeholder tag
   <verbatim kind="turn-prompt"/> takes its place and the harness swaps the

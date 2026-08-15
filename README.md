@@ -22,29 +22,50 @@ The expand_turn tool recalls a turn's full transcript in three modes:
 The model picks the mode itself (default auto routes recent turns to fork and
 older turns to subagent).
 
-## Summary format (version 3)
+The compact_turn tool lets the model compact proactively during a long turn:
+it replaces the completed part of the current turn (everything after the
+turn-starting message, up to the current step) with one checkpoint, keeping
+the turn-starting message and the current step verbatim. The checkpoint text
+is composed by the current context itself — the composing rules live in the
+bundled dsh-compact-turn skill and the text arrives as the tool's summary
+argument — so no fork or subagent summarizes the span. The tool validates
+the range (root session, tool-pair balance) and runs exclusively so the
+compaction transaction never races another tool call; the transaction
+itself — lock, whole-surface stability, shrink check, durability — stays in
+the mounted compaction backend through compactRegionWithSummary, and
+backends without that entry summarize the range themselves. Session
+compaction keeps its own cheap-model summarizer; the two never mix.
 
-Each checkpoint is a single user message:
+A conditional tail reminder backs it up: once the current turn spans more
+than reminderNodeThreshold surface nodes (default 30, counted by nodes, not
+tokens), the end-of-context runtime snapshot carries one stable line nudging
+the model toward compact_turn; at 1.5x the threshold the line escalates to a
+direct warning. Below the threshold the reminder contributes nothing — zero
+tokens, zero noise — and it disappears on its own once a compaction lands.
 
-    <turn-summary turn="12" version="3">
-    ## Timeline
-    - [chronological entries: user requests, decisions, discoveries, fixes]
-    ## Current State
-    - [what stands when the turn ends]
-    ## Open Questions and Pending Input
-    - [pending questions, reproduced VERBATIM]
-    ## Next Step
-    - [the single next action, or (none)]
+## Summary format (version 4)
+
+Each checkpoint is a single user message whose body is ONE flowing timeline —
+no section headers, no forms:
+
+    <turn-summary turn="12" version="4">
+    - [one entry per user request, decision, discovery, fix, or meaningful
+      outcome, in the order they happened]
+    - [tail entries naturally carry current state, pending input, next step]
     </turn-summary>
 
 Marking rules:
 
-- Superseded ideas, methods, and conclusions carry a leading [outdated]
-  marker; when a turn invalidates something from an earlier summary, it names
-  that turn.
-- Untested assumptions carry a leading [assumption] marker.
-- User wording, commands, paths, identifiers, and error strings are quoted
-  verbatim wherever wording matters.
+- Hindsight is written in natural language, not bracket tags: when a later
+  development proves an earlier entry wrong, the correction is annotated
+  inline at the point it went wrong — "I thought X might work. (It later
+  turned out wrong.)" — and stays beside the entry it revises. Assumptions
+  are stated as they were felt at the time; later corrections are
+  authoritative over earlier entries.
+- Whatever keeps intuition about the current context is preserved verbatim:
+  user wording and emphasis, the assistant's own commitments and offers, and
+  any phrasing later turns are likely to refer back to — plus commands,
+  paths, identifiers, and error strings.
 - Read-in material (code, docs, config, output) that the turn relied on or
   future turns will likely need is preserved verbatim enough to avoid
   re-reading, each passage with one line saying why it matters.
@@ -91,16 +112,21 @@ All keys optional, with defaults:
     toolResultCapChars: 20000
     maxRecallDepth: 4
     debug: false
+    reminderNodeThreshold: 30
 
 debug writes pipeline traces to $DSH_HOME/turn-memory-debug.log.
+reminderNodeThreshold is the surface-node count of the current turn that
+triggers the compact_turn tail reminder (second tier at 1.5x).
 
 ## Behavior notes
 
 - Summaries are best-effort. A failed, timed-out, or cancelled summary fork
   leaves the turn raw; step 2 of the plan then falls back to the raw
   transcript for that turn.
-- Turns that experienced mid-turn compaction are not replaced (the surface
-  already carries a checkpoint for part of the turn).
+- A turn that experienced mid-turn compaction (proactive compact_turn or
+  automatic pressure) is still replaced at its end: the span includes the
+  turn's own compaction checkpoints, so the final turn summary converges the
+  mid-turn checkpoint and the tail into one record.
 - The replacement is a user/message with the turn-memory source marker
   (turn number, summary id, format version). No custom session event type
   is introduced, so logs stay loadable by unmodified harnesses.
@@ -122,10 +148,24 @@ registered when the plugin loads:
   event vocabulary, surface replacement checks).
 - dsh-turn-memory — this plugin's configuration, behavior, and known
   degradation paths.
+- dsh-compact-turn — how to compose the compact_turn checkpoint for the
+  completed part of the current turn; read it before every proactive
+  compaction, then pass the text as the tool's summary argument.
 
 They appear in the skill catalog as soon as the plugin loads. Project-level
 skills override them; user-level file skills with the same names are
 shadowed.
+
+## Deployment on this machine
+
+The two-step system's host wiring lives in `~/.dsh/profiles/web/cordis.patch.yml`
+(compaction-basic disabled, command-compact re-enabled, turn-memory inserted
+before replay-compaction). The shipped agent presets mount their own
+compaction stack that host patches cannot reach; the personal preset
+`~/.dsh/.agent-presets/vilicvane` (a fork of `code` / PTC 模式) removes it so
+all compaction entry points resolve the replay fold. See
+`dsh-plugin-replay-compaction`'s README and the preset's own README for the
+details.
 
 ## License
 

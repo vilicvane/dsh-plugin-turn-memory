@@ -18,9 +18,9 @@
  *    fork (main-model continuation), subagent (cheap-model directed read),
  *    raw (transcript into context). The model picks the mode itself.
  *
- * Replacement of turns that experienced mid-turn compaction is skipped (the
- * surface already carries a checkpoint for part of the turn); the turn then
- * stays as-is and step 2 falls back to the raw transcript.
+ * Replacement of a turn that experienced mid-turn compaction includes the
+ * turn's own compaction checkpoints in the span, so the final turn summary
+ * converges the mid-turn checkpoint and the tail into one record.
  *
  * Note on style: this file intentionally uses plain string concatenation and
  * String.fromCharCode(10) for newlines (no template literals, no backslash
@@ -49,7 +49,7 @@ const name = 'turn-memory';
 const inject = ['subagents', 'sessions', 'systemPrompt', 'tools', 'skills'];
 
 /** Format version stamped into every summary checkpoint source. */
-const TURN_SUMMARY_VERSION = 3;
+const TURN_SUMMARY_VERSION = 4;
 
 /** The plugin field of the checkpoint source marker. */
 const SUMMARY_MARKER_PLUGIN = 'turn-memory';
@@ -74,6 +74,8 @@ const DEFAULT_SETTINGS = {
   maxRecallDepth: 4,
   /** Write pipeline traces to /home/vilicvane/.dsh/turn-memory-debug.log. */
   debug: false,
+  /** Surface-node count of the current turn that triggers the compact_turn tail reminder; the second tier fires at 1.5x. */
+  reminderNodeThreshold: 30,
 };
 
 /** Summary instruction sent to the per-turn summary fork. */
@@ -85,24 +87,14 @@ function buildSummaryPrompt(turn) {
     '',
     'Write a COMPACT flowing chronological record — a timeline, not a form. Keep only what a future turn needs; drop transient detail such as individual tool calls, intermediate output, and routine checks.',
     '',
-    'Use EXACTLY this structure:',
-    '',
-    '## Timeline',
-    '- [chronological entries: one per user request, decision, discovery, fix, or meaningful outcome, in the order they happened]',
-    '',
-    '## Current State',
-    '- [what stands when the turn ends: artifacts, configurations, running processes, open threads]',
-    '',
-    '## Open Questions and Pending Input',
-    '- [questions awaiting the user; reproduce the question and its options VERBATIM — the next answer will likely refer to these options by their wording]',
-    '',
-    '## Next Step',
-    '- [the single next action, or (none)]',
+    'Replicate the turn as ONE flowing timeline — no section headers, no forms. One entry per user request, decision, discovery, fix, or meaningful outcome, in the order they happened; each entry starts on its own line. The tail of the timeline naturally carries what stands at the end and what awaits the user.',
     '',
     'Marking:',
-    '- Mark superseded or disproven ideas, methods, and conclusions with a leading [outdated]: entry. When this turn invalidates something from an earlier summary, name that turn ("[outdated] turn 3 assumed X — this turn showed Y").',
-    '- Mark untested assumptions and tentative conclusions with a leading [assumption]: entry, so later turns treat them as unverified.',
-    '- Quote user wording, commands, paths, identifiers, and error strings VERBATIM wherever wording matters.',
+    '- Write hindsight in natural language, not bracket tags. When a later development proves an earlier entry wrong, annotate it at the point it went wrong — for example: "I thought X might work. (It later turned out wrong.)" — and keep the correction beside the entry it revises. When this turn invalidates something from an earlier summary, say so in natural language and name that turn.',
+    '- State assumptions as they were felt at the time ("I assumed X, unverified"). When a later entry disproves one, add the natural-language correction there rather than rewriting the original entry.',
+    '- If the turn ended waiting for the user, include the pending question and ALL its options VERBATIM as a timeline entry — the next answer will likely refer to these options by their wording.',
+    '- End the timeline with the single next action when one is clear.',
+    '- Preserve VERBATIM whatever keeps your intuition about the current context: the user\'s exact wording and emphasis, your own commitments and offers, and any phrasing a later turn is likely to refer back to. Commands, paths, identifiers, and error strings stay verbatim too. A summary that loses the wording loses the thread.',
     '- Preserve read-in material (code, docs, config, output) that this turn relied on or that future turns will likely need, verbatim enough to avoid re-reading — judge relevance broadly: include what you expect to help later, not only what was used right now. For each kept passage, add ONE short line saying why it matters and what it is for. Do not duplicate what an earlier checkpoint, a loaded skill, or another entry of this summary already covers.',
     '- Large verbatim passages: do not reproduce a passage longer than roughly 800 characters into the summary. Emit one placeholder tag instead — <verbatim kind="turn-prompt"/> for the message that started this turn, <verbatim kind="tool-result" callId="CALL_ID"/> for a tool result (the call id is visible on the tool-result block) — with ONE short line beside it saying what the passage is and why it matters. The harness replaces every tag with the original text when the checkpoint lands; tags exist only to save output tokens, never to omit content.',
     '- Name skills and procedures instead of restating their steps ("restarted dsh web per the dsh-web-restart skill"); when unsure of the name, check the skill catalog with the skill tool.',
@@ -110,13 +102,17 @@ function buildSummaryPrompt(turn) {
   ].join(NL);
 }
 
+
+
 /** Memory guidance section added to every agent's system prompt. */
 const MEMORY_SECTION = [
   '## Conversation Memory',
   '',
   'Each completed turn is stored as a flowing summary that marks the turn it replaces. Summaries fold turn-level detail; when one may not contain what you need, or when you must verify what happened in earlier turns — including when the user challenges a claim about them — recall the full information with the expand_turn tool BEFORE answering. Only the original transcripts settle the facts; summaries of neighboring turns can read as contradictory.',
   '',
-  'Summaries mark superseded ideas, methods, and conclusions with [outdated] and unverified assumptions with [assumption]; treat marked items accordingly.',
+  'Summaries annotate hindsight in natural language: entries later proven wrong carry an inline correction ("I thought X might work. It later turned out wrong."), and assumptions are stated as they were felt at the time. Treat later corrections as authoritative over earlier entries.',
+  '',
+  'During a long turn, compact proactively with the compact_turn tool before context pressure forces the automatic compactor. Compose the checkpoint text yourself from your current context, following the dsh-compact-turn skill, and pass it to compact_turn as the summary argument; the tool replaces the completed part of the current turn (everything after the turn-starting message, up to the current step) with that checkpoint. The turn-starting message and the current step stay verbatim.',
   '',
   'The recall modes, in order of fidelity:',
   '',
@@ -369,20 +365,45 @@ const PLUGIN_SKILLS = [
       '## 配置（profile cordis.patch.yml 的 turn-memory 行）',
       '',
       '- debug: false（默认）。开 true 后管道轨迹写 $DSH_HOME/turn-memory-debug.log。用文件级日志是因为 cordis logger 只写内存缓冲、不落盘，且 /tmp 对服务器进程私有。',
-      '- 其余键与默认：summaryTimeoutMs 120000、recallTimeoutMs 180000、cheapProvider deepseek-official、cheapModel deepseek-chat、cheapMaxTokens 4096、recentTurnThreshold 3、maxRawChars 200000、toolResultCapChars 20000、maxRecallDepth 4。',
+      '- 其余键与默认：summaryTimeoutMs 120000、recallTimeoutMs 180000、cheapProvider deepseek-official、cheapModel deepseek-chat、cheapMaxTokens 4096、recentTurnThreshold 3、maxRawChars 200000、toolResultCapChars 20000、maxRecallDepth 4、reminderNodeThreshold 30。',
       '',
       '## 行为约定',
       '',
-      '- turn 结束 → 主模型 fork 生成流水摘要（Timeline/Current State/Open Questions and Pending Input/Next Step）；下一条用户消息的 pre-step → 上一 turn 被 <turn-summary turn=N version=N> checkpoint 替换；最新用户消息永远逐字保留。',
-      '- 某 turn 没有替换节点的三种可能：(1) 该 turn 内发生过中途压缩（有意跳过）；(2) 摘要 fork 失败/超时；(3) 服务器重启（内存态丢失、fork 被中止）。重启恢复：根 agent 重建时，最后一个无 checkpoint 的已完成 turn 会被补摘要一次；更早的空缺保持原文。',
+      '- turn 结束 → 主模型 fork 生成纯时间线摘要（无固定 section，一条条按时间顺序排列；尾部自然承载当前状态、待决问题与下一步）；下一条用户消息的 pre-step → 上一 turn 被 <turn-summary turn=N version=N> checkpoint 替换；最新用户消息永远逐字保留。后验修正用自然语言括注（"我觉得这样可能不错。（但是后来发现不对）"），不用方括号标记；逐字保留维持上下文直觉的措辞（用户原话、自己做出的承诺、后续可能被引用的表述）。',
+      '- 某 turn 没有替换节点的两种可能：(1) 摘要 fork 失败/超时；(2) 服务器重启（内存态丢失、fork 被中止）。重启恢复：根 agent 重建时，最后一个无 checkpoint 的已完成 turn 会被补摘要一次；更早的空缺保持原文。',
+      '- compact_turn 模型工具：长 turn 中主动压缩当前 turn 已完成部分（turn 起始消息之后、当前 step 之前），只留起始消息逐字、当前 step 不动；独占执行保证压缩事务期间 surface 稳定。摘要由当前上下文（主模型自身）撰写——撰写规则在 dsh-compact-turn 技能里，随 summary 参数传入；工具只做范围/配平校验，事务仍走后端 compactRegionWithSummary（锁/稳定性/收缩校验全部复用）；后端不支持该入口时回退其自带摘要。turn 内压缩产生的 checkpoint 会纳入该 turn 最终的 turn 摘要替换（收敛合并，不是原文重喂）；后续再次压缩时旧 checkpoint 以一条浓缩摘要参与合并。',
+      '- 条件式尾部提醒：当前 turn 的 surface 节点数超过 reminderNodeThreshold（默认 30，按节点数不按 token）时，runtime 快照末尾出现一行提醒；超过 1.5 倍时升级为更直接的警告。低于阈值时零贡献、零 token；压缩落地后 turn 缩回阈值以下，提醒自行消失。',
       '- 替换节点 source = {kind: plugin, plugin: turn-memory, turn, turnSummaryId, version}。',
       '- expand_turn 三档：fork（主模型延续、吃暖前缀、适合近期）、subagent（便宜模型定向总结）、raw（原文直读、最后手段）；auto 按 recentTurnThreshold 路由，模型自选。',
       '- 摘要与操作说明的分工：摘要只记发生了什么/决定了什么；可复用操作步骤放技能，摘要里只留名字引用。',
+      '- 压缩后端：host 层由本体系第二步插件 dsh-plugin-replay-compaction 提供 ctx.compaction（web 的 cordis.patch.yml 已禁用 harness 自带 dsh-compaction-basic）。注意：内置 agent preset（standard / code=「PTC 模式」）各自带一个 isolate 组重新挂载 compaction-basic + command-compact + tool-result-pruner，host 补丁够不到它——这些 preset 的会话里手动 /compact 与压力压缩走 basic 引擎，不是 fold。个人 preset `vilicvane`（~/.dsh/.agent-presets/vilicvane，code 的 fork，删除了该 isolate 组、command-compact 独立成行）三入口（/compact、压力自动压缩、compact_turn）统一走 replay fold；新会话建议选它。曾有一次针对 compaction-basic 的指令补丁，经查是死代码，已用 npm 原版 tarball 还原并删除补丁脚本。模型分工：turn 内压缩（compact_turn）摘要 = 当前上下文自拟（规则见 dsh-compact-turn 技能），session 压缩摘要 = cheap 模型（replay-compaction 的 chat 默认），互不牵扯。',
       '',
       '## 修改插件后',
       '',
       '改 index.js → node --check 语法校验 → 走 dsh-web-restart 技能重启生效。',
       '冒烟测试环境：headless profile $DSH_HOME/profiles/test-turn-memory（base + headless 启动 + 两轮测试驱动器 dsh-plugin-test-runner）。',
+    ].join(NL),
+  },
+  {
+    name: 'dsh-compact-turn',
+    description: '为 compact_turn 撰写当前 turn 已完成部分的 checkpoint 摘要。USE FOR: 长 turn 主动压缩、调用 compact_turn 之前、撰写压缩内容时。',
+    content: [
+      '# dsh-compact-turn:为 compact_turn 撰写 checkpoint',
+      '',
+      'compact_turn 把你随 summary 参数传入的文本变成当前 turn 的一个 checkpoint，替换 turn 起始消息之后、当前 step 之前的所有内容；起始消息与当前 step 保持逐字。你是撰写这段文本的人——你当前的上下文就是被压缩的区间本身，压缩前不需要任何额外读取或工具调用。',
+      '',
+      '## 撰写规则',
+      '',
+      '- 用 ONE 条流动的时间线写，不加 section 标题、不填表格：每次用户请求、决定、发现、修复或有意义的产出一条，按发生顺序排列；只保留这个 turn 后续还需要的内容，丢掉单次工具调用、中间输出、例行检查等临时细节。',
+      '- 后来被证明错了的条目留在原处，在出错的位置加自然语言修正（"我觉得 X 可行。（后来发现不对。）"）；永远不要删条目。假设按当时的感觉陈述（"我当时假设 X，未验证"），后面的条目推翻它时在那里补一句修正。',
+      '- 逐字保留维持上下文直觉的措辞：用户原话与强调、自己做出的承诺与提议、后续可能被引用的表述；命令、路径、标识符、错误串也逐字保留。',
+      '- 可复用流程只写技能名/脚本路径，不重述步骤。',
+      '- checkpoint 会取代区间内容，必须能独立承载这段记录；保持它明显短于被替换的区间——后端有收缩校验，checkpoint 不比原区间小会整笔失败。',
+      '- 不用 <verbatim> 占位标签：turn 内压缩后端按原样落盘，不做标签还原。',
+      '',
+      '## 调用',
+      '',
+      '把摘要全文作为 summary 参数调用 compact_turn，不要附带其他文字或解释。',
     ].join(NL),
   },
 ];
@@ -396,6 +417,39 @@ function apply(ctx, config) {
   const states = new Map();
 
   ctx.systemPrompt.section({ name: 'turn-memory', order: 120, text: MEMORY_SECTION });
+
+  // Conditional tail reminder for long turns: a runtime-context contribution
+  // evaluated per step assembly. Below the threshold it contributes nothing
+  // (zero tokens, zero noise); above it the end-of-context snapshot carries
+  // one stable line nudging the model toward compact_turn. The snapshot is
+  // self-replacing, so the reminder disappears on its own once a compaction
+  // lands and the turn shrinks back below the threshold.
+  ctx.systemPrompt.context({
+    name: 'turn-compact-reminder',
+    order: 130,
+    text: (context) => {
+      try {
+        const session = context.agent?.session;
+        if (session === undefined || session.header.parentSession !== undefined) return '';
+        const turnStart = findLastEvent(session, 'turn/start');
+        if (turnStart === undefined) return '';
+        const turnEnd = findLastEvent(session, 'turn/end');
+        if (turnEnd !== undefined && turnEnd.seq > turnStart.seq) return '';
+        const nodes = session.surface.nodes;
+        const firstIdx = nodes.findIndex((seq) => seq > turnStart.seq);
+        if (firstIdx < 0) return '';
+        const count = nodes.length - firstIdx;
+        if (count < settings.reminderNodeThreshold) return '';
+        const tier2 = Math.ceil(settings.reminderNodeThreshold * 1.5);
+        if (count >= tier2) {
+          return 'Long turn warning: the current turn spans over ' + tier2 + ' surface nodes and keeps growing. Call compact_turn NOW — it condenses the completed steps into one checkpoint and frees context; waiting for automatic pressure risks a forced stop at a worse cut point.';
+        }
+        return 'Long turn notice: the current turn spans over ' + settings.reminderNodeThreshold + ' surface nodes. If the current phase is complete, call compact_turn — the finished part becomes one checkpoint while the turn-starting message and the current step stay verbatim.';
+      } catch {
+        return '';
+      }
+    },
+  });
 
   for (const skill of PLUGIN_SKILLS) {
     ctx.skills.register({
@@ -455,6 +509,112 @@ function apply(ctx, config) {
       title: 'Recall turn ' + args.turn,
       kind: 'other',
       rawInput: { turn: args.turn, mode: args.mode ?? 'auto' },
+    }),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'compact_turn',
+    description: [
+      'Compactly summarize the completed portion of the CURRENT turn into one checkpoint, freeing context during a long turn.',
+      'Compose the checkpoint text yourself from your current context, following the dsh-compact-turn skill, and pass it as the summary argument — no subagent summarizes the span for you.',
+      'The compacted range is everything after the turn-starting message up to (excluding) the current step; the turn-starting message stays verbatim and the current step is untouched.',
+      'Use it proactively when the turn is getting long and more work lies ahead, before automatic pressure compaction forces a less-informed cut. It runs exclusively, so other tool calls wait for it.',
+    ].join(' '),
+    parameters: {
+      summary: {
+        type: 'string',
+        required: true,
+        description: 'The checkpoint text replacing the completed part of the current turn: ONE flowing chronological timeline composed per the dsh-compact-turn skill. It must stand alone as the record of the span it replaces.',
+      },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      const agent = exec.agent;
+      if (agent === undefined) return 'compact_turn: no owning agent session';
+      const session = agent.session;
+      if (session.header.parentSession !== undefined) return 'compact_turn: only root sessions can compact';
+      const compaction = ctx.get('compaction');
+      if (compaction === undefined) return 'compact_turn: no compaction backend is mounted';
+      const turnStart = findLastEvent(session, 'turn/start');
+      if (turnStart === undefined) return 'compact_turn: no open turn';
+      const turnEnd = findLastEvent(session, 'turn/end');
+      if (turnEnd !== undefined && turnEnd.seq > turnStart.seq) return 'compact_turn: no open turn';
+      const events = session.events;
+      const nodes = session.surface.nodes;
+      const spanStart = nodes.findIndex((seq) => seq > turnStart.seq);
+      if (spanStart < 0) return 'compact_turn: nothing to compact yet';
+      // The current step's assistant message (the last assistant node) carries
+      // open tool calls, so it and everything after stay verbatim.
+      let assistantIdx = -1;
+      for (let index = nodes.length - 1; index > spanStart; index -= 1) {
+        if (events[nodes[index]]?.type === 'assistant/message') {
+          assistantIdx = index;
+          break;
+        }
+      }
+      if (assistantIdx < 0) return 'compact_turn: no assistant content to compact yet';
+      if (assistantIdx <= spanStart + 1) return 'compact_turn: nothing to compact yet';
+      const startSeq = nodes[spanStart + 1];
+      const endSeq = nodes[assistantIdx - 1];
+      // The slice endpoints are surface positions: the backend shadows the
+      // surface slice between them. The pairing walk, however, needs log
+      // positions — after an earlier in-turn checkpoint, surface order and seq
+      // order diverge (the checkpoint's seq exceeds the seqs of the kept step
+      // that follows it in surface order), so walking [startSeq, endSeq] as a
+      // raw seq interval would split the kept step's own tool pair. Walk the
+      // slice's seq span instead.
+      let walkStart = startSeq;
+      let walkEnd = endSeq;
+      for (let index = spanStart + 1; index < assistantIdx; index += 1) {
+        const seq = nodes[index];
+        if (seq < walkStart) walkStart = seq;
+        if (seq > walkEnd) walkEnd = seq;
+      }
+      // Balance over the log range: every tool call/result inside must pair
+      // inside, so no open pair crosses the cut.
+      const openCalls = new Set();
+      for (let seq = walkStart; seq <= walkEnd; seq += 1) {
+        const event = events[seq];
+        if (event === undefined) return 'compact_turn: session events incomplete; compact later';
+        if (event.type === 'tool/call') {
+          openCalls.add(event.data?.callId);
+        } else if (event.type === 'tool/result') {
+          const callId = event.data?.message?.content?.[0]?.toolCallId;
+          if (callId === undefined || !openCalls.has(callId)) return 'compact_turn: the cut would cross an open tool pair; compact later';
+          openCalls.delete(callId);
+        }
+      }
+      if (openCalls.size > 0) return 'compact_turn: the cut would leave an open tool call; compact later';
+      const nodeCount = assistantIdx - spanStart - 1;
+      // The checkpoint text is composed by the current context itself, per
+      // the dsh-compact-turn skill, and arrives as the summary argument; no
+      // subagent summarizes the span. The compaction transaction stays in
+      // the backend.
+      const summary = typeof args.summary === 'string' ? args.summary.trim() : '';
+      if (summary === '') return 'compact_turn: summary is required — compose the checkpoint text following the dsh-compact-turn skill and pass it as the summary argument';
+      const provider = agent.options.provider ?? 'unknown';
+      const model = agent.options.model ?? 'unknown';
+      try {
+        if (typeof compaction.compactRegionWithSummary === 'function') {
+          await compaction.compactRegionWithSummary(startSeq, endSeq, agent, summary, { provider, model }, exec.signal);
+        } else {
+          // Backend-agnostic fallback: a backend without the pre-supplied
+          // summary entry summarizes the range itself.
+          await compaction.compactRegion(startSeq, endSeq, agent, exec.signal);
+        }
+      } catch (error) {
+        return 'compact_turn: ' + (error?.message ?? error);
+      }
+      return 'compact_turn: compacted ' + nodeCount + ' surface nodes of the current turn into one checkpoint; the turn-starting message and the current step stay verbatim';
+    },
+    presentCall: () => ({
+      card: 'generic',
+      title: 'Compact current turn',
+      kind: 'other',
     }),
   }));
 
@@ -685,10 +845,6 @@ function apply(ctx, config) {
         dbg('recovery: turn ' + turn + ' has no assistant content; skipping');
         return;
       }
-      if (hasEventBetween(session, 'compaction/start', startEvent.seq, lastEnd.seq) || hasEventBetween(session, 'compaction/summary', startEvent.seq, lastEnd.seq)) {
-        dbg('recovery: turn ' + turn + ' experienced mid-turn compaction; skipping');
-        return;
-      }
       const controller = new AbortController();
       const item = {
         turn,
@@ -753,10 +909,6 @@ function apply(ctx, config) {
     }
     if (lastIdx - firstIdx + 1 !== spanSeqs.length) {
       dbg('tryReplace: turn ' + item.turn + ' SKIP non-contiguous span (idx ' + firstIdx + '..' + lastIdx + ', ' + spanSeqs.length + ' nodes)');
-      return false;
-    }
-    if (hasEventBetween(session, 'compaction/start', item.startSeq, item.endSeq) || hasEventBetween(session, 'compaction/summary', item.startSeq, item.endSeq)) {
-      dbg('tryReplace: turn ' + item.turn + ' SKIP compaction events in span');
       return false;
     }
     // Pair tool calls with their results over the LOG range, not the surface

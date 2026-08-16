@@ -13,6 +13,7 @@ const meta = (over: Partial<PrefixBoundaryMeta> = {}): PrefixBoundaryMeta => ({
   timestamp: '2026-08-15T22:00:00.000Z',
   sessionId: 'sess-1',
   mode: 'in-turn (current turn)',
+  beforeSeq: null,
   checkpointSeq: 9001,
   nextSeq: 9002,
   replacedNodes: 3,
@@ -66,7 +67,7 @@ describe('renderBoundaryNode', () => {
 
 describe('renderPrefixBoundary', () => {
   it('full boundary with a next node', () => {
-    const text = renderPrefixBoundary(meta(), userMessage('CHECKPOINT'), userMessage('NEXT'));
+    const text = renderPrefixBoundary(meta(), undefined, userMessage('CHECKPOINT'), userMessage('NEXT'));
     assert.ok(text.startsWith('# request-prefix boundary — 2026-08-15T22:00:00.000Z\n'));
     assert.ok(text.includes('mode: in-turn (current turn)'));
     assert.ok(text.includes('checkpoint: seq 9001 (3 surface nodes replaced, span [7000, 8000])'));
@@ -77,10 +78,21 @@ describe('renderPrefixBoundary', () => {
   });
 
   it('span to the surface tail has no next block and no note line', () => {
-    const text = renderPrefixBoundary(meta({ nextSeq: null, note: undefined }), userMessage('CHECKPOINT'), undefined);
+    const text = renderPrefixBoundary(meta({ nextSeq: null, note: undefined }), undefined, userMessage('CHECKPOINT'), undefined);
     assert.ok(text.includes('next: none — the replaced span ran to the surface tail'));
     assert.ok(!text.includes('==== next node'));
     assert.ok(!text.includes('note:'));
+  });
+
+  it('kept-before node renders its own block when beforeSeq is set', () => {
+    const text = renderPrefixBoundary(meta({ beforeSeq: 6000 }), userMessage('INITIAL'), userMessage('CHECKPOINT'), userMessage('NEXT'));
+    assert.ok(text.includes('==== kept before (seq 6000) ====\nINITIAL\n'));
+    assert.ok(text.includes('==== checkpoint node (seq 9001) ====\nCHECKPOINT\n'));
+  });
+
+  it('no kept-before block when beforeSeq is null', () => {
+    const text = renderPrefixBoundary(meta({ beforeSeq: null }), undefined, userMessage('CHECKPOINT'), userMessage('NEXT'));
+    assert.ok(!text.includes('kept before'));
   });
 });
 

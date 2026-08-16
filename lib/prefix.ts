@@ -41,6 +41,8 @@ export interface PrefixBoundaryMeta {
   sessionId: string;
   /** How the replacement was made: 'in-turn (current turn)' | 'whole-turn (compact_turn, turn 7)' | 'whole-turn (fork fallback, turn 5)'. */
   mode: string;
+  /** Seq of the node kept verbatim right BEFORE the checkpoint (the turn-starting user message), or null. */
+  beforeSeq: number | null;
   /** Seq of the landed checkpoint node. */
   checkpointSeq: number;
   /** Seq of the first kept node after the checkpoint, or null when the replaced span ran to the surface tail. */
@@ -93,6 +95,7 @@ export function renderBoundaryNode(event: BoundaryNodeLike | undefined): string 
  */
 export function renderPrefixBoundary(
   meta: PrefixBoundaryMeta,
+  before: BoundaryNodeLike | undefined,
   checkpoint: BoundaryNodeLike | undefined,
   next: BoundaryNodeLike | undefined,
 ): string {
@@ -104,6 +107,10 @@ export function renderPrefixBoundary(
     'next: ' + (meta.nextSeq === null ? 'none — the replaced span ran to the surface tail' : 'seq ' + meta.nextSeq + ' (kept verbatim)'),
   ];
   if (typeof meta.note === 'string' && meta.note !== '') lines.push('note: ' + meta.note);
+  if (meta.beforeSeq !== null && meta.beforeSeq !== undefined) {
+    lines.push('==== kept before (seq ' + meta.beforeSeq + ') ====');
+    lines.push(renderBoundaryNode(before));
+  }
   lines.push('==== checkpoint node (seq ' + meta.checkpointSeq + ') ====');
   lines.push(renderBoundaryNode(checkpoint));
   if (meta.nextSeq !== null) {

@@ -8,9 +8,11 @@ summary runs yet. On the next turn, the runtime context carries a pending
 notice and the main agent itself — the current context, with the user's new
 message in view — composes the previous turn's whole-turn checkpoint
 following the bundled dsh-compact-turn skill, then compacts that turn with
-compact_turn(turn, summary). The replacement covers the turn's whole span,
-its own user message included, so the newest user message always stays
-verbatim. A one-shot fork (same model as the conversation, sharing its warm
+compact_turn(turn, summary). The replacement covers the turn's span starting
+right after its own starting user message — that message stays verbatim on
+the surface, so the checkpoint never repeats it, and steer messages inside
+the span stay verbatim in their own <user-steer> elements. The newest user
+message always stays verbatim. A one-shot fork (same model as the conversation, sharing its warm
 request prefix) writes the summary only as a fallback when the main agent
 leaves a turn unsummarized for a whole turn. Raw events remain in the
 append-only log for replay and recall.
@@ -36,8 +38,8 @@ it replaces the completed part of the current turn (everything after the
 turn-starting message, up to the current step) with one checkpoint, keeping
 the turn-starting message and the current step verbatim. With the optional
 turn argument it compacts a completed previous turn whole instead — the
-span includes that turn's own user message, so the checkpoint must preserve
-its request verbatim; this is the call the pending notice asks for. The
+span starts right after that turn's own starting user message, which stays
+verbatim on the surface; this is the call the pending notice asks for. The
 checkpoint text is composed by the current context itself — the composing
 rules live in the bundled dsh-compact-turn skill and the text arrives as
 the tool's summary argument — so no fork or subagent summarizes the span.
@@ -59,14 +61,15 @@ tokens, zero noise — and it disappears on its own once a compaction lands.
 
 ## Summary format (version 4)
 
-Each checkpoint is a single user message whose body is ONE flowing timeline —
-no section headers, no forms:
+Each checkpoint is a single user message whose body is a sequence of role
+tags in the order things happened — no root wrapper (the surface already
+wraps the record as a turn-summary):
 
-    <turn-summary turn="12" version="4">
-    - [one entry per user request, decision, discovery, fix, or meaningful
-      outcome, in the order they happened]
-    - [tail entries naturally carry current state, pending input, next step]
-    </turn-summary>
+    <user-steer>steering message, verbatim</user-steer>
+    <working>process between the messages, compressed in place</working>
+    <assistant>user-facing output, verbatim</assistant>
+    <working>…</working>
+    <assistant>…</assistant>
 
 Marking rules:
 
@@ -80,6 +83,25 @@ Marking rules:
   user wording and emphasis, the assistant's own commitments and offers, and
   any phrasing later turns are likely to refer back to — plus commands,
   paths, identifiers, and error strings.
+- The checkpoint keeps the original order with no root wrapper (the
+  surface already wraps the record as a turn-summary): the turn's starting
+  user message stays verbatim on the surface before the checkpoint and
+  never appears inside it; every steering message inside the span stays
+  verbatim in its own <user-steer>…</user-steer> element, every
+  user-facing assistant text output stays verbatim in its own
+  <assistant>…</assistant> element at its original position, and only the
+  intermediate process (reasoning, tool calls, tool results, routine
+  checks) is compressed in place into a <working>…</working> element. The
+  elements alternate in the order things happened — users may steer
+  between replies and the assistant may alternate working and chatting —
+  and the tags themselves mark the speaker, so no
+  "user:"/"assistant:"/"process:" prefixes, no dialogue/summary labels,
+  no separate sections. The checkpoint reads like the conversation itself
+  with the process shortened.
+- The structure tags appear only inside checkpoint text — never in live
+  conversation output — and composing a summary is silent: the text goes
+  straight into the compact_turn summary argument and is never printed as
+  chat, so the summarization process produces no dialogue at all.
 - Read-in material (code, docs, config, output) is preserved as paths, not
   content: short key snippets (a critical line, a value) may be inline, but
   anything longer is recorded as the exact path plus one line saying what it
@@ -90,11 +112,14 @@ Marking rules:
   recall (or by re-reading files), each costing tokens and time. Keep
   whatever a future turn is likely to reference, verify, or continue — a
   line kept now is cheaper than a recall later.
-- The message that started the turn is reproduced verbatim as the first
-  timeline entry; when it is long, a placeholder tag
-  <verbatim kind="turn-prompt"/> takes its place and the harness swaps the
-  tag back to the original message when the checkpoint lands. The tag saves
-  output tokens, never omits content.
+- The message that just opened the current turn is only a hint (a lens,
+  not a task: do not think it through yet, the real thinking starts after
+  the summary lands) and is not part of the replaced span.
+- The message that started the turn is never part of the checkpoint: it
+  stays verbatim on the surface right before the checkpoint, so copying it
+  into the summary would only duplicate it. (For a resumed or recovered
+  turn whose starting message is no longer on the surface, reproduce it as
+  the first <user-steer>…</user-steer> element instead.)
 - The compaction act itself (the compact_turn call, node counts, the
   replacement result) is transient infrastructure: it never appears in a
   checkpoint or a reply — after a replacement lands, only the compressed
@@ -192,7 +217,10 @@ best-effort cache retention of "a few hours to a few days" (lower bound).
   turn's own compaction checkpoints, so the final turn summary converges the
   mid-turn checkpoint and the tail into one record.
 - The replacement is a user/message with the turn-memory source marker
-  (turn number, summary id, format version). No custom session event type
+  (turn number, summary id, format version, and a scope: whole-turn vs
+  in-turn — only whole-turn checkpoints mark a turn as replaced, so an
+  in-turn compaction never kills a turn's whole-turn flow). No custom
+  session event type
   is introduced, so logs stay loadable by unmodified harnesses.
 - Restart recovery: when a top-level agent is (re)created, the last completed
   turn that has no summary checkpoint is marked pending again, and the

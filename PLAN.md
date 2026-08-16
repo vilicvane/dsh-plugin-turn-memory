@@ -570,3 +570,79 @@ maxRawChars 500000 / toolResultCapChars 20000 / maxRecallDepth 4。
 - 测试:test/bounds.test.ts 新增 eventTextSize 4 例、foldedSpanSize /
   shrinkCheckError 3 例。文档同步 README、包内两个技能。
 - 状态:待 typecheck/test + 重启验证;未提交。
+
+## 17. checkpoint 保留全部面向用户的对话输出(turn 35)
+
+- 需求:压缩后保留所有对话输出——非思考过程、非工具调用的面向用户的对话
+  文本逐字全量保留;中间过程仍按时序总结(与之前一致)。
+- 实现(提示词/文档层,无代码逻辑变化):
+  - dsh-compact-turn 技能:通用撰写规则新增对话输出逐字全量保留条目(助手
+    对用户说出的每条 text 块按发生顺序成为独立条目,行首标「对话输出
+    (逐字):」;区间内用户消息同样逐字保留;时间线只总结中间过程);turn 内
+    模式注明收缩校验与保留对话输出的取舍(先压过程粒度,仍过不了则放弃
+    turn 内压缩,不得删减对话输出);整 turn 模式注明对话输出没有标签可代、
+    必须全文复制。
+  - MEMORY_SECTION:turn 内段与 pending 段各加一句(checkpoint 保留全部
+    用户可见回复、只总结中间过程)。
+  - buildSummaryPrompt(fork 兜底)与 README marking rules:各加一条
+    preserve every user-facing text output verbatim 规则。
+- 已知取舍:保留全部对话输出会让 checkpoint 比纯摘要大,收益是用户可见
+  对话永不丢失;对话输出本身几乎占满区间时 turn 内收缩校验可能失败,由
+  turn 内模式规则给出放弃路径。未来可选优化:对话输出块用 verbatim 标签
+  代写、落地时自动还原(现 resolver 只支持 turn-prompt kind)。
+- turn 37 修正:用户指出不要对话/过程分开摆放、不要强调摘要行为——改为
+  保留原时序、就地摘要:对话输出逐字留在原位置,中间过程在原位置压缩成
+  一句;不给条目加「对话」「摘要」之类的标记、不分节。四处提示词/文档
+  (技能通用规则与两模式、MEMORY_SECTION 两段、buildSummaryPrompt、
+  README)同步改为原地保留口径;turn 36 的 checkpoint 已按新规则撰写
+  (原时序、无标记)。
+- turn 39 修正:用户指出零标记后用户的话没有标注主体、容易把主体搞错——
+  在保留原时序、就地摘要、禁止分类标记的基础上,每条逐字对话前加主体
+  前缀(「用户：」/「助手：」);五处提示词/文档(技能通用规则、
+  MEMORY_SECTION 两段、buildSummaryPrompt、README)同步;turn 38 的
+  checkpoint 已按带主体前缀的新格式撰写(第一份示范)。
+- turn 41 修正:用户指出用户对话结束后的过程摘要句没有标记、可能被误读为
+  用户输入——过程摘要句前加「过程:」标记(英文 "process:")。五处提示词/
+  文档(技能通用规则、MEMORY_SECTION 两段、buildSummaryPrompt、README)
+  同步;turn 40 的 checkpoint 已按带「过程:」标记的新格式撰写(第一份
+  示范)。
+- turn 42 修正:用户改为更明确的嵌套标签标记——checkpoint 以 <summary> 根
+  标签包裹,内部按发生顺序交替 <user>…</user>(用户消息含 steer,逐字)/
+  <chat>…</chat>(助手面向用户的对话输出,逐字)/<working>…</working>(中间
+  过程就地压缩一句);标签即主体标记,替代前缀与「过程:」标记。五处提示词/
+  文档同步;turn 41 的 checkpoint 已按嵌套标签新格式撰写(第一份示范)。
+  verbatim turn-prompt 占位在整 turn 模式写成 <user> 元素内的占位标签、
+  落地时还原;turn 内模式不还原标签,结构标签作为纯文本标记原样留在
+  surface 上(本就是给人看的,无需转义)。
+- turn 43 修正:用户指出不要照搬其格式——外面本来就是 turn-summary 包裹,
+  checkpoint 内去掉 <summary> 根标签,内容直接就是标签序列;标签用词只是
+  示例、可换更恰当的,<chat> 改为 <assistant>(与 <user> 角色对称)。定案:
+  无根标签 + <user>…</user> / <assistant>…</assistant> /
+  <working>…</working> 按发生顺序交替。五处提示词/文档(技能通用规则与两
+  模式、MEMORY_SECTION 两段、buildSummaryPrompt、README)同步。
+- turn 44 修正:用户指出当前 turn 的用户消息只作为上一 turn 用户消息的 hint,
+  不要过度思考这条 hint,真正的思考在总结后开始——技能整 turn 模式、
+  MEMORY_SECTION pending 段、pending 提示文案、README 各加一句 hint/
+  lens-not-task 说明。
+- turn 45 修正:用户指出起始用户消息原文本来就留在上下文里(surface 上),
+  没必要再写进总结(debug 临时输出照旧输出边界即可);后续 steer 用
+  <user-steer> 标签强调。落地:tryReplace 的替换 span 改为从起始用户消息
+  之后开始(代码里 initialUserSeq 探测 + spanSeqs 排除,无用户消息时回退
+  折叠整段);起始消息不再进 checkpoint、verbatim turn-prompt 占位退出整
+  turn 模式;<user> 标签让位给 <user-steer>(仅区间内 steer 用);标签定案
+  为无根 + <user-steer>/<assistant>/<working> 按发生顺序交替。同步:技能
+  通用规则与整 turn 模式、MEMORY_SECTION pending 段、buildSummaryPrompt、
+  文件头注释、ops 技能 bullet、README 五处(替换语义、格式示例、marking
+  rules)。
+- turn 46 修正:标签只属于 checkpoint 文本、总结全程静默——正常对白绝不写
+  <user-steer>/<assistant>/<working> 结构标签(此前我把它写进了实时回复),
+  摘要文本只进 compact_turn 的 summary 参数、绝不以消息形式展示(此前至少
+  两轮把总结内容作为对白直接输出)。同步:技能通用规则 + 调用段、
+  MEMORY_SECTION 两段、buildSummaryPrompt、README marking rules。
+- turn 48 修正:整 turn 流程失灵的真实根因——turn 30 自折叠重构后 turn 内
+  checkpoint 也带 turn-memory 标记(plugin+turn 号),replacedTurnNumbers
+  把所有带标记 checkpoint 都算"该 turn 已替换",做过 turn 内压缩的 turn
+  (31、46、47)整 turn 流程永久跳过(no pending record、开场无 pending 提示)。
+  修复:checkpoint source 加 scope 字段(whole-turn | in-turn),
+  replacedTurnNumbers 只认 whole-turn;无 scope 的旧 checkpoint 一律不算。
+  之前的"重启丢失登记"判断被推翻。

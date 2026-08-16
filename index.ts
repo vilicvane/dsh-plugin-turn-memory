@@ -11,8 +11,9 @@
  *    compact_turn(turn, summary). A one-shot FORK (same model as the
  *    conversation, sharing the warm request prefix) summarizes a turn only as
  *    a fallback when the main agent leaves it unsummarized for a whole turn.
- *  - Replacement covers the summarized turn's whole span, its user message
- *    included, so the newest user message always stays verbatim.
+ *  - Replacement covers the summarized turn's span starting right after
+ *    its user message, which stays verbatim on the surface, so the newest
+ *    user message is never folded.
  *  - The replacement checkpoint is a user/message carrying the turn-memory
  *    source marker (turn number, summary id, format version). The raw events
  *    remain in the append-only log for replay and recall; the checkpoint is
@@ -65,7 +66,7 @@ const name = 'turn-memory';
 const inject = ['subagents', 'sessions', 'systemPrompt', 'tools', 'skills'];
 
 /** Format version stamped into every summary checkpoint source. */
-const TURN_SUMMARY_VERSION = 4;
+const TURN_SUMMARY_VERSION = 5;
 
 /** The plugin field of the checkpoint source marker. */
 const SUMMARY_MARKER_PLUGIN = 'turn-memory';
@@ -104,9 +105,9 @@ function buildSummaryPrompt(turn) {
     '',
     'Summarize ONLY turn ' + turn + ' — the most recent completed turn: its user request and the assistant work that followed. Earlier turns are already represented by their own summaries; reference them where this turn depends on or corrects them, but do not re-summarize them.',
     '',
-    'Write a COMPACT flowing chronological record — a timeline, not a form. Keep only what a future turn needs; drop transient detail such as individual tool calls, intermediate output, and routine checks.',
+    'Write a COMPACT record in the original chronological order. Keep only what a future turn needs; drop transient detail such as individual tool calls, intermediate output, and routine checks.',
     '',
-    'Replicate the turn as ONE flowing timeline — no section headers, no forms. One entry per user request, decision, discovery, fix, or meaningful outcome, in the order they happened; each entry starts on its own line. The tail of the timeline naturally carries what stands at the end and what awaits the user.',
+    'Keep the original order with no root wrapper: each user message and each user-facing reply stays verbatim in place, and only the intermediate process between them is compressed in place — never add dialogue/summary labels or split the record into sections; each entry starts on its own line. The tail naturally carries what stands at the end and what awaits the user.',
     '',
     'Marking:',
     '- Write hindsight in natural language, not bracket tags. When a later development proves an earlier entry wrong, annotate it at the point it went wrong — for example: "I thought X might work. (It later turned out wrong.)" — and keep the correction beside the entry it revises. When this turn invalidates something from an earlier summary, say so in natural language and name that turn.',
@@ -115,10 +116,12 @@ function buildSummaryPrompt(turn) {
     '- End the timeline with the single next action when one is clear.',
     '- Preserve VERBATIM whatever keeps your intuition about the current context: the user\'s exact wording and emphasis, your own commitments and offers, and any phrasing a later turn is likely to refer back to. Commands, paths, identifiers, and error strings stay verbatim too. A summary that loses the wording loses the thread.',
     '- Preserve read-in material (code, docs, config, output) as paths, not content: inline only short key snippets (a critical line, a value); for anything longer record the exact path plus ONE short line saying what it is and why it matters, and re-read the file with the read tool when the content is needed again — copied text goes stale, the file stays current. Do not duplicate what an earlier checkpoint, a loaded skill, or another entry of this summary already covers.',
-    '- The message that started this turn: reproduce it verbatim as the first timeline entry; when it is long, write the placeholder tag <verbatim kind="turn-prompt"/> instead, with one short line beside it saying what the message asks and why it matters. This summary lands as a whole-turn replacement, which swaps the tag back to the original message — the tag only saves output tokens, never drops content.',
+    '- The message that started this turn stays ON the surface right before the checkpoint — the replacement span starts after it — so do NOT include it in the summary at all; its original is already in context. Every user message inside the span is therefore a steering message: keep it verbatim in its own <user-steer>…</user-steer> element.',
+    '- Keep the original order — the surface already wraps the record as a turn-summary, so add no root wrapper of your own: every user message in the span is a steering message and stays verbatim in its own <user-steer>…</user-steer> element, every user-facing assistant text output stays verbatim in its own <assistant>…</assistant> element at its original position, and only the intermediate process (reasoning blocks, tool calls, tool results, routine checks) is compressed in place into a <working>…</working> element. The elements alternate in the order things happened — users may steer between replies and the assistant may alternate working and chatting — and the tags themselves mark the speaker, so no "user:"/"assistant:"/"process:" prefixes and no dialogue/summary labels or sections. The record should read like the conversation itself, just with the process shortened.',
     '- Once this summary lands, it is the only trace of this turn the main context sees: the original text is gone and can only be recovered with an expand_turn recall (or by re-reading files), each costing tokens and time. Keep whatever a future turn is likely to reference, verify, or continue — a line kept now is cheaper than a recall later.',
     '- The compaction act itself (any compact_turn call in this turn, its node counts and result) is transient infrastructure: do not include it in the summary and do not restate it — after the summary lands, only the compressed content should remain in view.',
     '- Name skills and procedures instead of restating their steps ("restarted dsh web per the dsh-web-restart skill"); when unsure of the name, check the skill catalog with the skill tool.',
+    '- The structure tags (<user-steer>/<assistant>/<working>) exist only inside this summary text; your output is the summary itself and nothing else.',
     '- Output only the summary text. Do not call any tool unless you must verify details of the turn you are summarizing; when detail is uncertain, verify it with the expand_turn tool (mode raw) rather than guessing.',
   ].join(NL);
 }
@@ -133,9 +136,9 @@ const MEMORY_SECTION = [
   '',
   'Summaries annotate hindsight in natural language: entries later proven wrong carry an inline correction ("I thought X might work. It later turned out wrong."), and assumptions are stated as they were felt at the time. Treat later corrections as authoritative over earlier entries.',
   '',
-  'During a long turn, compact proactively with the compact_turn tool before context pressure forces the automatic compactor. Compose the checkpoint text yourself from your current context, following the dsh-compact-turn skill, and pass it to compact_turn as the summary argument; the tool replaces the completed part of the current turn (everything after the turn-starting message, up to the current step) with that checkpoint. What the checkpoint replaces leaves your context; recovering it later costs an expand_turn recall — keep in the checkpoint what a future step is likely to need. The turn-starting message and the current step stay verbatim.',
+  'During a long turn, compact proactively with the compact_turn tool before context pressure forces the automatic compactor. Compose the checkpoint text yourself from your current context, following the dsh-compact-turn skill, and pass it to compact_turn as the summary argument; the tool replaces the completed part of the current turn (everything after the turn-starting message, up to the current step) with that checkpoint. Checkpoints keep the original order with no root wrapper (the surface already wraps the record): every user message (always a steering message — the turn-starting message stays outside the span) stays verbatim in a <user-steer>…</user-steer> element, every user-facing reply verbatim in an <assistant>…</assistant> element, and only the intermediate process (thinking, tool calls, tool results) is compressed in place into a <working>…</working> element — the tags themselves mark the speaker, so no prefixes and no dialogue/summary labels or sections. Compose silently: the checkpoint text goes only into the summary argument, never printed as a message, and the structure tags appear only inside checkpoint text, never in live replies. What the checkpoint replaces leaves your context; recovering it later costs an expand_turn recall — keep in the checkpoint what a future step is likely to need. The turn-starting message and the current step stay verbatim.',
   '',
-  'When the runtime context carries a pending-turn notice (a completed previous turn has no summary checkpoint yet), compose that turn\'s whole-turn checkpoint FIRST, following the dsh-compact-turn skill: the message that just opened this turn is your lens for what the previous turn must retain, and the previous turn\'s own user message must be preserved verbatim inside the checkpoint (or write <verbatim kind="turn-prompt"/> and the original message is restored when the checkpoint lands). Then call compact_turn with the turn number and the checkpoint text as the summary argument — the call replaces the entire previous turn on the surface, its user message included, and frees context for the rest of this turn. The compaction act itself — the call, node counts, the replacement result — is transient infrastructure: never include it in the checkpoint and never repeat it to the user; after the replacement lands, only the compressed content should remain in view.',
+  'When the runtime context carries a pending-turn notice (a completed previous turn has no summary checkpoint yet), compose that turn\'s whole-turn checkpoint FIRST, following the dsh-compact-turn skill: keep the original order with no root wrapper (the surface already wraps the record) — the previous turn\'s starting user message stays verbatim ON the surface right before the checkpoint (the replacement span starts after it), so do NOT include it in the checkpoint; every user message inside the span is a steering message and stays verbatim in its own <user-steer>…</user-steer> element, every user-facing reply verbatim in its own <assistant>…</assistant> element, and only the intermediate process compressed in place into <working>…</working> elements, in original order — the tags mark the speaker, so no prefixes, labels, or sections; the message that just opened this turn is only a HINT for what the previous turn must retain — a lens, not a task: do not think it through yet, the real thinking starts after the summary lands; compose silently — the summary text goes straight into the compact_turn call and is never shown as chat, and the structure tags belong to checkpoint text only. Then call compact_turn with the turn number and the checkpoint text as the summary argument — the call replaces the span of the previous turn on the surface (starting right after its user message, which stays verbatim), and frees context for the rest of this turn. The compaction act itself — the call, node counts, the replacement result — is transient infrastructure: never include it in the checkpoint and never repeat it to the user; after the replacement lands, only the compressed content should remain in view.',
   '',
   'The recall modes:',
   '',
@@ -263,14 +266,21 @@ function hasEventBetween(session, type, startSeq, endSeq) {
   return false;
 }
 
-/** Turns whose spans already carry a turn-memory summary checkpoint. */
+/**
+ * Turns whose spans already carry a whole-turn replacement checkpoint. Only
+ * scope 'whole-turn' counts: in-turn checkpoints carry the same plugin marker
+ * since the self-fold rework and must NOT make a turn look replaced, or its
+ * whole-turn flow (pending notice, compact_turn whole-turn mode, fork
+ * fallback) dies after any in-turn compaction. Checkpoints written before
+ * the scope field existed are ignored by design.
+ */
 function replacedTurnNumbers(session) {
   const out = new Set();
   for (const seq of session.surface.nodes) {
     const event = session.events[seq];
     if (event === undefined || event.type !== 'user/message') continue;
     const source = event.data?.source;
-    if (source?.plugin === SUMMARY_MARKER_PLUGIN && typeof source.turn === 'number') out.add(source.turn);
+    if (source?.plugin === SUMMARY_MARKER_PLUGIN && source.scope === 'whole-turn' && typeof source.turn === 'number') out.add(source.turn);
   }
   return out;
 }
@@ -392,12 +402,12 @@ const PLUGIN_SKILLS = [
       '## 行为约定',
       '',
       '- turn-memory 资格按持久化 origin 判定，不看运行时归属：origin 非 subagent 的会话（主会话与 fork，无论 live 还是 resumed）都享受完整待遇——pending 登记、压缩提醒、compact_turn 全模式可用；仅一次性召回 subagent（origin 为 subagent）不参与 pending 机制（避免为一次性会话浪费 fork 兜底模型调用），compact_turn 的 turn 内模式则任何 agent 都可以对自己会话用。',
-      '- turn 结束 → 该 turn 登记为 pending，零模型调用、不生成摘要；下一条用户消息到来时，runtime 上下文出现 pending 提示，主 agent（当前上下文）先按 dsh-compact-turn 技能撰写上一 turn 的整 turn checkpoint（新消息是保留取舍的透镜；上一 turn 的用户原话必须逐字进摘要，或写 <verbatim kind="turn-prompt"/> 由替换时自动还原），再用 compact_turn(turn=N, summary) 立即把上一 turn（含其用户消息）替换为 <turn-summary turn=N version=N> checkpoint；最新用户消息永远逐字保留。主 agent 整个下一 turn 都没做 → 该 turn 结束时由主模型 fork 兜底补摘要（晚一个 turn，再下一个 pre-step 落地）。后验修正用自然语言括注（"我觉得这样可能不错。（但是后来发现不对）"），不用方括号标记；逐字保留维持上下文直觉的措辞（用户原话、自己做出的承诺、后续可能被引用的表述）。',
+      '- turn 结束 → 该 turn 登记为 pending，零模型调用、不生成摘要；下一条用户消息到来时，runtime 上下文出现 pending 提示，主 agent（当前上下文）先按 dsh-compact-turn 技能撰写上一 turn 的整 turn checkpoint（新消息只是保留取舍的 hint/透镜、不为其展开实质思考；上一 turn 的起始用户消息保留在 surface 上、替换 span 从它之后开始，区间内的 steer 消息逐字进 <user-steer> 元素），再用 compact_turn(turn=N, summary) 立即把上一 turn 的 span（起始用户消息之后）替换为 <turn-summary turn=N version=N> checkpoint；最新用户消息永远逐字保留。主 agent 整个下一 turn 都没做 → 该 turn 结束时由主模型 fork 兜底补摘要（晚一个 turn，再下一个 pre-step 落地）。后验修正用自然语言括注（"我觉得这样可能不错。（但是后来发现不对）"），不用方括号标记；逐字保留维持上下文直觉的措辞（用户原话、自己做出的承诺、后续可能被引用的表述）。',
       '- 某 turn 长时间没有替换节点的可能：(1) 主 agent 未调用 compact_turn 或调用失败 → 下一 turn 结束时 fork 兜底，兜底摘要在再下一个 pre-step 落地；(2) 服务器重启（内存态丢失）→ 恢复时最后一个无 checkpoint 的已完成 turn 重新登记 pending，由恢复后的主 agent 在下一条用户消息到来时撰写。',
       '- compact_turn 模型工具：长 turn 中主动压缩当前 turn 已完成部分（turn 起始消息之后、当前 step 之前），只留起始消息逐字、当前 step 不动；独占执行保证压缩事务期间 surface 稳定。摘要由当前上下文（主模型自身）撰写——撰写规则在 dsh-compact-turn 技能里，随 summary 参数传入；工具自做全部折叠：范围/配平校验、收缩校验（checkpoint 字符数必须小于被折叠节点的模型可见文本）、checkpoint 落盘（surfaceOp replace + sourceEventSeqs，与 tryReplace 同款 splice）——完全不依赖任何 compaction 后端。带 turn 参数的整 turn 模式：把已完成 turn 的整段（含用户消息）替换为带 turn-memory 标记的 turn 摘要 checkpoint（复用 tryReplace 直接落盘，不走压缩后端、无收缩校验）。turn 内压缩产生的 checkpoint 会纳入该 turn 最终的 turn 摘要替换（收敛合并，不是原文重喂）；后续再次压缩时旧 checkpoint 以一条浓缩摘要参与合并。',
       '- 条件式尾部提醒：当前 turn 的 surface 节点数超过 reminderNodeThreshold（默认 30，按节点数不按 token）时，runtime 快照末尾出现一行提醒；超过 1.5 倍时升级为更直接的警告。低于阈值时零贡献、零 token；压缩落地后 turn 缩回阈值以下，提醒自行消失。',
 '- prefixDumpDir 非空时，每次压缩替换落盘后把接缝处最后两个节点（新 checkpoint + 其后第一个保留节点，按它们在 request 前缀里的文本形态渲染）追加写入 <prefixDumpDir>/request-prefix-<sessionId>.txt——按 session 各建一个文件（每个替换一块、块间以分隔线隔开，文件只增不减、最早的替换边界在最前），肉眼确认替换边界用。',
-      '- 替换节点 source = {kind: plugin, plugin: turn-memory, turn, turnSummaryId, version}。',
+      '- 替换节点 source = {kind: plugin, plugin: turn-memory, turn, turnSummaryId, version, scope: whole-turn | in-turn}——只有 scope whole-turn 算整 turn 已替换，in-turn checkpoint 不影响 pending 流程。',
       '- expand_turn 双模式：agentic（默认；工具按 turn 的时间内部路由——end 距今 ≤ recallRecentWindowMs（默认 7200000，2 小时）的近期 turn 由 fork 回答，fork 的上下文是已完成 turn 的原始全文重放（不是 checkpoint），且仅当 provider 磁盘缓存还保留着这些 turn 直播时持久化的 prefix unit 时才是暖的、零额外模型调用；更早的 turn 由 cheap 模型读完整转录定向回答；question 必填）与 raw（原文直读、最后手段、超长按 maxRawChars 截断；question 忽略）。',
       '- 摘要与操作说明的分工：摘要只记发生了什么/决定了什么；可复用操作步骤放技能，摘要里只留名字引用。',
       '- 压缩后端：host 层由本体系第二步插件 dsh-plugin-replay-compaction 提供 ctx.compaction（web 的 cordis.patch.yml 已禁用 harness 自带 dsh-compaction-basic）。注意：内置 agent preset（standard / code=「PTC 模式」）各自带一个 isolate 组重新挂载 compaction-basic + command-compact + tool-result-pruner，host 补丁够不到它——这些 preset 的会话里手动 /compact 与压力压缩走 basic 引擎，不是 fold。个人 preset `vilicvane`（~/.dsh/.agent-presets/vilicvane，code 的 fork，删除了该 isolate 组、command-compact 独立成行）三入口（/compact、压力自动压缩、compact_turn）统一走 replay fold；新会话建议选它。曾有一次针对 compaction-basic 的指令补丁，经查是死代码，已用 npm 原版 tarball 还原并删除补丁脚本。模型分工：turn 内压缩与整 turn 替换的摘要 = 当前上下文自拟（规则见 dsh-compact-turn 技能）；fork 只作整 turn 摘要兜底（同样主模型）；session 压缩摘要 = cheap 模型（replay-compaction 的 chat 默认），互不牵扯。',
@@ -414,13 +424,15 @@ const PLUGIN_SKILLS = [
     content: [
       '# dsh-compact-turn:为 compact_turn 撰写 checkpoint',
       '',
-      'compact_turn 把你随 summary 参数传入的文本落成 checkpoint：不带 turn 参数时替换当前 turn 起始消息之后、当前 step 之前的已完成部分（起始消息与当前 step 逐字保留）；带 turn=N 时替换整个已完成 turn N（含该 turn 的用户消息），此后该 turn 在 surface 上只以这份摘要存在。你就是撰写这份文本的人——你当前的上下文就是被压缩区间（或其绝大部分）本身，压缩前不需要额外读取或工具调用。',
+      'compact_turn 把你随 summary 参数传入的文本落成 checkpoint：不带 turn 参数时替换当前 turn 起始消息之后、当前 step 之前的已完成部分（起始消息与当前 step 逐字保留）；带 turn=N 时替换已完成 turn N 的折叠区间——但该 turn 的起始用户消息保留在 surface 上、checkpoint 之前（不进折叠区间、也不写进摘要，原文已经在上下文里），区间内其余内容折叠进 checkpoint。你就是撰写这份文本的人——你当前的上下文就是被压缩区间（或其绝大部分）本身，压缩前不需要额外读取或工具调用。',
       '',
       '## 撰写规则（两种模式通用）',
       '',
-      '- 用 ONE 条流动的时间线写，不加 section 标题、不填表格：每次用户请求、决定、发现、修复或有意义的产出一条，按发生顺序排列；只保留这个区间后续还需要的内容，丢掉单次工具调用、中间输出、例行检查等临时细节。',
+      '- 用 ONE 条流动的时间线写，不加 section 标题、不填表格：每次用户请求、决定、发现、修复或有意义的产出一条，按发生顺序排列；只保留这个区间后续还需要的内容，丢掉单次工具调用、中间输出（思考块、工具结果、例行检查）等临时细节。',
       '- 后来被证明错了的条目留在原处，在出错的位置加自然语言修正（"我觉得 X 可行。（后来发现不对。）"）；永远不要删条目。假设按当时的感觉陈述（"我当时假设 X，未验证"），后面的条目推翻它时在那里补一句修正。',
       '- 逐字保留维持上下文直觉的措辞：用户原话与强调、自己做出的承诺与提议、后续可能被引用的表述；命令、路径、标识符、错误串也逐字保留。',
+      '- 保留原始时序、就地摘要，用标签标注每条内容的角色：不写根标签（外面已经是 turn-summary 包裹，checkpoint 内容直接就是标签序列），按发生顺序交替排列 <user-steer>…</user-steer>（区间内用户的每条消息——起始消息总在区间外，所以区间内必是中途 steer，逐字全文）、<assistant>…</assistant>（助手面向用户的正文输出，逐字全文）、<working>…</working>（对话输出之间的中间过程——思考、工具调用与结果、例行检查、注入的运行时上下文——在它的原位置就地压缩成一句）。用户可能中途 steer 更多消息、助手也可能工作一段输出一段对白，标签按实际发生顺序任意交替即可表达。标签即主体标记，不再加「用户：」等前缀、不另设分类标记或分节。',
+      '- 结构标签只属于 checkpoint 文本：<user-steer>/<assistant>/<working> 只出现在传给 compact_turn 的 summary 里，正常对白中绝不写这些标签。',
       '- 可复用流程只写技能名/脚本路径，不重述步骤。',
       '- checkpoint 必须能独立承载这段记录，并保持明显短于被替换的区间。',
       '- 压缩即移出视野：checkpoint 落地后，被替换区间的原文就不再出现在你的上下文里，日后只能靠 expand_turn 召回（近期 fork 直接回答、更早由小模型读全文）或重读文件，每次都有 token 与时间成本；将来很可能被引用、核对、延续的细节，现在多留一行比以后花一次召回便宜。',
@@ -429,19 +441,20 @@ const PLUGIN_SKILLS = [
       '## turn 内模式（无 turn 参数）',
       '',
       '- 起始消息与当前 step 不在区间内，摘要不必复述它们。',
-      '- 不要写 <verbatim> 标签：turn 内压缩不会还原标签，写什么就原样留下什么。',
-      '- 有收缩校验：checkpoint 不比被折叠区间小会整笔失败（按被折叠节点的模型可见文本字符数比较）。',
+      '- 不要写 <verbatim> 标签：turn 内压缩不会还原标签，写什么就原样留下什么。<user-steer>/<assistant>/<working> 结构标签是给人看的纯文本标记，会原样留在 surface 上，没问题。',
+      '- 有收缩校验：checkpoint 不比被折叠区间小会整笔失败（按被折叠节点的模型可见文本字符数比较）。对话输出逐字保留导致过不了校验时，只压过程摘要的粒度；仍过不了就放弃这次 turn 内压缩（整 turn 压缩没有收缩校验），不得删减对话输出。',
       '',
       '## 整 turn 模式（带 turn 参数）',
       '',
-      '- 目标 turn 的用户消息属于被替换区间：其原话必须逐字成为 timeline 的第一条；也可以只写 <verbatim kind="turn-prompt"/> 标签，替换时会被自动还原成原文。',
-      '- 当前 turn 的用户新消息不属于被替换区间，不要写进摘要；它只作为取舍透镜——凡与新问题相关的目标 turn 细节务必保留，无关的可以压掉。',
+      '- 目标 turn 的起始用户消息保留在 surface 上、checkpoint 之前：不进折叠区间、不要写进摘要（原文已经在上下文里，重复反而占位置）。区间内的用户消息都是中途 steer：逐字写入各自的 <user-steer>…</user-steer> 元素，保留原位置。',
+      '- 目标 turn 内的对话输出同样逐字保留在各自原始位置的 <assistant>…</assistant> 里（没有标签可代，必须全文复制进 checkpoint）。',
+      '- 当前 turn 的用户新消息不属于被替换区间，不要写进摘要；它只是目标 turn 用户消息的一条提示（hint），只用来判断保留取舍——凡与新问题相关的目标 turn 细节务必保留，无关的可以压掉。不要为这条 hint 展开实质思考：真正的思考在压缩完成后开始。',
       '- 只在 runtime 上下文出现 pending 提示时使用；一次调用只处理一个 turn，按 turn 号从小到大逐个处理。',
       '- 整 turn 替换不走压缩后端，没有收缩校验；checkpoint 仍应明显短于被替换的 turn。',
       '',
       '## 调用',
       '',
-      '把摘要全文作为 summary 参数调用 compact_turn；整 turn 模式另把目标 turn 号作为 turn 参数传入。不要附带其他文字或解释。',
+      '把摘要全文作为 summary 参数调用 compact_turn；整 turn 模式另把目标 turn 号作为 turn 参数传入。撰写与调用全程静默：摘要文本只进 summary 参数，绝不以消息形式展示、绝不作为对白输出；总结过程中不产生任何对白。',
     ].join(NL),
   },
 ];
@@ -518,7 +531,11 @@ function apply(ctx, config) {
       try {
         const session = context.agent?.session;
         if (session === undefined || !isTurnMemorySession(context.agent)) return '';
-        const state = states.get(session.id);
+        let state = states.get(session.id);
+        if (state === undefined || state.items.size === 0) {
+          registerPendingTurn(session);
+          state = states.get(session.id);
+        }
         if (state === undefined || state.items.size === 0) return '';
         const turnStart = findLastEvent(session, 'turn/start');
         if (turnStart === undefined) return '';
@@ -530,7 +547,7 @@ function apply(ctx, config) {
         }
         if (pendingTurns.length === 0) return '';
         pendingTurns.sort((a, b) => a - b);
-        return 'Pending turn summary: turn ' + pendingTurns.join(', ') + ' still ' + (pendingTurns.length === 1 ? 'has' : 'have') + ' no summary checkpoint. Before anything else, compose ' + (pendingTurns.length === 1 ? 'that turn\'s' : 'those turns\'') + ' checkpoint' + (pendingTurns.length === 1 ? '' : 's') + ' following the dsh-compact-turn skill — the message that opened this turn is your lens for what to retain, but it is not part of the replaced span — then call compact_turn once per turn with the turn number and the checkpoint text as the summary argument. Doing this first frees context for the rest of the turn.';
+        return 'Pending turn summary: turn ' + pendingTurns.join(', ') + ' still ' + (pendingTurns.length === 1 ? 'has' : 'have') + ' no summary checkpoint. Before anything else, compose ' + (pendingTurns.length === 1 ? 'that turn\'s' : 'those turns\'') + ' checkpoint' + (pendingTurns.length === 1 ? '' : 's') + ' following the dsh-compact-turn skill — the message that opened this turn is only a hint for what to retain (a lens, not a task: do not think it through yet, the real thinking starts after the summary lands), and it is not part of the replaced span — then call compact_turn once per turn with the turn number and the checkpoint text as the summary argument. Doing this first frees context for the rest of the turn.';
       } catch {
         return '';
       }
@@ -606,7 +623,7 @@ function apply(ctx, config) {
       'Compactly summarize the completed portion of the CURRENT turn into one checkpoint, freeing context during a long turn.',
       'Compose the checkpoint text yourself from your current context, following the dsh-compact-turn skill, and pass it as the summary argument — no subagent summarizes the span for you.',
       'The compacted range is everything after the turn-starting message up to (excluding) the current step; the turn-starting message stays verbatim and the current step is untouched.',
-      'With the optional turn argument, compact a COMPLETED previous turn whole instead: its entire span — that turn\'s own user message included — is replaced by your checkpoint, so preserve that turn\'s user request verbatim.',
+      'With the optional turn argument, compact a COMPLETED previous turn whole instead: the span AFTER its turn-starting user message is replaced by your checkpoint — that message stays verbatim on the surface right before the checkpoint, so do not repeat it in the checkpoint (steering messages inside the span keep their own <user-steer>…</user-steer> elements).',
       'Use it proactively when the turn is getting long and more work lies ahead, before automatic pressure compaction forces a less-informed cut. After the call the compacted span leaves your context; recover it later only via expand_turn (or re-reading files) — keep in the checkpoint what a future step is likely to need. It runs exclusively, so other tool calls wait for it.',
     ].join(' '),
     parameters: {
@@ -617,7 +634,7 @@ function apply(ctx, config) {
       },
       turn: {
         type: 'integer',
-        description: 'Optional target turn number: compact that COMPLETED turn whole (its user message included) instead of the current turn\'s completed portion. Use only for turns the runtime context lists as pending.',
+        description: 'Optional target turn number: compact that COMPLETED turn whole — its span after the turn-starting user message (that message stays verbatim on the surface before the checkpoint). Use only for turns the runtime context lists as pending.',
       },
     },
     output: {
@@ -637,16 +654,21 @@ function apply(ctx, config) {
       const turnArg = typeof args.turn === 'number' && Number.isInteger(args.turn) ? args.turn : undefined;
       if (turnArg !== undefined) {
         // Whole-turn mode: the current context composed the checkpoint for a
-        // COMPLETED previous turn; replace that turn's whole span (its user
-        // message included) with the turn-memory summary checkpoint. This
-        // path reuses the same replacement as the fork fallback (tryReplace)
-        // and does not run a compaction transaction.
+        // COMPLETED previous turn; replace that turn's span AFTER its
+        // starting user message (the start stays verbatim on the surface, so
+        // the checkpoint's <user-steer> elements cover only mid-turn steering) with
+        // the turn-memory summary checkpoint. This path reuses the same
+        // replacement as the fork fallback (tryReplace) and does not run a
+        // compaction transaction.
         const summary = typeof args.summary === 'string' ? args.summary.trim() : '';
         if (summary === '') return 'compact_turn: summary is required — compose the checkpoint text following the dsh-compact-turn skill and pass it as the summary argument';
         const openTurn = findLastEvent(session, 'turn/start');
         if (openTurn !== undefined && openTurn.data?.turn === turnArg) return 'compact_turn: turn ' + turnArg + ' is the open turn — call compact_turn without the turn argument to compact the current turn';
-        const state = states.get(session.id);
-        const item = state?.items.get(turnArg);
+        let item = states.get(session.id)?.items.get(turnArg);
+        if (item === undefined) {
+          const registered = registerPendingTurn(session);
+          if (registered?.turn === turnArg) item = registered;
+        }
         if (item === undefined) return 'compact_turn: turn ' + turnArg + ' has no pending turn record in this session';
         if (item.replaced) return 'compact_turn: turn ' + turnArg + ' is already replaced by its summary checkpoint';
         item.summary = summary;
@@ -698,6 +720,7 @@ function apply(ctx, config) {
             turn: turnStart.data?.turn,
             turnSummaryId: randomUUID(),
             version: TURN_SUMMARY_VERSION,
+            scope: 'in-turn',
           },
         };
         const checkpointOp: any = {
@@ -718,6 +741,7 @@ function apply(ctx, config) {
       dumpPrefixBoundary(
         session,
         'in-turn (current turn)',
+        boundary.bounds.spanStartSeq,
         checkpointSeq,
         nextSeq,
         nodeCount,
@@ -962,46 +986,59 @@ function apply(ctx, config) {
    * items never block the next pre-step — the replacement lands whenever
    * the agent compacts the turn.
    */
+  /**
+   * Idempotent, log-driven pending registration: registers the last completed
+   * turn as pending when it has no summary checkpoint yet. Shared by the
+   * agent/created recovery and the lazy self-healing paths (the pending
+   * notice and the compact_turn whole-turn mode) — registration can be lost
+   * when a restart lands while a turn is open or an agent resumes through a
+   * path that skips lifecycle events, and re-deriving it from the log keeps
+   * the whole-turn flow independent of event delivery.
+   */
+  function registerPendingTurn(session) {
+    const lastEnd = findLastEvent(session, 'turn/end');
+    if (lastEnd === undefined) return undefined;
+    const turn = lastEnd.data.turn;
+    let state = states.get(session.id);
+    if (state === undefined) {
+      state = { items: new Map(), lastTurn: 0 };
+      states.set(session.id, state);
+    }
+    if (state.lastTurn >= turn) return state.items.get(turn);
+    if (replacedTurnNumbers(session).has(turn)) {
+      dbg('recovery: turn ' + turn + ' already replaced; marking handled');
+      state.lastTurn = turn;
+      return undefined;
+    }
+    state.lastTurn = turn;
+    const startEvent = findLastEvent(session, 'turn/start', lastEnd.seq);
+    if (startEvent === undefined || startEvent.data?.turn !== turn) return undefined;
+    if (!hasEventBetween(session, 'assistant/message', startEvent.seq, lastEnd.seq)) {
+      dbg('recovery: turn ' + turn + ' has no assistant content; skipping');
+      return undefined;
+    }
+    const controller = new AbortController();
+    const item = {
+      turn,
+      startSeq: startEvent.seq,
+      endSeq: lastEnd.seq,
+      controller,
+      settled: true,
+      summary: undefined,
+      replaced: false,
+      forkInFlight: false,
+      recovery: true,
+      turnSummaryId: randomUUID(),
+    };
+    state.items.set(turn, item);
+    dbg('recovery: turn ' + turn + ' marked pending after session resume');
+    return item;
+  }
+
   ctx.on('agent/created', ({ agent }) => {
     try {
-      const session = agent.session;
       if (!isTurnMemorySession(agent)) return;
-      const lastEnd = findLastEvent(session, 'turn/end');
-      if (lastEnd === undefined) return;
-      const turn = lastEnd.data.turn;
-      let state = states.get(session.id);
-      if (state === undefined) {
-        state = { items: new Map(), lastTurn: 0 };
-        states.set(session.id, state);
-      }
-      if (state.lastTurn >= turn) return;
-      if (replacedTurnNumbers(session).has(turn)) {
-        dbg('recovery: turn ' + turn + ' already replaced; marking handled');
-        state.lastTurn = turn;
-        return;
-      }
-      state.lastTurn = turn;
-      const startEvent = findLastEvent(session, 'turn/start', lastEnd.seq);
-      if (startEvent === undefined || startEvent.data?.turn !== turn) return;
-      if (!hasEventBetween(session, 'assistant/message', startEvent.seq, lastEnd.seq)) {
-        dbg('recovery: turn ' + turn + ' has no assistant content; skipping');
-        return;
-      }
-      const controller = new AbortController();
-      const item = {
-        turn,
-        startSeq: startEvent.seq,
-        endSeq: lastEnd.seq,
-        controller,
-        settled: true,
-        summary: undefined,
-        replaced: false,
-        forkInFlight: false,
-        recovery: true,
-        turnSummaryId: randomUUID(),
-      };
-      state.items.set(turn, item);
-      dbg('recovery: turn ' + turn + ' marked pending after session resume');
+      registerPendingTurn(agent.session);
     } catch (error) {
       dbg('recovery: handling failed: ' + errorText(error));
       ctx.logger.warn('turn-memory: resume recovery failed: ' + errorText(error));
@@ -1031,7 +1068,7 @@ function apply(ctx, config) {
    * separated by a divider line. Disabled unless prefixDumpDir is set;
    * best-effort.
    */
-  function dumpPrefixBoundary(session, mode, checkpointSeq, nextSeq, replacedNodes, replacedSpan, note) {
+  function dumpPrefixBoundary(session, mode, beforeSeq, checkpointSeq, nextSeq, replacedNodes, replacedSpan, note) {
     const dir = settings.prefixDumpDir;
     if (typeof dir !== 'string' || dir === '') return;
     try {
@@ -1042,12 +1079,14 @@ function apply(ctx, config) {
           timestamp: new Date().toISOString(),
           sessionId: String(session.id),
           mode,
+          beforeSeq,
           checkpointSeq,
           nextSeq,
           replacedNodes,
           replacedSpan,
           note,
         },
+        beforeSeq === null || beforeSeq === undefined ? undefined : session.events[beforeSeq],
         session.events[checkpointSeq],
         nextSeq === null ? undefined : session.events[nextSeq],
       );
@@ -1062,12 +1101,26 @@ function apply(ctx, config) {
   /** Replace one completed turn with its summary checkpoint; returns false when skipped. */
   function tryReplace(session, item, via) {
     const events = session.events;
+    // The turn's own user message stays on the surface: the replacement span
+    // starts AFTER it, so the checkpoint never needs to repeat it — the
+    // original remains in context right before the checkpoint. Falls back to
+    // folding the whole span when the turn carries no user message.
+    let initialUserSeq: number | null = null;
+    for (let seq = item.startSeq + 1; seq <= item.endSeq; seq += 1) {
+      const event = events[seq];
+      if (event === undefined) break;
+      if (event.type === 'user/message' && event.surfaceOp === 'append' && event.data?.source?.kind === 'user') {
+        initialUserSeq = seq;
+        break;
+      }
+    }
     const spanSeqs: number[] = [];
     const skippedForeign: number[] = [];
     let firstIdx = -1;
     let lastIdx = -1;
     session.surface.nodes.forEach((seq, index) => {
       if (seq > item.startSeq && seq <= item.endSeq) {
+        if (seq === initialUserSeq) return;
         const event = events[seq];
         if (foreignCheckpointOf(event, item.turn)) {
           skippedForeign.push(seq);
@@ -1132,6 +1185,7 @@ function apply(ctx, config) {
         turn: item.turn,
         turnSummaryId: item.turnSummaryId,
         version: TURN_SUMMARY_VERSION,
+        scope: 'whole-turn',
       },
     }, {
       surfaceOp: { op: 'replace', start: spanSeqs[0], end: spanSeqs[spanSeqs.length - 1] },
@@ -1142,7 +1196,7 @@ function apply(ctx, config) {
     const surfaceAfter = session.surface.nodes;
     const checkpointSeq = surfaceAfter[firstIdx];
     const nextSeq = surfaceAfter[firstIdx + 1] ?? null;
-    dumpPrefixBoundary(session, via, checkpointSeq, nextSeq, spanSeqs.length, '[' + spanSeqs[0] + ', ' + spanSeqs[spanSeqs.length - 1] + ']', undefined);
+    dumpPrefixBoundary(session, via, initialUserSeq, checkpointSeq, nextSeq, spanSeqs.length, '[' + spanSeqs[0] + ', ' + spanSeqs[spanSeqs.length - 1] + ']', initialUserSeq === null ? undefined : 'turn-starting user message seq ' + initialUserSeq + ' stays verbatim BEFORE the checkpoint');
     dbg('tryReplace: turn ' + item.turn + ' REPLACED span [' + spanSeqs[0] + ', ' + spanSeqs[spanSeqs.length - 1] + '] (' + spanSeqs.length + ' nodes)');
     ctx.logger.info('turn-memory: replaced turn ' + item.turn + ' (shadowed ' + spanSeqs.length + ' surface nodes)');
     return true;

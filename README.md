@@ -120,10 +120,12 @@ Marking rules:
   into the summary would only duplicate it. (For a resumed or recovered
   turn whose starting message is no longer on the surface, reproduce it as
   the first <user-steer>…</user-steer> element instead.)
-- The compaction act itself (the compact_turn call, node counts, the
-  replacement result) is transient infrastructure: it never appears in a
-  checkpoint or a reply — after a replacement lands, only the compressed
-  content remains in view.
+- All compaction-machinery process is transient infrastructure:
+  compact_turn calls and probes, node counts, replacement results, pending
+  notices and registration state, restart scheduling for compaction
+  changes — none of it appears in a checkpoint or a reply; checkpoints keep
+  only substantive outcomes (root causes, decisions, fixes, artifacts).
+  After a replacement lands, only the compressed content remains in view.
 - Reusable procedures are referenced by name (skill or script path) instead
   of being restated; the steps live in skills loaded on demand.
 

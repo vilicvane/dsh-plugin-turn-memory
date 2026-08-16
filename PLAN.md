@@ -508,6 +508,18 @@ maxRawChars 500000 / toolResultCapChars 20000 / maxRecallDepth 4。
   (.gitignore 排除);生效需 dsh web 重启,由下一 turn 的压缩以文件存在为证。
 - 状态:重启调度中;未提交。
 
+## 18. 压缩机制过程内容不进 checkpoint(turn 50)
+
+- 现象:用户指出 turn 48 的整 turn checkpoint 又把压缩上一轮的过程内容写进了
+  总结(<working> 里叙述了 compact_turn 探针、no pending record 报错、重启
+  调度等压缩流程过程)。
+- 根因:既有规则只排除"压缩动作本身"(调用、节点数、替换结果),没有覆盖压缩
+  机制的周边过程叙述——触发提示与 pending 状态、探针与验证过程、为压缩相关
+  改动调度的重启。
+- 修复:四处规则加宽为"压缩机制的全部过程内容不进 checkpoint/回复,只保留
+  实质结论(根因、决策、修复、产出)":dsh-compact-turn 技能通用规则与调用段、
+  buildSummaryPrompt、MEMORY_SECTION pending 段、README marking rules。
+
 ## 17. 压缩过程不可见原则(turn 33)
 
 - 现象:整 turn 压缩完成后,回复与 checkpoint 里仍在复述压缩动作(turn 号、

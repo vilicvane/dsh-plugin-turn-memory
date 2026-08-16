@@ -101,10 +101,10 @@ Marking rules:
   with the process shortened.
 - Checkpoints already inside the span (a <turn-summary> block or an
   in-turn checkpoint from earlier compaction) are not covered-and-skippable:
-  copy their fragments verbatim into the new checkpoint (hindsight
-  annotations allowed), then summarize only the remaining content and append
-  it in order — omitting or rewriting already-summarized parts silently loses
-  history.
+  copy their fragments byte-for-byte into the new checkpoint at their
+  original positions (hindsight annotations allowed), then summarize only
+  the remaining content and append it in order — copying beats tightening,
+  and omitting or rewriting already-summarized parts silently loses history.
 - The structure tags appear only inside checkpoint text, never in live
   conversation output, and composing a summary is silent: the text goes
   straight into the compact_turn summary argument, so the summarization

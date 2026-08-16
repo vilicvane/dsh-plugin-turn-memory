@@ -543,6 +543,14 @@ long turn 提醒文案各加收敛子句(代理可能不加载技能、只凭提
   开头是本 turn 的 turn-memory checkpoint 时,照抄部分两边相抵,只比较新
   片段与新内容;checkpoint 短于照抄长度时给"must begin with ... copied
   verbatim"定向报错)。测试 41→46/46;提示词改动需重启生效。
+- turn 92 整 turn 模式同病复发(用户指同一 dump 文件末尾):22:02(turn 84)
+  与 22:12(turn 85)两条 whole-turn summary 把区间内的 turn 内 checkpoint
+  片段整体改写为单个新 <working>、细节大量丢失——turn 内片段照抄自 22:07
+  起正常,但整 turn 模式的技能规则只写"照抄规则见通用规则"、没有 turn 内
+  模式那样的逐字硬度与模板。修复:技能整 turn 模式加硬(裸标签片段逐字全文
+  照抄、按原位置保留、模板 <working>甲</working><working>乙</working>、
+  "照抄优先于精炼");buildSummaryPrompt/MEMORY_SECTION pending 段/README
+  补 byte-for-byte at their original positions。提示词改动需重启生效。
 
 ## 18. 压缩机制过程内容不进 checkpoint(turn 50)
 

@@ -45,7 +45,10 @@ rules live in the bundled dsh-compact-turn skill and the text arrives as
 the tool's summary argument — so no fork or subagent summarizes the span.
 For the current-turn mode the tool validates the range (tool-pair
 balance), runs exclusively, and folds the span itself: the shrink check
-(checkpoint chars vs the folded nodes model-visible text), the checkpoint
+(checkpoint chars vs the folded nodes model-visible text — when the span
+opens with this turn's earlier checkpoint, the copied fragment cancels out
+and only the new fragments are compared against the new content), the
+checkpoint
 append and the surface replacement all run in the plugin, mirroring the
 whole-turn path — no compaction backend is involved. The whole-turn path
 applies the same
@@ -156,7 +159,8 @@ stays single-source.
     lib/routing.ts  pure agentic-recall age routing
     test/*.test.ts  node:test unit tests for the lib modules
 
-Run both checks after edits, then restart per the dsh-web-restart skill:
+Run both checks after edits, then remind the user to restart dsh web
+manually (no automatic restarts — see the dsh-web-restart skill):
 
     pnpm test        # unit tests (node --test, type stripping)
     pnpm typecheck   # tsc --noEmit

@@ -532,6 +532,17 @@ long turn 提醒文案各加收敛子句(代理可能不加载技能、只凭提
   按类型就地总结按原时序接在后面;整 turn 压缩同样保留区间内片段原样、只
   总结剩余内容。五处同步:技能通用规则(改只限 <turn-summary> 块)与两模式、
   MEMORY_SECTION 两段、buildSummaryPrompt、README 两处。
+- turn 87 追加规则在长 turn 中不稳定(用户实测,另一会话 dump 证据):turn 内
+  第二次 compact_turn 的 checkpoint 把第一次 checkpoint 的实质整体改写/吞掉
+  (span 起点即前 checkpoint seq,原文在上下文里却仍被重新总结)——提示词
+  "原文照抄"被总结惯性覆盖,且全量收缩校验给"收紧整体"留了错误激励。修复
+  两层:(1) 提示词加硬——技能 turn 内模式改为"新 checkpoint 必须从旧
+  checkpoint 的逐字全文开始(一字不改、唯一增补是 hindsight 括注)"并给
+  逐字模板;MEMORY_SECTION/buildSummaryPrompt/README 同口径加 byte-for-byte;
+  (2) 收缩校验改增量语义(lib/bounds.ts 新增 carriedCheckpointChars:span
+  开头是本 turn 的 turn-memory checkpoint 时,照抄部分两边相抵,只比较新
+  片段与新内容;checkpoint 短于照抄长度时给"must begin with ... copied
+  verbatim"定向报错)。测试 41→46/46;提示词改动需重启生效。
 
 ## 18. 压缩机制过程内容不进 checkpoint(turn 50)
 

@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { checkToolPairBalance, computeSpanBoundaries, computeWalkRange, eventTextSize, foldedSpanSize, shrinkCheckError, type SessionEventLike } from '../lib/bounds.ts';
+import { carriedCheckpointChars, checkToolPairBalance, computeSpanBoundaries, computeWalkRange, eventTextSize, foldedSpanSize, shrinkCheckError, type SessionEventLike } from '../lib/bounds.ts';
 
 const ev = (seq: number, type: string, data: Record<string, any> = {}): SessionEventLike => ({ seq, type, data });
 
@@ -205,5 +205,48 @@ describe('foldedSpanSize and shrinkCheckError', () => {
     const error = shrinkCheckError(events, [9], 5);
     assert.ok(error !== null && error.includes('not smaller than the folded span'));
     assert.ok(error.includes('5 chars'));
+  });
+});
+
+describe('carried checkpoint and incremental shrink', () => {
+  const checkpoint = (seq: number, text: string) => ev(seq, 'user/message', {
+    content: [{ type: 'text', text }],
+    source: { kind: 'plugin', plugin: 'turn-memory', turn: 1 },
+  });
+
+  it('recognizes a turn-memory checkpoint at the span head', () => {
+    const events = eventsOf(checkpoint(9, 'abcde'), ev(10, 'assistant/message', { message: { content: [{ type: 'text', text: 'fg' }] } }));
+    assert.equal(carriedCheckpointChars(events, [9, 10]), 5);
+  });
+
+  it('returns 0 for a non-checkpoint head', () => {
+    const events = eventsOf(ev(9, 'user/message', { content: [{ type: 'text', text: 'abcde' }], source: { kind: 'user' } }));
+    assert.equal(carriedCheckpointChars(events, [9]), 0);
+  });
+
+  it('incremental check: new fragments beat new content while the copied part cancels', () => {
+    const events = eventsOf(
+      checkpoint(9, 'carried-carried-carried-carried-carried'),
+      ev(10, 'assistant/message', { message: { content: [{ type: 'text', text: 'new content that is long' }] } }),
+    );
+    // copied 35 chars + new fragments 5 chars = 40 < folded 35+25=60
+    assert.equal(shrinkCheckError(events, [9, 10], 40), null);
+  });
+
+  it('drops below the verbatim length are refused with the copy-first error', () => {
+    const events = eventsOf(checkpoint(9, 'carried-carried-carried-carried-carried'));
+    const error = shrinkCheckError(events, [9], 20);
+    assert.ok(error !== null && error.includes('copied verbatim'));
+  });
+
+  it('new fragments not smaller than new content are refused with the incremental detail', () => {
+    const events = eventsOf(
+      checkpoint(9, 'carried'),
+      ev(10, 'assistant/message', { message: { content: [{ type: 'text', text: 'xy' }] } }),
+    );
+    // carried 7 + fragments 3 = 10 vs folded 7+2=9 → fails on the new part
+    const error = shrinkCheckError(events, [9, 10], 10);
+    assert.ok(error !== null && error.includes('new fragments'));
+    assert.ok(error.includes('new span content'));
   });
 });

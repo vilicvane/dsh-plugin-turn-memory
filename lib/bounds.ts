@@ -158,10 +158,33 @@ export function foldedSpanSize(
 }
 
 /**
+ * Chars of the span's opening node when it is this turn's earlier in-turn
+ * checkpoint (a user/message carrying the turn-memory plugin source marker).
+ * The append rule copies that fragment verbatim into every new checkpoint, so
+ * the shrink check cancels it out on both sides and compares only the new
+ * fragments against the new content.
+ */
+export function carriedCheckpointChars(
+  events: readonly (SessionEventLike | undefined)[],
+  seqs: readonly number[],
+): number {
+  if (seqs.length === 0) return 0;
+  const event = events[seqs[0]];
+  if (event?.type !== 'user/message') return 0;
+  const source = event.data?.source as { kind?: unknown; plugin?: unknown } | undefined;
+  if (source?.kind !== 'plugin' || source.plugin !== 'turn-memory') return 0;
+  return eventTextSize(event);
+}
+
+/**
  * Shrink guard for the self-fold: the checkpoint must be strictly smaller
  * than the folded span (measured in chars of model-visible text), otherwise
  * the whole fold is refused — the same contract the compaction backend used
- * to enforce for the transaction.
+ * to enforce for the transaction. When the span opens with an earlier
+ * checkpoint of this same turn (append mode), the comparison is incremental:
+ * the copied fragment cancels out and only the new fragments must beat the
+ * new content — tightening already-summarized parts is neither required nor
+ * accepted.
  */
 export function shrinkCheckError(
   events: readonly (SessionEventLike | undefined)[],
@@ -169,6 +192,16 @@ export function shrinkCheckError(
   checkpointChars: number,
 ): string | null {
   const folded = foldedSpanSize(events, seqs);
+  const carried = carriedCheckpointChars(events, seqs);
+  if (carried > 0) {
+    if (checkpointChars < carried) {
+      return 'compact_turn: the checkpoint must begin with the previous checkpoint copied verbatim (' + carried + ' chars) — do not rewrite or shrink already-summarized fragments';
+    }
+    const foldedNew = folded - carried;
+    const checkpointNew = checkpointChars - carried;
+    if (checkpointNew < foldedNew) return null;
+    return 'compact_turn: the new fragments (' + checkpointNew + ' chars) are not smaller than the new span content (' + foldedNew + ' chars); tighten only the NEW content — the copied checkpoint cancels out on both sides — or compact a smaller range';
+  }
   if (checkpointChars < folded) return null;
   return 'compact_turn: the checkpoint (' + checkpointChars + ' chars) is not smaller than the folded span (' + folded + ' chars); write a tighter summary or compact a smaller range';
 }

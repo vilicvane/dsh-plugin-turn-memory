@@ -508,6 +508,31 @@ maxRawChars 500000 / toolResultCapChars 20000 / maxRecallDepth 4。
   (.gitignore 排除);生效需 dsh web 重启,由下一 turn 的压缩以文件存在为证。
 - 状态:重启调度中;未提交。
 
+## 19. 轮内收敛再次失效与修复(turn 73)
+
+- 现象:用户提供另一会话(session-bb76e564)的 request-prefix dump——连续三次
+turn 内压缩,每次新 checkpoint 只携带最近一段的内容,前序 checkpoint 的
+实质(第一次的诊断结论、第二次的接线调研)全部丢失;整 turn 收敛时也只
+收敛了最后一个 checkpoint。
+- 根因:收敛规则在 turn 69 已进技能通用规则,但只围绕 <turn-summary> 块措辞,
+且 MEMORY_SECTION 的 turn 内段(长 turn 主动压缩时必然在上下文中、无需加载
+技能)完全没有收敛要求——turn 内压缩的撰写 agent 把前序裸标签 checkpoint
+当成"已覆盖",新 checkpoint 只写增量。
+- 修复五处:①MEMORY_SECTION turn 内段加收敛句(the new checkpoint is the
+whole record so far, not just progress since the last compaction);②技能通用
+规则措辞补"本 turn 前序 turn 内压缩留下的裸标签收敛块";③技能 turn 内模式
+加具体收敛示例(旧 checkpoint 的结论一字不落地并入新 checkpoint);④⑤两级
+long turn 提醒文案各加收敛子句(代理可能不加载技能、只凭提醒压缩)。
+- 验证:typecheck、41/41 通过;线上验证待用户在 fork 会话再压一次。
+- turn 78 撤销机械守卫(用户决定先不加守卫,先保证无守卫时绝大多数情况正常,
+  守卫才有意义):删除 lib/convergence.ts 与 test/convergence.test.ts、
+  index.ts 两条路径的校验接线与 checkpointTextOf 辅助函数,README/PLAN 同步。
+- turn 81 语义反转(用户定案):turn 内压缩不再合并——新 checkpoint = 旧
+  checkpoint 片段原文照抄(可补 hindsight 括注,已总结部分整体不变)+ 新内容
+  按类型就地总结按原时序接在后面;整 turn 压缩同样保留区间内片段原样、只
+  总结剩余内容。五处同步:技能通用规则(改只限 <turn-summary> 块)与两模式、
+  MEMORY_SECTION 两段、buildSummaryPrompt、README 两处。
+
 ## 18. 压缩机制过程内容不进 checkpoint(turn 50)
 
 - 现象:用户指出 turn 48 的整 turn checkpoint 又把压缩上一轮的过程内容写进了

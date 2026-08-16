@@ -47,7 +47,9 @@ For the current-turn mode the tool validates the range (tool-pair
 balance), runs exclusively, and folds the span itself: the shrink check
 (checkpoint chars vs the folded nodes model-visible text), the checkpoint
 append and the surface replacement all run in the plugin, mirroring the
-whole-turn path — no compaction backend is involved. The whole-turn mode
+whole-turn path — no compaction backend is involved. The whole-turn path
+applies the same
+guard to the span it replaces. The whole-turn mode
 reuses the same replacement path as the fallback fork (turn-memory marker
 checkpoint). Session compaction keeps its own cheap-model summarizer; the
 two never mix.
@@ -96,8 +98,10 @@ Marking rules:
   with the process shortened.
 - Checkpoints already inside the span (a <turn-summary> block or an
   in-turn checkpoint from earlier compaction) are not covered-and-skippable:
-  they are part of the span's substance and must be converged into the new
-  checkpoint in place, or history is silently lost.
+  copy their fragments verbatim into the new checkpoint (hindsight
+  annotations allowed), then summarize only the remaining content and append
+  it in order — omitting or rewriting already-summarized parts silently loses
+  history.
 - The structure tags appear only inside checkpoint text, never in live
   conversation output, and composing a summary is silent: the text goes
   straight into the compact_turn summary argument, so the summarization
@@ -206,8 +210,9 @@ best-effort cache retention of "a few hours to a few days" (lower bound).
   falls back to the raw transcript for that turn.
 - A turn that experienced mid-turn compaction (proactive compact_turn or
   automatic pressure) is still replaced at its end: the span includes the
-  turn's own compaction checkpoints, so the final turn summary converges the
-  mid-turn checkpoint and the tail into one record.
+  turn's own compaction checkpoints, so the final turn summary keeps their
+  fragments verbatim (hindsight annotations allowed) and appends the
+  summarized tail — already-summarized parts are never rewritten.
 - The replacement is a user/message with the turn-memory source marker
   (turn number, summary id, format version, and a scope: whole-turn vs
   in-turn — only whole-turn checkpoints mark a turn as replaced, so an

@@ -113,7 +113,7 @@ function buildSummaryPrompt(turn) {
     '',
     'The tags alternate in the order things happened and mark the speaker, so no "user:"/"assistant:" prefixes and no labels or sections.',
     '- The turn\'s starting user message stays ON the surface right before this checkpoint — do not include it; every user message in the span is therefore a steering message (<user-steer>).',
-    '- Checkpoints already inside the span (a <turn-summary> block or an in-turn checkpoint from earlier compaction) are NOT covered-and-skippable: they are part of the span\'s substance and must be converged into this record in place — distill their substance into the timeline. Omitting them silently loses history.',
+    '- Checkpoints already inside the span (a <turn-summary> block or an in-turn checkpoint from earlier compaction) are NOT covered-and-skippable: copy their fragments verbatim into this record (you may add hindsight annotations beside them), then summarize only the remaining content and append it in order. Omitting or rewriting already-summarized parts silently loses history.',
     '- Preserve verbatim whatever keeps your intuition: user wording and emphasis, your commitments and offers, phrasing later turns may refer to, plus commands, paths, identifiers, error strings.',
     '- Read-in material stays as paths, not copies: inline only short key snippets; record the exact path plus one line of purpose, and re-read with the read tool when needed — copied text goes stale.',
     '- Hindsight in natural language ("I thought X might work. It later turned out wrong."), kept beside the entry it revises; assumptions stated as felt ("I assumed X, unverified").',
@@ -134,9 +134,9 @@ const MEMORY_SECTION = [
   '',
   'Summaries annotate hindsight in natural language ("I thought X might work. It later turned out wrong."); treat later corrections as authoritative over earlier entries.',
   '',
-  'During a long turn, compact proactively with the compact_turn tool before context pressure forces the automatic compactor. Compose the checkpoint yourself per the dsh-compact-turn skill and pass it as the summary argument — compose silently, the text goes only into the tool call. The tool replaces everything after the turn-starting message up to the current step; both stay verbatim. What the checkpoint replaces leaves your context; recovering it later costs an expand_turn recall — keep what a future step is likely to need.',
+  'During a long turn, compact proactively with the compact_turn tool before context pressure forces the automatic compactor. Compose the checkpoint yourself per the dsh-compact-turn skill and pass it as the summary argument — compose silently, the text goes only into the tool call. The tool replaces everything after the turn-starting message up to the current step; both stay verbatim. The span may begin with earlier in-turn checkpoint blocks of this same turn: copy them verbatim — do NOT merge or rewrite them, even when several <working> blocks sit together; you may add hindsight annotations beside them, but already-summarized parts stay unchanged — summarize only the new content and append it in order after them. What the checkpoint replaces leaves your context; recovering it later costs an expand_turn recall — keep what a future step is likely to need.',
   '',
-  'When the runtime context carries a pending-turn notice, compose that turn\'s whole-turn checkpoint FIRST per the dsh-compact-turn skill, then call compact_turn with the turn number and the summary. That turn\'s starting user message stays verbatim on the surface right before the checkpoint — do not repeat it. Checkpoints already inside the span are NOT covered-and-skippable: converge their substance into the new checkpoint in place, or history is silently lost. The message that just opened this turn is only a lens for what to retain, not a task: the real thinking starts after the summary lands. Compose silently, and keep compaction machinery (calls, counts, results, notices, restarts) out of the checkpoint and out of your replies.',
+  'When the runtime context carries a pending-turn notice, compose that turn\'s whole-turn checkpoint FIRST per the dsh-compact-turn skill, then call compact_turn with the turn number and the summary. That turn\'s starting user message stays verbatim on the surface right before the checkpoint — do not repeat it. Checkpoints already inside the span are NOT covered-and-skippable: keep their fragments verbatim (hindsight annotations allowed), then summarize only the remaining content and append it in order — never rewrite already-summarized parts, or history is silently lost. The message that just opened this turn is only a lens for what to retain, not a task: the real thinking starts after the summary lands. Compose silently, and keep compaction machinery (calls, counts, results, notices, restarts) out of the checkpoint and out of your replies.',
   '',
   'The recall modes:',
   '',
@@ -434,7 +434,7 @@ const PLUGIN_SKILLS = [
       '',
       '  用户可能中途 steer 多条、你也可能工作一段输出一段，标签按发生顺序交替即可。标签即主体标记：不加「用户：」前缀、不加分类标题、不分节——checkpoint 读起来就是对话本身，只是过程变短了。',
       '- <user-steer> 里的原话与 <assistant> 里的正文一字不改；<working> 只压粒度、不删事实。',
-      '- 区间里已有的摘要 checkpoint（前序压缩留下的 <turn-summary> 块或收敛块）不是已覆盖、可跳过的内容：它们是区间实质的一部分，必须把其中的实质内容按原时序收敛进新 checkpoint（提炼要点、并入对应位置），不得省略、不得只留尾巴——否则压缩会静默丢失历史。',
+      '- 区间里已有的压缩产物不是已覆盖、可跳过的内容：整 turn 的 <turn-summary> 块与 turn 内的 checkpoint 片段都必须原文照抄进新 checkpoint（可补 hindsight 括注），剩余内容按类型就地总结、按原时序接在后面——不得省略或重写已总结部分，否则压缩会静默丢失历史。',
       '- 后来被证错的条目留在原处，就地补自然语言修正（"我觉得 X 可行。（后来发现不对。）"）；假设按当时的感觉写（"我当时假设 X，未验证"）。',
       '- 逐字保留维持直觉的措辞：用户原话与强调、你的承诺与提议、命令、路径、标识符、错误串。',
       '- 读入的代码/文档只记路径 + 一句用途，需要时用 read 重读；短关键片段可内联。技能步骤只记名字，不重述。',
@@ -444,12 +444,13 @@ const PLUGIN_SKILLS = [
       '',
       '## turn 内模式（无 turn 参数）',
       '',
+      '- 区间开头常常是上一次 turn 内压缩留下的 checkpoint（裸标签文本）：它的片段原文照抄、不动——即使前序全是 <working> 也不合并、不重写；可为它补自然语言 hindsight 括注，但已总结的部分整体不变。只把其后新内容的实质按类型就地总结（<user-steer>/<assistant> 逐字、<working> 压成一句）按原时序接在后面。例：区间 = 旧 checkpoint（两个 <working>）+ 后续过程 → 新 checkpoint = 旧 checkpoint 原样 + <working>后续过程…</working>。',
       '- 不写 <verbatim> 标签：turn 内不还原标签，写什么就原样留下什么（结构标签是给人看的纯文本，留在 surface 上没问题）。',
       '- 有收缩校验：checkpoint 不比被折叠区间小会整笔失败。过不了时只压 <working> 的粒度；仍过不了就放弃这次 turn 内压缩，不得删减对话输出。',
       '',
       '## 整 turn 模式（带 turn 参数）',
       '',
-      '- 目标 turn 的起始用户消息留在 surface 上，不写进摘要；区间内的用户消息都是中途 steer，逐字进各自的 <user-steer> 元素。',
+      '- 目标 turn 的起始用户消息留在 surface 上，不写进摘要；区间内的用户消息都是中途 steer，逐字进各自的 <user-steer> 元素。剩余内容按类型就地总结接上（压缩产物照抄规则见通用规则）。',
       '- 当前 turn 的用户消息只是保留取舍的 hint/透镜：新问题相关的目标 turn 细节务必保留、无关的可压掉；不为它展开实质思考——真正的思考在压缩完成后开始。',
       '- 只在 runtime 上下文出现 pending 提示时使用；一次一个 turn，按 turn 号从小到大。',
       '- 无收缩校验，但 checkpoint 仍应明显短于被替换的 turn。',
@@ -512,9 +513,9 @@ function apply(ctx, config) {
         if (count < settings.reminderNodeThreshold) return '';
         const tier2 = Math.ceil(settings.reminderNodeThreshold * 1.5);
         if (count >= tier2) {
-          return 'Long turn warning: the current turn spans over ' + tier2 + ' surface nodes and keeps growing. Call compact_turn NOW — it condenses the completed steps into one checkpoint and frees context; waiting for automatic pressure risks a forced stop at a worse cut point.';
+          return 'Long turn warning: the current turn spans over ' + tier2 + ' surface nodes and keeps growing. Call compact_turn NOW — it condenses the completed steps into one checkpoint and frees context; converge any earlier in-turn checkpoints inside the span into the new checkpoint (it is the whole record so far, not just progress since the last one), and waiting for automatic pressure risks a forced stop at a worse cut point.';
         }
-        return 'Long turn notice: the current turn spans over ' + settings.reminderNodeThreshold + ' surface nodes. If the current phase is complete, call compact_turn — the finished part becomes one checkpoint while the turn-starting message and the current step stay verbatim.';
+        return 'Long turn notice: the current turn spans over ' + settings.reminderNodeThreshold + ' surface nodes. If the current phase is complete, call compact_turn — the finished part becomes one checkpoint (converging any earlier in-turn checkpoints inside the span into it) while the turn-starting message and the current step stay verbatim.';
       } catch {
         return '';
       }
@@ -677,6 +678,9 @@ function apply(ctx, config) {
         const replaced = tryReplace(session, item, 'whole-turn (compact_turn, turn ' + turnArg + ')');
         if (!replaced) {
           item.summary = undefined;
+          const gapError = item.replaceError;
+          item.replaceError = undefined;
+          if (typeof gapError === 'string' && gapError !== '') return 'compact_turn: ' + gapError;
           return 'compact_turn: turn ' + turnArg + ' could not be replaced right now (see the turn-memory debug log); the turn stays pending and can be retried';
         }
         return 'compact_turn: turn ' + turnArg + ' replaced by the provided summary (' + item.replacedNodes + ' surface nodes converged into one turn-summary checkpoint)';

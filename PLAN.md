@@ -508,6 +508,21 @@ maxRawChars 500000 / toolResultCapChars 20000 / maxRecallDepth 4。
   (.gitignore 排除);生效需 dsh web 重启,由下一 turn 的压缩以文件存在为证。
 - 状态:重启调度中;未提交。
 
+## 17. 压缩过程不可见原则(turn 33)
+
+- 现象:整 turn 压缩完成后,回复与 checkpoint 里仍在复述压缩动作(turn 号、
+  节点数量、替换结果)——用户指出理论上压缩后只应看到压缩后的内容,不应包含
+  压缩过程。
+- 机制澄清:压缩动作发生在执行它的那个 turn 的区间里(如为 turn 31 压缩的
+  动作属于 turn 32 的区间),压缩 turn 31 无法移除 turn 32 里的过程;该过程
+  随 turn 32 自己被压缩而消失。当前 turn 总是包含自己刚执行的压缩动作,直到
+  它也被压缩——这是设计使然。
+- 修复:把原则写进提示词——dsh-compact-turn 技能通用撰写规则、MEMORY_SECTION
+  pending 段、buildSummaryPrompt(fork 兜底)、README marking rules 各加一条:
+  压缩动作(调用、节点数、替换结果)是短暂基础设施,不进 checkpoint、不向用户
+  复述,替换落地后视野里只留压缩后的内容。历史 checkpoint(turn 31 及以前)仍
+  含过程复述,规则自 turn 32 起生效。
+
 ## 15. fork 算根会话(turn 25)
 
 - 现象:用户在 fork 会话里继续对话,compact_turn 报 only root sessions can

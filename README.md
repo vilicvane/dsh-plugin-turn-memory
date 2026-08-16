@@ -95,6 +95,10 @@ Marking rules:
   <verbatim kind="turn-prompt"/> takes its place and the harness swaps the
   tag back to the original message when the checkpoint lands. The tag saves
   output tokens, never omits content.
+- The compaction act itself (the compact_turn call, node counts, the
+  replacement result) is transient infrastructure: it never appears in a
+  checkpoint or a reply — after a replacement lands, only the compressed
+  content remains in view.
 - Reusable procedures are referenced by name (skill or script path) instead
   of being restated; the steps live in skills loaded on demand.
 

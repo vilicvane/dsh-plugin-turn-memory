@@ -727,9 +727,10 @@ long turn 提醒文案各加收敛子句(代理可能不加载技能、只凭提
      lib/bounds.ts、test/bounds.test.ts、reminderNodeThreshold、尾部提醒、
      pending 提示贡献器全部删除;不再需要 dsh-compact-turn 撰写技能)。
   2. turn 结束后由 sub agent 压缩:先把该 turn 完整转录写成临时草稿文件
-     <cwd>/.dsh-turn-summary-<sessionId>.md(lib/render.ts 渲染:### User/
-     ### Assistant/### Tool result 标记行,tool-result 超长按
-     toolResultCapChars 截断),sub agent 自行 read/edit 草稿直至完成。
+     <cwd>/.dsh-turn-summary-<sessionId>.md(lib/render.ts 渲染:直接就是
+     checkpoint 的标签格式——<user-steer>/<assistant> 逐字、原始过程在
+     <working> 块内、tool-result 超长按 toolResultCapChars 截断),sub agent
+     用 read/edit 只就地缩短 <working> 块内容、不动标签结构,直至完成。
   3. 压缩子代理 = 主会话 fork(用户 steer 定案:sub agent 是主会话的 fork,
      上下文里已有包括待总结 turn 在内的完整转录)——每轮允许工具
      read/edit,回复 DONE 表示草稿完成;引擎读回草稿 → tryReplace 立即落地

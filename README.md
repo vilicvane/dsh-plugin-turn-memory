@@ -7,8 +7,10 @@ When a top-level (root or resumed fork) session's turn completes, the plugin
 writes the turn's raw transcript into a temporary draft file and spawns a
 fork of the main session — a subagent whose context replays the completed
 turns verbatim, including the turn being summarized. The draft is seeded
-with the turn's full transcript as ### User / ### Assistant / ### Tool
-result blocks, and the fork compresses it in place (read/edit tools only)
+with the turn's full transcript already in the checkpoint's tag format
+(verbatim <user-steer>/<assistant> content, raw process inside <working>
+blocks), and the fork compresses it in place (read/edit tools only) — it
+only shortens the <working> contents, the tag structure stays —
 until it holds the whole-turn
 checkpoint, replies DONE, and the plugin reads the file back, replaces the
 turn's span on the surface with that checkpoint, and deletes the draft. The

@@ -96,31 +96,22 @@ const DEFAULT_SETTINGS = {
   prefixDumpDir: '',
 };
 
-/** Instruction for the per-turn summary fork: the fork's context already replays the completed turns verbatim, so it reads turn N there and refines the draft file; the engine reads the draft back when the fork settles. */
-function buildSummaryPrompt(turn, draftPath, transcript) {
+/** Instruction for the per-turn summary fork: the draft already holds the turn's transcript in the FINAL checkpoint tag format, so the fork only shortens <working> contents in place; the engine reads the draft back when the fork settles. */
+function buildSummaryPrompt(turn, draftPath) {
   return [
-    'You are the turn-summary fork of this session. Your context is a verbatim replay of the session\'s completed turns — turn ' + turn + ' (the most recently completed turn in that replay, or the one delimited below) is fully in it.',
+    'You are the turn-summary fork of this session. Your context is a verbatim replay of the session\'s completed turns — turn ' + turn + ' (the most recently completed turn in that replay) is fully in it.',
     '',
-    'Summarize ONLY turn ' + turn + ' into a compact running record. The draft file ' + draftPath + ' already holds the turn\'s full transcript as ### User / ### Assistant / ### Tool result marker blocks (tool results may be truncated). Compress it IN PLACE with the edit tool: progressively replace stretches of transcript blocks with the tag-format summary below. Never print the summary text in your reply — the file is the only deliverable. When the file is final, reply with the single word DONE.',
+    'Compress ONLY turn ' + turn + ' into the draft file ' + draftPath + '. The draft already holds that turn\'s transcript in the FINAL checkpoint format: verbatim <user-steer> and <assistant> content, with the raw process (tool calls, results, routine checks) inside <working> blocks (tool results may be truncated). Your job is compression IN PLACE, not writing: with the edit tool, shorten the CONTENT of each <working> block to one flowing line. <user-steer> and <assistant> contents are already final — keep them byte for byte. Never add, remove, rename, or reorder tags; never merge or split blocks; never add content outside the draft; never print the summary in your reply — the file is the only deliverable. When the file is final, reply with the single word DONE.',
     '',
-    'The record format — the conversation itself, in original chronological order, with the process shortened. No root wrapper (the surface already wraps the record as a turn-summary); a tag sequence marks each role:',
-    '',
-    '<user-steer>a steering user message, verbatim</user-steer>',
-    '<assistant>a user-facing reply, verbatim</assistant>',
-    '<working>the process in between (thinking, tool calls, results, routine checks), compressed in place to one line</working>',
-    '',
-    'The tags alternate in the order things happened and mark the speaker, so no "user:"/"assistant:" prefixes and no labels or sections.',
-    '- The turn\'s starting user message stays ON the surface right before this checkpoint — do not include it; every user message in the span is therefore a steering message (<user-steer>).',
-    '- Checkpoints already inside the span (a <turn-summary> block or an in-turn checkpoint from earlier compaction) are NOT covered-and-skippable: copy their fragments byte for byte into the draft, at their original positions (hindsight annotations allowed beside them), then summarize only the remaining content and append it in order — copying beats tightening; rewriting already-summarized parts silently loses history.',
-    '- Preserve verbatim whatever keeps your intuition: user wording and emphasis, your commitments and offers, phrasing later turns may refer to, plus commands, paths, identifiers, error strings.',
+    'A compressed <working> line keeps the substantive part only — decisions, discoveries, fixes, meaningful outcomes, in chronological order — and drops transient detail (individual tool calls, intermediate output, routine checks).',
+    '- Preserve verbatim whatever keeps your intuition: user wording and emphasis, commitments and offers, phrasing later turns may refer to, plus commands, paths, identifiers, error strings.',
     '- Read-in material stays as paths, not copies: inline only short key snippets; record the exact path plus one line of purpose — copied text goes stale.',
-    '- Hindsight in natural language ("I thought X might work. It later turned out wrong."), kept beside the entry it revises; assumptions stated as felt ("I assumed X, unverified").',
-    '- If the turn ended waiting for the user, include the pending question and ALL its options verbatim. End with the single next action when one is clear.',
+    '- Hindsight in natural language ("I thought X might work. It later turned out wrong."), kept inside the <working> block it revises; assumptions stated as felt ("I assumed X, unverified").',
+    '- If the turn ended waiting for the user, the pending question and ALL its options stay verbatim inside the <working> block that carried them; end with the single next action when one is clear.',
     '- Once this summary lands it is the only trace of this turn: the original can only be recovered by an expand_turn recall or by re-reading files — a line kept now is cheaper than a recall later.',
     '- Compaction machinery (compact_turn calls, node counts, replacement results, restarts) never enters the summary; keep only substantive outcomes (root causes, decisions, fixes, artifacts).',
     '- Name skills and procedures instead of restating their steps.',
-    transcript,
-  ].filter((line) => line !== undefined).join(NL);
+  ].join(NL);
 }
 
 
@@ -129,7 +120,7 @@ function buildSummaryPrompt(turn, draftPath, transcript) {
 const MEMORY_SECTION = [
   '## Conversation Memory',
   '',
-  'Each completed turn is automatically compacted when it ends: a fork subagent of this session compresses the turn\'s transcript — pre-rendered into a draft file as ### User / ### Assistant / ### Tool result blocks — in place with edit, and the plugin then replaces the turn\'s span — starting right after its user message, which stays verbatim on the surface — with a <turn-summary> checkpoint. Do not compact turns yourself; the compact_turn tool (with a turn argument) only re-runs the fork for a completed turn the engine missed.',
+  'Each completed turn is automatically compacted when it ends: a fork subagent of this session compresses the turn\'s transcript — pre-rendered into a draft file already in the checkpoint\'s tag format (verbatim <user-steer>/<assistant> content, raw process inside <working> blocks) — by shortening the <working> contents in place with edit, and the plugin then replaces the turn\'s span — starting right after its user message, which stays verbatim on the surface — with a <turn-summary> checkpoint. Do not compact turns yourself; the compact_turn tool (with a turn argument) only re-runs the fork for a completed turn the engine missed.',
   '',
   'When a summary may not contain what you need, or you must verify what happened in an earlier turn — including when the user challenges a claim — recall the full information with the expand_turn tool BEFORE answering; only the original transcripts settle the facts.',
   '',
@@ -398,7 +389,7 @@ const PLUGIN_SKILLS = [
       '## 行为约定',
       '',
       '- turn-memory 资格按持久化 origin 判定，不看运行时归属：origin 非 subagent 的会话（主会话与 fork，无论 live 还是 resumed）turn 结束时自动触发压缩 fork；仅一次性召回 subagent（origin 为 subagent）不参与（避免为一次性会话浪费主模型 fork）。',
-      '- turn 结束 → registerTurn 登记（幂等、日志驱动、无 assistant 内容的 turn 跳过）并立即 spawn 主模型 fork 子代理（parent=agent、toolFilter 只允许 read/edit）：引擎先把该 turn 的 span 渲染成 ### User / ### Assistant / ### Tool result 标记块（工具结果按 toolResultCapChars 截断）写进草稿 <cwd>/.dsh-turn-summary-<sessionId>-turn<N>.md（只读改工具面下空文件没有 edit 锚点，必须预填转录），fork 用 edit 就地压缩草稿、回复 DONE；引擎读回草稿 → tryReplace 立即把该 turn 的 span（起始用户消息之后、它逐字留在 surface）替换为 <turn-summary turn=N version=N> checkpoint → 删草稿。fork 失败或空草稿 → turn stays raw，之后每次 turn 结束的 sweep 按最旧优先重试未替换 turn。',
+      '- turn 结束 → registerTurn 登记（幂等、日志驱动、无 assistant 内容的 turn 跳过）并立即 spawn 主模型 fork 子代理（parent=agent、toolFilter 只允许 read/edit）：引擎先把该 turn 的 span 渲染成 checkpoint 同款标签格式（<user-steer>/<assistant> 逐字、原始过程在 <working> 块内，工具结果按 toolResultCapChars 截断）写进草稿 <cwd>/.dsh-turn-summary-<sessionId>-turn<N>.md（只读改工具面下空文件没有 edit 锚点，必须预填转录），fork 用 edit 只就地缩短各 <working> 块内容、标签结构不动，回复 DONE；引擎读回草稿 → tryReplace 立即把该 turn 的 span（起始用户消息之后、它逐字留在 surface）替换为 <turn-summary turn=N version=N> checkpoint → 删草稿。fork 失败或空草稿 → turn stays raw，之后每次 turn 结束的 sweep 按最旧优先重试未替换 turn。',
       '- 服务器重启（内存态丢失）→ agent/created 恢复：最后一个已完成 turn 若无 checkpoint 则 registerTurn 并立即 spawn fork；更旧的缺口由之后 turn 结束的 sweep 补。',
       '- compact_turn 工具：无 turn 内模式、无 summary 参数；只带可选 turn 参数补触发压缩 fork（缺省为最后一个已完成 turn），已在飞/已替换/未找到各有报错；主 agent 不自己写摘要（MEMORY_SECTION 已写明，摘要只由 fork 在草稿文件上产出）。',
 
@@ -734,7 +725,7 @@ function apply(ctx, config) {
       dbg('runTurnSummary: draft seeded for turn ' + item.turn + ' (' + transcript.length + ' chars, ' + spanSeqs.length + ' nodes)');
       run = await ctx.subagents.start('fork', {
         label: 'turn-summary ' + item.turn,
-        prompt: [{ type: 'text', text: buildSummaryPrompt(item.turn, draftPath, undefined) }],
+        prompt: [{ type: 'text', text: buildSummaryPrompt(item.turn, draftPath) }],
         parent: agent,
         signal: item.controller.signal,
         toolFilter: { allow: ['read', 'edit'] },

@@ -6,7 +6,7 @@
  *  - When a turn ends, the plugin immediately spawns a FORK subagent of this
  *    session (same model, its context is a verbatim replay of the completed
  *    turns — the full turn text included). The fork reads the turn from its
- *    own context, refines a per-turn draft file with read/edit tools, and
+ *    own context, refines a per-turn draft file with segment tools, and
  *    answers DONE; the plugin then reads the draft back and replaces the
  *    turn's span — starting right after its user message, which stays
  *    verbatim on the surface — with a <turn-summary> checkpoint. The main
@@ -42,10 +42,11 @@
  */
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
+import { draftShapeCheck, grepSegments, parseDraftSegments, readSegmentContent, replaceSegmentContent, segmentIdList } from './lib/draft.ts';
 import { renderTurnSpanText } from './lib/render.ts';
 import { appendDumpBlock, buildDumpFileName, renderPrefixBoundary } from './lib/prefix.ts';
 import { routeRecallByAge } from './lib/routing.ts';
@@ -68,7 +69,7 @@ const name = 'turn-memory';
 const inject = ['subagents', 'sessions', 'systemPrompt', 'tools', 'skills'];
 
 /** Format version stamped into every summary checkpoint source. */
-const TURN_SUMMARY_VERSION = 5;
+const TURN_SUMMARY_VERSION = 6;
 
 /** The plugin field of the checkpoint source marker. */
 const SUMMARY_MARKER_PLUGIN = 'turn-memory';
@@ -96,14 +97,24 @@ const DEFAULT_SETTINGS = {
   prefixDumpDir: '',
 };
 
-/** Instruction for the per-turn summary fork: the draft already holds the turn's transcript in the FINAL checkpoint tag format, so the fork only shortens <working> contents in place; the engine reads the draft back when the fork settles. */
+/** Instruction for the per-turn summary fork: the draft already holds the turn's transcript in the FINAL checkpoint tag format with numbered segments, so the fork only shortens <working:N> contents in place by segment id; the engine reads the draft back when the fork settles. */
 function buildSummaryPrompt(turn, draftPath) {
   return [
     'You are the turn-summary fork of this session. Your context is a verbatim replay of the session\'s completed turns — turn ' + turn + ' (the most recently completed turn in that replay) is fully in it.',
     '',
-    'Compress ONLY turn ' + turn + ' into the draft file ' + draftPath + '. The draft already holds that turn\'s transcript in the FINAL checkpoint format: verbatim <user-steer> and <assistant> content, with the raw process (tool calls, results, routine checks) inside <working> blocks (tool results may be truncated). Your job is compression IN PLACE, not writing: with the edit tool, shorten the CONTENT of each <working> block to one flowing line. <user-steer> and <assistant> contents are already final — keep them byte for byte. Never add, remove, rename, or reorder tags; never merge or split blocks; never add content outside the draft; never print the summary in your reply — the file is the only deliverable. When the file is final, reply with the single word DONE.',
+    'Compress ONLY turn ' + turn + ' in the draft file ' + draftPath + '. The draft already holds that turn\'s transcript in the FINAL checkpoint format: numbered segments — verbatim <user-steer:N> and <assistant:N> content, raw process (tool calls, results, routine checks; tool results may be truncated) inside <working:N> blocks — each id unique, in order, and stable. Your job is compression IN PLACE: shorten the CONTENT of each <working:N> block to one flowing line.',
     '',
-    'A compressed <working> line keeps the substantive part only — decisions, discoveries, fixes, meaningful outcomes, in chronological order — and drops transient detail (individual tool calls, intermediate output, routine checks).',
+    'Work from your context, not from re-reading the file — the full original turn is in your context, so compress from that. Use these tools:',
+    '- draft_replace_segment(path, id, content): replace the inner content of segment id with your new line. Pass the BARE content — no tags, no surrounding newlines; the tool pads the tag lines itself. Call it directly from memory; you do not need the old content.',
+    '- draft_read_segment(path, id): read one segment, only when you are unsure of its current state.',
+    '- draft_grep(path, pattern): find which segments mention something, by regex. Do not re-read the whole file unless genuinely necessary.',
+    '',
+    'Rules:',
+    '- <user-steer:N> and <assistant:N> contents are already final — never replace them; the engine rejects the draft if any verbatim segment changed.',
+    '- Injected context (runtime snapshots, skill catalogs, system reminders) sits inside <working:N> blocks under an [injected: ...] marker: compress each to ONE short line saying what it carried — file policy, approval policy, pending notices, skill-catalog change — never the catalog or snapshot itself.',
+    '- Every <working:N> must end as one flowing line; a block still showing tool transcripts or raw snapshots means the job is not done (the engine rejects working blocks longer than ' + String(2000) + ' chars).',
+    '- Never add, remove, rename, renumber, or reorder segments; never merge or split blocks; never add content outside the draft; never print the summary in your reply — the file is the only deliverable.',
+    '- A compressed <working> line keeps the substantive part only — decisions, discoveries, fixes, meaningful outcomes, in chronological order — and drops transient detail (individual tool calls, intermediate output, routine checks).',
     '- Preserve verbatim whatever keeps your intuition: user wording and emphasis, commitments and offers, phrasing later turns may refer to, plus commands, paths, identifiers, error strings.',
     '- Read-in material stays as paths, not copies: inline only short key snippets; record the exact path plus one line of purpose — copied text goes stale.',
     '- Hindsight in natural language ("I thought X might work. It later turned out wrong."), kept inside the <working> block it revises; assumptions stated as felt ("I assumed X, unverified").',
@@ -111,6 +122,8 @@ function buildSummaryPrompt(turn, draftPath) {
     '- Once this summary lands it is the only trace of this turn: the original can only be recovered by an expand_turn recall or by re-reading files — a line kept now is cheaper than a recall later.',
     '- Compaction machinery (compact_turn calls, node counts, replacement results, restarts) never enters the summary; keep only substantive outcomes (root causes, decisions, fixes, artifacts).',
     '- Name skills and procedures instead of restating their steps.',
+    '',
+    'When every <working:N> block is compressed and the file is final, reply with the single word DONE.',
   ].join(NL);
 }
 
@@ -120,7 +133,9 @@ function buildSummaryPrompt(turn, draftPath) {
 const MEMORY_SECTION = [
   '## Conversation Memory',
   '',
-  'Each completed turn is automatically compacted when it ends: a fork subagent of this session compresses the turn\'s transcript — pre-rendered into a draft file already in the checkpoint\'s tag format (verbatim <user-steer>/<assistant> content, raw process inside <working> blocks) — by shortening the <working> contents in place with edit, and the plugin then replaces the turn\'s span — starting right after its user message, which stays verbatim on the surface — with a <turn-summary> checkpoint. Do not compact turns yourself; the compact_turn tool (with a turn argument) only re-runs the fork for a completed turn the engine missed.',
+  'Each completed turn is automatically compacted when it ends: a fork subagent of this session compresses the turn\'s transcript — pre-rendered into a draft file already in the checkpoint\'s tag format (verbatim <user-steer:N>/<assistant:N> segments, raw process inside <working:N> blocks, each numbered for segment-level replacement) — by shortening the <working:N> contents in place with the draft_replace_segment tool (target segments by id from its context; draft_read_segment/draft_grep for partial lookups), and the plugin then replaces the turn\'s span — starting right after its user message, which stays verbatim on the surface — with a <turn-summary> checkpoint. Do not compact turns yourself; the compact_turn tool (with a turn argument) only re-runs the fork for a completed turn the engine missed.',
+  '',
+  'After a checkpoint lands, the pre-compression transcript of that turn stays at .dsh-turn-raw-<sessionId>-turn-<N>.md in the session workspace (overwritten by the next summarized turn). When a turn opens, compare the newest landed checkpoint against that raw file to judge how well the fork summarized; if substantive content was dropped, tell the user. The file needs no cleanup.',
   '',
   'When a summary may not contain what you need, or you must verify what happened in an earlier turn — including when the user challenges a claim — recall the full information with the expand_turn tool BEFORE answering; only the original transcripts settle the facts.',
   '',
@@ -389,7 +404,7 @@ const PLUGIN_SKILLS = [
       '## 行为约定',
       '',
       '- turn-memory 资格按持久化 origin 判定，不看运行时归属：origin 非 subagent 的会话（主会话与 fork，无论 live 还是 resumed）turn 结束时自动触发压缩 fork；仅一次性召回 subagent（origin 为 subagent）不参与（避免为一次性会话浪费主模型 fork）。',
-      '- turn 结束 → registerTurn 登记（幂等、日志驱动、无 assistant 内容的 turn 跳过）并立即 spawn 主模型 fork 子代理（parent=agent、toolFilter 只允许 read/edit）：引擎先把该 turn 的 span 渲染成 checkpoint 同款标签格式（<user-steer>/<assistant> 逐字、原始过程在 <working> 块内，工具结果按 toolResultCapChars 截断）写进草稿 <cwd>/.dsh-turn-summary-<sessionId>-turn<N>.md（只读改工具面下空文件没有 edit 锚点，必须预填转录），fork 用 edit 只就地缩短各 <working> 块内容、标签结构不动，回复 DONE；引擎读回草稿 → tryReplace 立即把该 turn 的 span（起始用户消息之后、它逐字留在 surface）替换为 <turn-summary turn=N version=N> checkpoint → 删草稿。fork 失败或空草稿 → turn stays raw，之后每次 turn 结束的 sweep 按最旧优先重试未替换 turn。',
+      '- turn 结束 → registerTurn 登记（幂等、日志驱动、无 assistant 内容的 turn 跳过）并立即 spawn 主模型 fork 子代理（parent=agent、toolFilter 只允许 read + draft_replace_segment/draft_read_segment/draft_grep）：引擎先把该 turn 的 span 渲染成 checkpoint 同款标签格式（<user-steer>/<assistant> 逐字、原始过程在 <working> 块内，工具结果按 toolResultCapChars 截断）写进草稿 <cwd>/.dsh-turn-summary-<sessionId>-turn<N>.md（只读改工具面下空文件没有 edit 锚点，必须预填转录），fork 用 edit 只就地缩短各 <working> 块内容、标签结构不动，回复 DONE；引擎读回草稿 → tryReplace 立即把该 turn 的 span（起始用户消息之后、它逐字留在 surface）替换为 <turn-summary turn=N version=N> checkpoint → 删草稿。fork 失败或空草稿 → turn stays raw，之后每次 turn 结束的 sweep 按最旧优先重试未替换 turn。',
       '- 服务器重启（内存态丢失）→ agent/created 恢复：最后一个已完成 turn 若无 checkpoint 则 registerTurn 并立即 spawn fork；更旧的缺口由之后 turn 结束的 sweep 补。',
       '- compact_turn 工具：无 turn 内模式、无 summary 参数；只带可选 turn 参数补触发压缩 fork（缺省为最后一个已完成 turn），已在飞/已替换/未找到各有报错；主 agent 不自己写摘要（MEMORY_SECTION 已写明，摘要只由 fork 在草稿文件上产出）。',
 
@@ -545,6 +560,102 @@ function apply(ctx, config) {
   }));
 
   /**
+   * Draft-segment tools for the turn-summary fork. The fork works from its
+   * context (the turn's original transcript replay) and targets segments by
+   * their unique id, so it never has to reproduce old content or re-read the
+   * whole draft. Registered for every agent; only the summary fork's
+   * toolFilter allows them. The path argument must point at a turn-summary
+   * draft (basename checked) — other paths are refused.
+   */
+  function draftFileText(path) {
+    if (typeof path !== 'string' || !/^\.dsh-turn-summary-.+-turn-\d+\.md$/.test(basename(path))) {
+      return { error: 'draft tool: path must be a turn-summary draft file path (from the fork prompt)' };
+    }
+    try {
+      return { text: readFileSync(path, 'utf8') };
+    } catch (error) {
+      return { error: 'draft tool: could not read ' + path + ': ' + errorText(error) };
+    }
+  }
+
+  function draftWriteBack(path, text) {
+    try {
+      writeFileSync(path, text);
+      return null;
+    } catch (error) {
+      return 'draft tool: could not write ' + path + ': ' + errorText(error);
+    }
+  }
+
+  ctx.tools.register(defineTool({
+    name: 'draft_replace_segment',
+    description: [
+      'Replace the inner content of one numbered segment in the turn-summary draft file.',
+      'Target the segment by its id (the number in its opening tag) — call it directly from memory; the old content does not need to be reproduced.',
+      'The tool keeps the segment tag and id; only the inner content changes.',
+    ].join(' '),
+    parameters: {
+      path: { type: 'string', required: true, description: 'The draft file path from the fork prompt.' },
+      id: { type: 'integer', required: true, description: 'The segment id to replace.' },
+      content: { type: 'string', required: true, description: 'The new inner content for that segment (no tags).' },
+    },
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      const read = draftFileText(args.path);
+      if (read.error !== undefined) return read.error;
+      const id = args.id;
+      const next = replaceSegmentContent(read.text, id, typeof args.content === 'string' ? args.content : '');
+      if (next === null) return 'draft_replace_segment: no segment with id ' + id + '; the draft has ids: ' + segmentIdList(read.text);
+      const writeError = draftWriteBack(args.path, next);
+      if (writeError !== null) return writeError;
+      const segment = parseDraftSegments(next).find((candidate) => candidate.id === id);
+      return 'draft_replace_segment: segment ' + id + ' (' + (segment?.kind ?? 'unknown') + ') replaced';
+    },
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'draft_read_segment',
+    description: 'Read one numbered segment of the turn-summary draft file by its id. Use only when unsure of a segment\'s current state — never to re-read the whole draft.',
+    parameters: {
+      path: { type: 'string', required: true, description: 'The draft file path from the fork prompt.' },
+      id: { type: 'integer', required: true, description: 'The segment id to read.' },
+    },
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    async execute(args, exec) {
+      const read = draftFileText(args.path);
+      if (read.error !== undefined) return read.error;
+      const id = args.id;
+      const content = readSegmentContent(read.text, id);
+      if (content === null) return 'draft_read_segment: no segment with id ' + id + '; the draft has ids: ' + segmentIdList(read.text);
+      return content;
+    },
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'draft_grep',
+    description: 'Search the turn-summary draft file with a JS regular expression. Returns which segments match, with the matching lines and their line numbers — use it to locate content instead of reading the whole draft.',
+    parameters: {
+      path: { type: 'string', required: true, description: 'The draft file path from the fork prompt.' },
+      pattern: { type: 'string', required: true, description: 'The regular expression to search for.' },
+    },
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    async execute(args, exec) {
+      const read = draftFileText(args.path);
+      if (read.error !== undefined) return read.error;
+      const hits = grepSegments(read.text, String(args.pattern ?? ''));
+      if (typeof hits === 'string') return hits;
+      if (hits.length === 0) return 'draft_grep: no matches';
+      const lines: string[] = [];
+      for (const hit of hits) {
+        lines.push('<seg ' + hit.kind + ':' + hit.id + '>');
+        for (const line of hit.lines) lines.push('  ' + line.lineNumber + ': ' + line.text.slice(0, 300));
+      }
+      return lines.join(NL);
+    },
+  }));
+
+  /**
    * Agentic recall routing by the turn's age: a turn whose end lies inside
    * recallRecentWindowMs is answered by a fork whose context replays the
    * completed-turn log verbatim (cheap only while the provider's disk cache
@@ -690,10 +801,16 @@ function apply(ctx, config) {
     return join(cwd, '.dsh-turn-summary-' + String(session.id) + '-turn-' + turn + '.md');
   }
 
+  /** Raw-transcript copy of the latest summarized turn, kept AFTER the checkpoint lands so the next turn can judge summary quality against it; overwritten per turn. The name deliberately avoids the draft-tool basename pattern. */
+  function rawPathFor(session, turn) {
+    const cwd = typeof session.header?.cwd === 'string' && session.header.cwd !== '' ? session.header.cwd : process.cwd();
+    return join(cwd, '.dsh-turn-raw-' + String(session.id) + '-turn-' + turn + '.md');
+  }
+
   /**
    * Run the turn-summary fork for one completed turn. The fork's context is a
    * verbatim replay of the session's completed turns, so it reads the turn
-   * there and refines the per-turn draft file (read/edit only); when it
+   * there and refines the per-turn draft file with the segment tools; when it
    * settles, the draft becomes the checkpoint and the turn is replaced
    * immediately. One turn, one fork; retries reuse the same item.
    */
@@ -702,14 +819,16 @@ function apply(ctx, config) {
     item.forkInFlight = true;
     const session = agent.session;
     const draftPath = draftPathFor(session, item.turn);
+    let seededTranscript = '';
     let run;
     try {
-      // Seed the draft with the full turn transcript: the fork's tool surface
-      // is read/edit only, and edit needs a non-empty anchor — an empty file
-      // leaves the fork nothing to replace. The fork compresses the rendered
+      // Seed the draft with the full turn transcript in the numbered-tag
+      // checkpoint format; the fork targets segments by id, so an empty file
+      // would leave it nothing to replace. The fork compresses the rendered
       // transcript in place.
       const spanSeqs = turnSpanSeqs(session, item.startSeq, item.endSeq, item.turn);
       const transcript = renderTurnSpanText(session.events, spanSeqs, { maxToolResultChars: settings.toolResultCapChars });
+      seededTranscript = transcript;
       if (transcript.trim() === '') {
         item.forkInFlight = false;
         dbg('runTurnSummary: turn ' + item.turn + ' has no renderable span; the turn stays raw');
@@ -722,13 +841,18 @@ function apply(ctx, config) {
         ctx.logger.warn('turn-memory: could not write the summary draft for turn ' + item.turn + ': ' + errorText(error));
         return;
       }
+      // Keep a raw-transcript copy past the fork for post-hoc quality checks
+      // by the next turn's agent (overwritten per turn; best-effort).
+      try { writeFileSync(rawPathFor(session, item.turn), transcript); } catch (error) {
+        dbg('runTurnSummary: raw copy write failed for turn ' + item.turn + ': ' + errorText(error));
+      }
       dbg('runTurnSummary: draft seeded for turn ' + item.turn + ' (' + transcript.length + ' chars, ' + spanSeqs.length + ' nodes)');
       run = await ctx.subagents.start('fork', {
         label: 'turn-summary ' + item.turn,
         prompt: [{ type: 'text', text: buildSummaryPrompt(item.turn, draftPath) }],
         parent: agent,
         signal: item.controller.signal,
-        toolFilter: { allow: ['read', 'edit'] },
+        toolFilter: { allow: ['read', 'draft_replace_segment', 'draft_read_segment', 'draft_grep'] },
       });
     } catch (error) {
       item.forkInFlight = false;
@@ -749,6 +873,11 @@ function apply(ctx, config) {
       draft = draft.trim();
       if (draft === '') {
         ctx.logger.warn('turn-memory: summary fork for turn ' + item.turn + ' left no draft; the turn stays raw');
+        return;
+      }
+      const shapeError = draftShapeCheck(seededTranscript, draft);
+      if (shapeError !== null) {
+        ctx.logger.warn('turn-memory: summary fork for turn ' + item.turn + ' broke the draft shape: ' + shapeError + '; the turn stays raw');
         return;
       }
       item.summary = draft;

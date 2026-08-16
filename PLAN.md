@@ -757,3 +757,48 @@ long turn 提醒文案各加收敛子句(代理可能不加载技能、只凭提
   渲染的转录写进草稿;buildSummaryPrompt 与 MEMORY_SECTION 改"草稿已含
   转录、就地压缩";ops 技能 bullet 与 README intro 同步(草稿预填转录)。
   node --check、typecheck、29/29 全过。
+
+## 21. 编号标签 + 分段工具(turn 99)
+
+- 动因:fork 用 edit 压 <working> 太慢——每轮要重读草稿、old_string 要复述
+  旧内容;用户定案:标签加唯一编号(<working:1 /> 式,内容承载为
+  <working:3>…</working>),子代理按 id 直接替换、不重读全文。
+- 实现:lib/render.ts 组装时给每段编号(相邻 working 合并时共享一个 id);
+  新增 lib/draft.ts(parseDraftSegments/replaceSegmentContent/
+  readSegmentContent/grepSegments/segmentIdList/draftShapeCheck);index.ts
+  注册三个工具 draft_replace_segment(path,id,content)/draft_read_segment
+  (path,id)/draft_grep(path,pattern)(路径 basename 校验 .dsh-turn-summary
+  -…-turn-N.md);fork toolFilter 改 read + 三工具(去掉 edit);runTurnSummary
+  在 fork settle 后做 draftShapeCheck(段序列 id/kind 不变、user-steer/
+  assistant 逐字一致,违者 turn 保持 raw);buildSummaryPrompt 重写(按 id
+  从上下文直接替换、局部读取兜底、DONE);TURN_SUMMARY_VERSION 5→6;
+  MEMORY_SECTION/运维技能/README 同步。
+- 测试:test/draft.test.ts 11 例 + render 期望改编号,46/46 全过。
+- turn 100 修正:首次实测发现注入上下文(runtime 快照、技能目录、system
+  reminder)被当 user-steer 逐字保留进 checkpoint——renderSpanSegments 对
+  所有 user/message 一律按 source.kind==="user" 才给 user-steer,其余按
+  [injected: ...] 标记进 working(fork 可压缩);buildSummaryPrompt 加两条
+  (注入上下文压成一行、working 不得残留原始转录);draftShapeCheck 加机械
+  守卫(working 段 >2000 字符即拒、turn 保持 raw,MAX_WORKING_CHARS
+  导出常量);测试 +4 例,50/50 全过。
+- turn 100 修正二:用户指出闭标签没带序号——改为 </working:3> 式闭标签,
+  解析正则从回引 kind 的惰性匹配改为回引 kind+id 的精确配对(<\/\1:\2>),
+  配对不再依赖"最近的同类闭标签"、内容里出现同类闭标签也不会截断;
+  render/replace/README 示例同步,50/50 全过。
+- turn 100 修正三:用户要求贪婪匹配 + 行级苛刻锚点——正则改为
+  /^<(user-steer|assistant|working):(\d+)>([\s\S]*)^<\/\1:\2>$/gm
+  (开闭标签各独占一行、kind 限定三选一、闭标签回引 kind+id、正文贪婪),
+  上下文里内联的标签示例不再误匹配;test/draft.test.ts 加 3 例锚点测试,
+  53/53 全过。
+- turn 102 追加:用户要求保留原始 turn 文件供总结后评估——新增
+  rawPathFor(session,turn)(.dsh-turn-raw-<sessionId>-turn-<N>.md,命名避开
+  draft 工具 basename 校验),runTurnSummary 播种草稿时把原始转录另存一份、
+  落地后保留(每 turn 覆盖、最新一份);MEMORY_SECTION 加一条(开场可对照
+  raw 文件评估上轮总结质量、发现实质丢失要告诉用户);README 同步。
+- turn 103 修正(实测死胡同):fork 传裸 content(不带换行)时,replaceSegment
+  Content 原样拼接使闭标签不再独占一行、行锚点正则整段解析失败("segment 1
+  (unknown)")。修复:replaceSegmentContent 自身规范化——剥掉 content 两端
+  空白后以 opening+NL+inner+NL+closing 重建,标签永远独占一行;工具提示与
+  buildSummaryPrompt 明确"传裸内容、工具自己补换行";测试 +2 例(裸内容
+  可重解析、两端空白剥离),55/55 全过。
+  转录里的内联标签示例不再误解析;测试 +3 例,53/53 全过。

@@ -1,11 +1,12 @@
 /**
  * Pure rendering of one completed turn's span into the draft text the
  * turn-summary fork compresses in place. The draft is already in the
- * checkpoint's FINAL tag format — <user-steer> and <assistant> contents
- * verbatim, raw process inside <working> blocks — so source and target share
- * one vocabulary and the fork only shortens <working> contents in place,
- * never restructures. Extracted from the plugin entry so the rendering is
- * unit-testable without booting the plugin.
+ * checkpoint's FINAL tag format — <user-steer:N> and <assistant:N> contents
+ * verbatim, raw process inside <working:N> blocks, each segment numbered by
+ * its position — so source and target share one vocabulary, every segment
+ * carries a unique replaceable id, and the fork only shortens <working>
+ * contents in place, never restructures. Extracted from the plugin entry so
+ * the rendering is unit-testable without booting the plugin.
  *
  * Style matches the entry file: plain string concatenation, no template
  * literals, so sources stay embeddable without quoting hazards.
@@ -21,6 +22,7 @@ export interface RenderEventLike {
       name?: string;
       content?: readonly { type?: string; text?: string }[];
     }[];
+    source?: { kind?: string; plugin?: string };
     name?: string;
     message?: {
       content?: readonly {
@@ -73,7 +75,15 @@ export function renderSpanSegments(event: RenderEventLike | undefined, options?:
       if (part.type === 'text' && typeof part.text === 'string') parts.push(part.text);
       else if (typeof part.type === 'string') parts.push('[' + part.type + ']');
     }
-    return [{ kind: 'user-steer', text: parts.join('') }];
+    const text = parts.join('');
+    // Only real user input is a verbatim steering segment. Injected context
+    // (runtime snapshots, skill catalogs, system reminders) is infrastructure:
+    // it lands in a compressible <working> block with an [injected: ...]
+    // marker, never as untouchable <user-steer>.
+    const source = event.data?.source;
+    if (source?.kind === 'user') return [{ kind: 'user-steer', text }];
+    const marker = typeof source?.plugin === 'string' && source.plugin !== '' ? source.plugin : (typeof source?.kind === 'string' && source.kind !== '' ? source.kind : 'context');
+    return [{ kind: 'working', text: '[injected: ' + marker + ']' + NL + text }];
   }
   if (type === 'assistant/message') {
     const segments: SpanSegment[] = [];
@@ -101,22 +111,31 @@ export function renderTurnSpanText(
   options?: RenderOptions,
 ): string {
   let out = '';
+  let nextId = 0;
   let workingOpen = false;
+  let workingId = 0;
   const closeWorking = () => {
     if (workingOpen) {
-      out += NL + '</working>' + NL;
+      out += NL + '</working:' + workingId + '>' + NL;
       workingOpen = false;
     }
   };
   for (const seq of seqs) {
     for (const segment of renderSpanSegments(events[seq], options)) {
       if (segment.kind === 'working') {
-        out += workingOpen ? NL : '<working>' + NL;
+        if (!workingOpen) {
+          nextId += 1;
+          workingId = nextId;
+          out += '<working:' + workingId + '>' + NL;
+        } else {
+          out += NL;
+        }
         workingOpen = true;
         out += segment.text;
       } else {
         closeWorking();
-        out += '<' + segment.kind + '>' + NL + segment.text + NL + '</' + segment.kind + '>' + NL;
+        nextId += 1;
+        out += '<' + segment.kind + ':' + nextId + '>' + NL + segment.text + NL + '</' + segment.kind + ':' + nextId + '>' + NL;
       }
     }
   }

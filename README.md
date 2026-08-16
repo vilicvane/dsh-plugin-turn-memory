@@ -7,18 +7,30 @@ When a top-level (root or resumed fork) session's turn completes, the plugin
 writes the turn's raw transcript into a temporary draft file and spawns a
 fork of the main session — a subagent whose context replays the completed
 turns verbatim, including the turn being summarized. The draft is seeded
-with the turn's full transcript already in the checkpoint's tag format
-(verbatim <user-steer>/<assistant> content, raw process inside <working>
-blocks), and the fork compresses it in place (read/edit tools only) — it
-only shortens the <working> contents, the tag structure stays —
-until it holds the whole-turn
-checkpoint, replies DONE, and the plugin reads the file back, replaces the
-turn's span on the surface with that checkpoint, and deletes the draft. The
-replacement covers the turn's span starting right after its own starting
-user message — that message stays verbatim on the surface, so the checkpoint
-never repeats it, and steer messages inside the span stay verbatim in their
-own <user-steer> elements. The newest user message always stays verbatim.
-Raw events remain in the append-only log for replay and recall.
+with the turn's full transcript already in the checkpoint's tag format:
+numbered segments — verbatim <user-steer:N>/<assistant:N> content, raw
+process inside <working:N> blocks — each id unique so the fork can target
+segments without reproducing their old content. Only real user input is a
+<user-steer> segment: injected context (runtime snapshots, skill catalogs,
+system reminders) lands in <working:N> under an [injected: ...] marker and
+must be compressed to one line like the rest of the process. The fork compresses in
+place: it shortens each <working:N> content with draft_replace_segment
+(passing the bare new content, no tags or surrounding newlines — the tool
+pads the tag lines itself; targeting by id from its context, never
+re-reading the whole file;
+draft_read_segment and draft_grep serve partial lookups) until it holds the
+whole-turn checkpoint, replies DONE, and the plugin verifies the shape (same
+segment sequence, verbatim segments byte-for-byte), reads the file back,
+replaces the turn's span on the surface with that checkpoint, and deletes
+the draft. The replacement covers the turn's span starting right after its
+own starting user message — that message stays verbatim on the surface, so
+the checkpoint never repeats it, and steer messages inside the span stay
+verbatim in their own <user-steer> elements. The newest user message always
+stays verbatim. Raw events remain in the append-only log for replay and
+recall. The pre-compression transcript of the most recently summarized turn
+is kept next to the draft at .dsh-turn-raw-<sessionId>-turn-<N>.md
+(overwritten per turn) so the next turn can eyeball the landed checkpoint
+against it and judge how well the fork summarized.
 
 The expand_turn tool recalls a turn's full transcript in two modes:
 
@@ -50,11 +62,17 @@ Each checkpoint is a single user message whose body is a sequence of role
 tags in the order things happened — no root wrapper (the surface already
 wraps the record as a turn-summary):
 
-    <user-steer>steering message, verbatim</user-steer>
-    <working>process between the messages, compressed in place</working>
-    <assistant>user-facing output, verbatim</assistant>
-    <working>…</working>
-    <assistant>…</assistant>
+    <user-steer:1>steering message, verbatim</user-steer:1>
+    <working:2>process between the messages, compressed in place</working:2>
+    <assistant:3>user-facing output, verbatim</assistant:3>
+    <working:4>…</working:4>
+    <assistant:5>…</assistant:5>
+
+    Segment ids are unique, ascending, and stable: the fork replaces a
+    segment by id (draft_replace_segment) without reproducing old content.
+    Each tag occupies its own line exactly — the parser matches line-start
+    to line-end, so inline tag examples inside content never parse as
+    segments.
 
 Marking rules:
 
@@ -71,11 +89,11 @@ Marking rules:
   already wraps the record as a turn-summary): the turn's starting user
   message stays verbatim on the surface before the checkpoint and never
   appears inside it; every steering message inside the span stays verbatim
-  in its own <user-steer>…</user-steer> element, every user-facing
-  assistant text output stays verbatim in its own <assistant>…</assistant>
+  in its own <user-steer:N>…</user-steer:N> element, every user-facing
+  assistant text output stays verbatim in its own <assistant:N>…</assistant:N>
   element at its original position, and only the intermediate process
   (reasoning, tool calls, tool results, routine checks) is compressed in
-  place into a <working>…</working> element. The tags alternate in the
+  place into a <working:N>…</working:N> element. The tags alternate in the
   order things happened and mark the speaker, so no prefixes, labels, or
   separate sections — the checkpoint reads like the conversation itself
   with the process shortened.

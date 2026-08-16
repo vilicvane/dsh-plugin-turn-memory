@@ -715,3 +715,44 @@ long turn 提醒文案各加收敛子句(代理可能不加载技能、只凭提
   pending 段不再复述标签结构、指向技能),dsh-compact-turn 技能重写为带示例
   的精简版(标签序列示例替代长篇格式描述),compact_turn 工具描述与 pending
   提示文案同步缩短,README marking rules 精简。
+
+## 20. 彻底重构:去掉 turn 内压缩、turn 结束由 fork 编辑草稿文件(turn 94)
+
+- 动因(用户定案):反复出现的整 turn 总结丢失前序片段(用户多次贴 dump 指出
+  "很多细节都没了、对不上之前的片段"),提示词加硬与增量收缩校验都压不住
+  总结惯性。用户判断方案稳定性不行,要求回归 sub agent 模式、与
+  replay-compaction 一致——按 turn 维护一个草稿文件,由 sub agent 自行读改。
+- 定案设计:
+  1. 不再进行 turn 内压缩(compact_turn 无 turn 参数的模式整体删除;
+     lib/bounds.ts、test/bounds.test.ts、reminderNodeThreshold、尾部提醒、
+     pending 提示贡献器全部删除;不再需要 dsh-compact-turn 撰写技能)。
+  2. turn 结束后由 sub agent 压缩:先把该 turn 完整转录写成临时草稿文件
+     <cwd>/.dsh-turn-summary-<sessionId>.md(lib/render.ts 渲染:### User/
+     ### Assistant/### Tool result 标记行,tool-result 超长按
+     toolResultCapChars 截断),sub agent 自行 read/edit 草稿直至完成。
+  3. 压缩子代理 = 主会话 fork(用户 steer 定案:sub agent 是主会话的 fork,
+     上下文里已有包括待总结 turn 在内的完整转录)——每轮允许工具
+     read/edit,回复 DONE 表示草稿完成;引擎读回草稿 → tryReplace 立即落地
+     → unlink 草稿。多轮:每轮草稿状态即文件本身,超时/中止/失败都不丢
+     已写的部分。
+  4. 触发:turn 结束(agent/status idle)即 spawn fork;更旧的未总结 turn
+     按最旧优先 sweep;agent/created(重启恢复)注册最后未总结 turn 并
+     spawn;compact_turn 工具仅保留 turn 参数、作为补漏触发(某 turn 仍
+     无 checkpoint 时主 agent 可调用);pre-step 的等待逻辑删除。
+  5. MEMORY_SECTION 精简:turn 结束自动 fork 压缩、不要自行总结、
+     compact_turn 仅用于补漏。
+- 实现:index.ts 大改(summarizeTurn→runTurnSummary、registerPendingTurn→
+  registerTurn、pre-step 删除、compact_turn 重写、删除三个贡献器与技能)、
+  新增 lib/render.ts 与 test/render.test.ts、删 lib/bounds.ts 与
+  test/bounds.test.ts;node --check、typecheck、29/29 全过;README 已同步。
+- 校验:turn 95 起生效(需用户手动重启);运行时证据=下一 turn 结束后草稿
+  文件出现、fork 跑完、表面出现 turn-summary checkpoint。
+- turn 96 修复:用户发现 fork 开始时草稿是空的——实现里 runTurnSummary 写
+  空文件就 spawn(与定案设计第 2 条不符:应先写完整转录)。fork 工具面只有
+  read/edit、edit 拒绝空 old_string,空草稿无锚点、fork 写完也落不了盘
+  (子代理历史原文:NOT DONE — blocked by a tool-surface limitation)。修复:
+  新增 turnSpanSeqs(session,start,end,turn)(与 tryReplace 同语义的 span
+  seq 计算),spawn 前把 renderTurnSpanText(settings.toolResultCapChars)
+  渲染的转录写进草稿;buildSummaryPrompt 与 MEMORY_SECTION 改"草稿已含
+  转录、就地压缩";ops 技能 bullet 与 README intro 同步(草稿预填转录)。
+  node --check、typecheck、29/29 全过。

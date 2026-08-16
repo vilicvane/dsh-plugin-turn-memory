@@ -658,6 +658,13 @@ maxRawChars 500000 / toolResultCapChars 20000 / maxRecallDepth 4。
   修复:checkpoint source 加 scope 字段(whole-turn | in-turn),
   replacedTurnNumbers 只认 whole-turn;无 scope 的旧 checkpoint 一律不算。
   之前的"重启丢失登记"判断被推翻。
+- turn 69 修正:整 turn 压缩静默丢历史——撰写规则没有"区间内既有 checkpoint
+  必须收敛"的要求(设计意图只在文件头注释里:converges the mid-turn
+  checkpoint and the tail),撰写 agent 把区间内重放的摘要块当"已覆盖"跳过,
+  checkpoint 只剩最后一节(用户在 fork 里实测发现)。修复:四处加收敛规则
+  (技能通用规则、buildSummaryPrompt、MEMORY_SECTION pending 段、README
+  marking rules)——区间内的 <turn-summary> 块/收敛块不是可跳过内容,实质
+  必须按原时序收敛进新 checkpoint,否则静默丢历史。
 - turn 51 提示词重构(用户:提示词随 patch 越来越长,希望更简单准确、可用
   例子代替模糊描述、不丢覆盖面):格式规范单源化——buildSummaryPrompt 重写
   为 18 行(内联标签序列示例),MEMORY_SECTION 四段长文缩短(turn 内段与

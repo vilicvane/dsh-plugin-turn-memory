@@ -94,6 +94,10 @@ Marking rules:
   order things happened and mark the speaker, so no prefixes, labels, or
   separate sections — the checkpoint reads like the conversation itself
   with the process shortened.
+- Checkpoints already inside the span (a <turn-summary> block or an
+  in-turn checkpoint from earlier compaction) are not covered-and-skippable:
+  they are part of the span's substance and must be converged into the new
+  checkpoint in place, or history is silently lost.
 - The structure tags appear only inside checkpoint text, never in live
   conversation output, and composing a summary is silent: the text goes
   straight into the compact_turn summary argument, so the summarization

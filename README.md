@@ -73,59 +73,45 @@ wraps the record as a turn-summary):
 
 Marking rules:
 
-- Hindsight is written in natural language, not bracket tags: when a later
-  development proves an earlier entry wrong, the correction is annotated
-  inline at the point it went wrong — "I thought X might work. (It later
-  turned out wrong.)" — and stays beside the entry it revises. Assumptions
-  are stated as they were felt at the time; later corrections are
-  authoritative over earlier entries.
+- Hindsight in natural language, not bracket tags: when a later development
+  proves an earlier entry wrong, the correction stays beside the entry it
+  revises ("I thought X might work. It later turned out wrong.");
+  assumptions are stated as felt at the time, and later corrections are
+  authoritative.
 - Whatever keeps intuition about the current context is preserved verbatim:
   user wording and emphasis, the assistant's own commitments and offers, and
-  any phrasing later turns are likely to refer back to — plus commands,
-  paths, identifiers, and error strings.
-- The checkpoint keeps the original order with no root wrapper (the
-  surface already wraps the record as a turn-summary): the turn's starting
-  user message stays verbatim on the surface before the checkpoint and
-  never appears inside it; every steering message inside the span stays
-  verbatim in its own <user-steer>…</user-steer> element, every
-  user-facing assistant text output stays verbatim in its own
-  <assistant>…</assistant> element at its original position, and only the
-  intermediate process (reasoning, tool calls, tool results, routine
-  checks) is compressed in place into a <working>…</working> element. The
-  elements alternate in the order things happened — users may steer
-  between replies and the assistant may alternate working and chatting —
-  and the tags themselves mark the speaker, so no
-  "user:"/"assistant:"/"process:" prefixes, no dialogue/summary labels,
-  no separate sections. The checkpoint reads like the conversation itself
+  phrasing later turns are likely to refer to — plus commands, paths,
+  identifiers, and error strings.
+- The checkpoint keeps the original order with no root wrapper (the surface
+  already wraps the record as a turn-summary): the turn's starting user
+  message stays verbatim on the surface before the checkpoint and never
+  appears inside it; every steering message inside the span stays verbatim
+  in its own <user-steer>…</user-steer> element, every user-facing
+  assistant text output stays verbatim in its own <assistant>…</assistant>
+  element at its original position, and only the intermediate process
+  (reasoning, tool calls, tool results, routine checks) is compressed in
+  place into a <working>…</working> element. The tags alternate in the
+  order things happened and mark the speaker, so no prefixes, labels, or
+  separate sections — the checkpoint reads like the conversation itself
   with the process shortened.
-- The structure tags appear only inside checkpoint text — never in live
-  conversation output — and composing a summary is silent: the text goes
-  straight into the compact_turn summary argument and is never printed as
-  chat, so the summarization process produces no dialogue at all.
+- The structure tags appear only inside checkpoint text, never in live
+  conversation output, and composing a summary is silent: the text goes
+  straight into the compact_turn summary argument, so the summarization
+  produces no dialogue at all.
 - Read-in material (code, docs, config, output) is preserved as paths, not
-  content: short key snippets (a critical line, a value) may be inline, but
-  anything longer is recorded as the exact path plus one line saying what it
-  is and why it matters — re-read the file with the read tool when the
-  content is needed again, since copied text goes stale.
+  content: short key snippets may be inline; anything longer is recorded as
+  the exact path plus one line saying what it is and why — re-read with the
+  read tool when the content is needed again, since copied text goes stale.
 - Once the checkpoint lands, it is the only trace of the turn the main
-  context sees: the original text can only be recovered with an expand_turn
-  recall (or by re-reading files), each costing tokens and time. Keep
-  whatever a future turn is likely to reference, verify, or continue — a
-  line kept now is cheaper than a recall later.
-- The message that just opened the current turn is only a hint (a lens,
-  not a task: do not think it through yet, the real thinking starts after
-  the summary lands) and is not part of the replaced span.
-- The message that started the turn is never part of the checkpoint: it
-  stays verbatim on the surface right before the checkpoint, so copying it
-  into the summary would only duplicate it. (For a resumed or recovered
-  turn whose starting message is no longer on the surface, reproduce it as
-  the first <user-steer>…</user-steer> element instead.)
-- All compaction-machinery process is transient infrastructure:
-  compact_turn calls and probes, node counts, replacement results, pending
-  notices and registration state, restart scheduling for compaction
-  changes — none of it appears in a checkpoint or a reply; checkpoints keep
-  only substantive outcomes (root causes, decisions, fixes, artifacts).
-  After a replacement lands, only the compressed content remains in view.
+  context sees: the original can only be recovered with an expand_turn
+  recall (or by re-reading files), each costing tokens and time — a line
+  kept now is cheaper than a recall later.
+- The message that just opened the current turn is only a hint (a lens, not
+  a task) and is not part of the replaced span.
+- Compaction machinery (compact_turn calls, node counts, replacement
+  results, pending notices, restart scheduling) never enters the checkpoint
+  and is never repeated to the user; checkpoints keep substance only (root
+  causes, decisions, fixes, artifacts).
 - Reusable procedures are referenced by name (skill or script path) instead
   of being restated; the steps live in skills loaded on demand.
 

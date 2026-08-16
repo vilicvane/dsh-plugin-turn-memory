@@ -658,3 +658,9 @@ maxRawChars 500000 / toolResultCapChars 20000 / maxRecallDepth 4。
   修复:checkpoint source 加 scope 字段(whole-turn | in-turn),
   replacedTurnNumbers 只认 whole-turn;无 scope 的旧 checkpoint 一律不算。
   之前的"重启丢失登记"判断被推翻。
+- turn 51 提示词重构(用户:提示词随 patch 越来越长,希望更简单准确、可用
+  例子代替模糊描述、不丢覆盖面):格式规范单源化——buildSummaryPrompt 重写
+  为 18 行(内联标签序列示例),MEMORY_SECTION 四段长文缩短(turn 内段与
+  pending 段不再复述标签结构、指向技能),dsh-compact-turn 技能重写为带示例
+  的精简版(标签序列示例替代长篇格式描述),compact_turn 工具描述与 pending
+  提示文案同步缩短,README marking rules 精简。

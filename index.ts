@@ -43,7 +43,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
-import { checkToolPairBalance, computeSpanBoundaries, computeWalkRange } from './lib/bounds.ts';
+import { checkToolPairBalance, computeSpanBoundaries, computeWalkRange, shrinkCheckError } from './lib/bounds.ts';
 import { appendDumpBlock, buildDumpFileName, renderPrefixBoundary } from './lib/prefix.ts';
 import { routeRecallByAge } from './lib/routing.ts';
 
@@ -393,7 +393,7 @@ const PLUGIN_SKILLS = [
       '- turn-memory 资格按持久化 origin 判定，不看运行时归属：origin 非 subagent 的会话（主会话与 fork，无论 live 还是 resumed）都享受完整待遇——pending 登记、压缩提醒、compact_turn 全模式可用；仅一次性召回 subagent（origin 为 subagent）不参与 pending 机制（避免为一次性会话浪费 fork 兜底模型调用），compact_turn 的 turn 内模式则任何 agent 都可以对自己会话用。',
       '- turn 结束 → 该 turn 登记为 pending，零模型调用、不生成摘要；下一条用户消息到来时，runtime 上下文出现 pending 提示，主 agent（当前上下文）先按 dsh-compact-turn 技能撰写上一 turn 的整 turn checkpoint（新消息是保留取舍的透镜；上一 turn 的用户原话必须逐字进摘要，或写 <verbatim kind="turn-prompt"/> 由替换时自动还原），再用 compact_turn(turn=N, summary) 立即把上一 turn（含其用户消息）替换为 <turn-summary turn=N version=N> checkpoint；最新用户消息永远逐字保留。主 agent 整个下一 turn 都没做 → 该 turn 结束时由主模型 fork 兜底补摘要（晚一个 turn，再下一个 pre-step 落地）。后验修正用自然语言括注（"我觉得这样可能不错。（但是后来发现不对）"），不用方括号标记；逐字保留维持上下文直觉的措辞（用户原话、自己做出的承诺、后续可能被引用的表述）。',
       '- 某 turn 长时间没有替换节点的可能：(1) 主 agent 未调用 compact_turn 或调用失败 → 下一 turn 结束时 fork 兜底，兜底摘要在再下一个 pre-step 落地；(2) 服务器重启（内存态丢失）→ 恢复时最后一个无 checkpoint 的已完成 turn 重新登记 pending，由恢复后的主 agent 在下一条用户消息到来时撰写。',
-      '- compact_turn 模型工具：长 turn 中主动压缩当前 turn 已完成部分（turn 起始消息之后、当前 step 之前），只留起始消息逐字、当前 step 不动；独占执行保证压缩事务期间 surface 稳定。摘要由当前上下文（主模型自身）撰写——撰写规则在 dsh-compact-turn 技能里，随 summary 参数传入；工具只做范围/配平校验，事务仍走后端 compactRegionWithSummary（锁/稳定性/收缩校验全部复用）；后端不支持该入口时回退其自带摘要。带 turn 参数的整 turn 模式：把已完成 turn 的整段（含用户消息）替换为带 turn-memory 标记的 turn 摘要 checkpoint（复用 tryReplace 直接落盘，不走压缩后端、无收缩校验）。turn 内压缩产生的 checkpoint 会纳入该 turn 最终的 turn 摘要替换（收敛合并，不是原文重喂）；后续再次压缩时旧 checkpoint 以一条浓缩摘要参与合并。',
+      '- compact_turn 模型工具：长 turn 中主动压缩当前 turn 已完成部分（turn 起始消息之后、当前 step 之前），只留起始消息逐字、当前 step 不动；独占执行保证压缩事务期间 surface 稳定。摘要由当前上下文（主模型自身）撰写——撰写规则在 dsh-compact-turn 技能里，随 summary 参数传入；工具自做全部折叠：范围/配平校验、收缩校验（checkpoint 字符数必须小于被折叠节点的模型可见文本）、checkpoint 落盘（surfaceOp replace + sourceEventSeqs，与 tryReplace 同款 splice）——完全不依赖任何 compaction 后端。带 turn 参数的整 turn 模式：把已完成 turn 的整段（含用户消息）替换为带 turn-memory 标记的 turn 摘要 checkpoint（复用 tryReplace 直接落盘，不走压缩后端、无收缩校验）。turn 内压缩产生的 checkpoint 会纳入该 turn 最终的 turn 摘要替换（收敛合并，不是原文重喂）；后续再次压缩时旧 checkpoint 以一条浓缩摘要参与合并。',
       '- 条件式尾部提醒：当前 turn 的 surface 节点数超过 reminderNodeThreshold（默认 30，按节点数不按 token）时，runtime 快照末尾出现一行提醒；超过 1.5 倍时升级为更直接的警告。低于阈值时零贡献、零 token；压缩落地后 turn 缩回阈值以下，提醒自行消失。',
 '- prefixDumpDir 非空时，每次压缩替换落盘后把接缝处最后两个节点（新 checkpoint + 其后第一个保留节点，按它们在 request 前缀里的文本形态渲染）追加写入 <prefixDumpDir>/request-prefix-<sessionId>.txt——按 session 各建一个文件（每个替换一块、块间以分隔线隔开，文件只增不减、最早的替换边界在最前），肉眼确认替换边界用。',
       '- 替换节点 source = {kind: plugin, plugin: turn-memory, turn, turnSummaryId, version}。',
@@ -428,7 +428,7 @@ const PLUGIN_SKILLS = [
       '',
       '- 起始消息与当前 step 不在区间内，摘要不必复述它们。',
       '- 不要写 <verbatim> 标签：turn 内压缩不会还原标签，写什么就原样留下什么。',
-      '- 后端有收缩校验，checkpoint 不比原区间小会整笔失败。',
+      '- 有收缩校验：checkpoint 不比被折叠区间小会整笔失败（按被折叠节点的模型可见文本字符数比较）。',
       '',
       '## 整 turn 模式（带 turn 参数）',
       '',
@@ -656,8 +656,6 @@ function apply(ctx, config) {
         }
         return 'compact_turn: turn ' + turnArg + ' replaced by the provided summary (' + item.replacedNodes + ' surface nodes converged into one turn-summary checkpoint)';
       }
-      const compaction = ctx.get('compaction');
-      if (compaction === undefined) return 'compact_turn: no compaction backend is mounted';
       const turnStart = findLastEvent(session, 'turn/start');
       if (turnStart === undefined) return 'compact_turn: no open turn';
       const turnEnd = findLastEvent(session, 'turn/end');
@@ -675,25 +673,41 @@ function apply(ctx, config) {
       if (pairError !== null) return pairError;
       // The checkpoint text is composed by the current context itself, per
       // the dsh-compact-turn skill, and arrives as the summary argument; no
-      // subagent summarizes the span. The compaction transaction stays in
-      // the backend.
+      // subagent summarizes the span. The fold below is fully self-contained
+      // — shrink check, checkpoint append, and the surface replacement all
+      // run here, mirroring the whole-turn path (tryReplace), so no
+      // compaction backend is involved.
       const summary = typeof args.summary === 'string' ? args.summary.trim() : '';
       if (summary === '') return 'compact_turn: summary is required — compose the checkpoint text following the dsh-compact-turn skill and pass it as the summary argument';
-      const provider = agent.options.provider ?? 'unknown';
-      const model = agent.options.model ?? 'unknown';
+      const foldedSeqs: number[] = [];
+      for (let index = boundary.bounds.spanStart + 1; index < boundary.bounds.assistantIdx; index += 1) foldedSeqs.push(nodes[index]);
+      const shrinkError = shrinkCheckError(events, foldedSeqs, summary.length);
+      if (shrinkError !== null) return shrinkError;
       try {
-        if (typeof compaction.compactRegionWithSummary === 'function') {
-          await compaction.compactRegionWithSummary(startSeq, endSeq, agent, summary, { provider, model }, exec.signal);
-        } else {
-          // Backend-agnostic fallback: a backend without the pre-supplied
-          // summary entry summarizes the range itself.
-          await compaction.compactRegion(startSeq, endSeq, agent, exec.signal);
-        }
+        // The same checkpoint shape tryReplace appends (any-typed here
+        // because the tool executor types the append narrowly).
+        const checkpointData: any = {
+          id: randomUUID(),
+          role: 'user',
+          content: [{ type: 'text', text: summary }],
+          source: {
+            kind: 'plugin',
+            plugin: SUMMARY_MARKER_PLUGIN,
+            turn: turnStart.data?.turn,
+            turnSummaryId: randomUUID(),
+            version: TURN_SUMMARY_VERSION,
+          },
+        };
+        const checkpointOp: any = {
+          surfaceOp: { op: 'replace', start: foldedSeqs[0], end: foldedSeqs[foldedSeqs.length - 1] },
+          sourceEventSeqs: foldedSeqs,
+        };
+        session.append('user/message', checkpointData, checkpointOp);
       } catch (error) {
         return 'compact_turn: ' + errorText(error);
       }
-      // Debug aid: the landed replacement boundary, for eyeballing. After the
-      // transaction the checkpoint sits where startSeq was (position
+      // Debug aid: the landed replacement boundary, for eyeballing. The
+      // checkpoint sits where the first folded node was (position
       // spanStart + 1) and the kept current step follows it.
       const surfaceAfter = session.surface.nodes;
       const checkpointPos = boundary.bounds.spanStart + 1;

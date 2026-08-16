@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { checkToolPairBalance, computeSpanBoundaries, computeWalkRange, type SessionEventLike } from '../lib/bounds.ts';
+import { checkToolPairBalance, computeSpanBoundaries, computeWalkRange, eventTextSize, foldedSpanSize, shrinkCheckError, type SessionEventLike } from '../lib/bounds.ts';
 
 const ev = (seq: number, type: string, data: Record<string, any> = {}): SessionEventLike => ({ seq, type, data });
 
@@ -158,5 +158,52 @@ describe('checkToolPairBalance', () => {
       ev(15, 'assistant/message'),
     );
     assert.equal(checkToolPairBalance(events, 12, 15), 'compact_turn: session events incomplete; compact later');
+  });
+});
+
+describe('eventTextSize', () => {
+  it('counts user message text', () => {
+    assert.equal(eventTextSize(ev(8, 'user/message', { content: [{ type: 'text', text: 'hello' }] })), 5);
+  });
+
+  it('counts assistant message text across blocks', () => {
+    assert.equal(
+      eventTextSize(ev(9, 'assistant/message', { message: { content: [{ type: 'text', text: 'ab' }, { type: 'tool-call', name: 'x', arguments: '{}' }] } })),
+      2,
+    );
+  });
+
+  it('counts tool result payload text', () => {
+    assert.equal(
+      eventTextSize(ev(10, 'tool/result', { message: { content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'abcde' }] }] } })),
+      5,
+    );
+  });
+
+  it('returns 0 for non-message events and holes', () => {
+    assert.equal(eventTextSize(ev(11, 'tool/call', {})), 0);
+    assert.equal(eventTextSize(undefined), 0);
+  });
+});
+
+describe('foldedSpanSize and shrinkCheckError', () => {
+  it('sums the folded nodes text', () => {
+    const events = eventsOf(
+      ev(9, 'user/message', { content: [{ type: 'text', text: 'aaaa' }] }),
+      ev(10, 'assistant/message', { message: { content: [{ type: 'text', text: 'bbbbbb' }] } }),
+    );
+    assert.equal(foldedSpanSize(events, [9, 10]), 10);
+  });
+
+  it('a strictly smaller checkpoint passes', () => {
+    const events = eventsOf(ev(9, 'user/message', { content: [{ type: 'text', text: 'aaaaaaaaaa' }] }));
+    assert.equal(shrinkCheckError(events, [9], 9), null);
+  });
+
+  it('an equal or larger checkpoint is refused with the size detail', () => {
+    const events = eventsOf(ev(9, 'user/message', { content: [{ type: 'text', text: 'aaaaa' }] }));
+    const error = shrinkCheckError(events, [9], 5);
+    assert.ok(error !== null && error.includes('not smaller than the folded span'));
+    assert.ok(error.includes('5 chars'));
   });
 });

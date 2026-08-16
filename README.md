@@ -42,14 +42,13 @@ checkpoint text is composed by the current context itself — the composing
 rules live in the bundled dsh-compact-turn skill and the text arrives as
 the tool's summary argument — so no fork or subagent summarizes the span.
 For the current-turn mode the tool validates the range (tool-pair
-balance) and runs exclusively so the compaction transaction never
-races another tool call; the transaction itself — lock, whole-surface
-stability, shrink check, durability — stays in the mounted compaction
-backend through compactRegionWithSummary, and backends without that entry
-summarize the range themselves. The whole-turn mode reuses the same
-replacement path as the fallback fork (turn-memory marker checkpoint, no
-compaction transaction). Session compaction keeps its own cheap-model
-summarizer; the two never mix.
+balance), runs exclusively, and folds the span itself: the shrink check
+(checkpoint chars vs the folded nodes model-visible text), the checkpoint
+append and the surface replacement all run in the plugin, mirroring the
+whole-turn path — no compaction backend is involved. The whole-turn mode
+reuses the same replacement path as the fallback fork (turn-memory marker
+checkpoint). Session compaction keeps its own cheap-model summarizer; the
+two never mix.
 
 A conditional tail reminder backs it up: once the current turn spans more
 than reminderNodeThreshold surface nodes (default 30, counted by nodes, not

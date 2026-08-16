@@ -535,3 +535,23 @@ maxRawChars 500000 / toolResultCapChars 20000 / maxRecallDepth 4。
   origin 非 subagent 即享完整待遇(主会话与 fork 含 live/resumed),5 处
   调用点改名(486/518/886/952/1138)。用户重启后本 fork 下一 turn 开场出现
   pending 提示、compact_turn(turn=26) 成功——修复生效的直接证据。
+
+## 16. turn 内压缩完全自折叠(turn 30)
+
+- 需求:用户指出 turn-memory 不应依赖具体 compaction 实现(compact turn 会
+  触发 compaction 实现);定案选"完全自折叠"(另两条路:后端优先+自折叠兜底、
+  维持现状)。
+- 改动:turn 内分支删除 ctx.get(compaction) 委托(compactRegionWithSummary/
+  compactRegion 回退与 provider/model envelope 一并删除);改为与 tryReplace
+  同款自折叠——(1) 范围计算 lib/bounds + tool-pair 平衡不变;(2) 新增纯函数
+  eventTextSize / foldedSpanSize / shrinkCheckError(lib/bounds.ts,字符数级
+  收缩校验,checkpoint 必须严格小于被折叠节点的模型可见文本,否则整笔拒绝);
+  (3) session.append user/message checkpoint(source = turn-memory 标记 +
+  surfaceOp replace + sourceEventSeqs,内容为摘要原文不加 <turn-summary>
+  包裹)后 dumpPrefixBoundary 照旧。
+- 语义变化:不再有后端 durable lock 与压力压缩互斥——自折叠与后端 pressure
+  compaction 的竞态窗口缩小到工具独占执行期间的单次 append,记录为已知取舍。
+  收缩校验从后端 token 级变为本插件字符级。
+- 测试:test/bounds.test.ts 新增 eventTextSize 4 例、foldedSpanSize /
+  shrinkCheckError 3 例。文档同步 README、包内两个技能。
+- 状态:待 typecheck/test + 重启验证;未提交。

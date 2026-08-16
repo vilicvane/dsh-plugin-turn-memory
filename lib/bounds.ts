@@ -125,3 +125,50 @@ export function checkToolPairBalance(
   if (openCalls.size > 0) return 'compact_turn: the cut would leave an open tool call; compact later';
   return null;
 }
+
+/** Chars of the text blocks one message-shaped record carries. */
+function blocksTextSize(blocks: unknown): number {
+  if (!Array.isArray(blocks)) return 0;
+  let total = 0;
+  for (const block of blocks) {
+    if (block === null || typeof block !== 'object') continue;
+    const record = block as { type?: unknown; text?: unknown };
+    if (record.type === 'text' && typeof record.text === 'string') total += record.text.length;
+  }
+  return total;
+}
+
+/** Chars of model-visible text one folded event contributes. */
+export function eventTextSize(event: SessionEventLike | undefined): number {
+  if (event === undefined) return 0;
+  if (event.type === 'user/message') return blocksTextSize(event.data?.content);
+  if (event.type === 'assistant/message') return blocksTextSize(event.data?.message?.content);
+  if (event.type === 'tool/result') return blocksTextSize(event.data?.message?.content?.[0]?.content);
+  return 0;
+}
+
+/** Total chars of the folded surface nodes, for the shrink check. */
+export function foldedSpanSize(
+  events: readonly (SessionEventLike | undefined)[],
+  seqs: readonly number[],
+): number {
+  let total = 0;
+  for (const seq of seqs) total += eventTextSize(events[seq]);
+  return total;
+}
+
+/**
+ * Shrink guard for the self-fold: the checkpoint must be strictly smaller
+ * than the folded span (measured in chars of model-visible text), otherwise
+ * the whole fold is refused — the same contract the compaction backend used
+ * to enforce for the transaction.
+ */
+export function shrinkCheckError(
+  events: readonly (SessionEventLike | undefined)[],
+  seqs: readonly number[],
+  checkpointChars: number,
+): string | null {
+  const folded = foldedSpanSize(events, seqs);
+  if (checkpointChars < folded) return null;
+  return 'compact_turn: the checkpoint (' + checkpointChars + ' chars) is not smaller than the folded span (' + folded + ' chars); write a tighter summary or compact a smaller range';
+}

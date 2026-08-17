@@ -27,6 +27,7 @@ import {
 } from './session-segments.ts';
 import type { PricedNode, SessionSegment } from './session-segments.ts';
 import type { SourceNodeRange } from './session-segments.ts';
+import { WorkerToolScope } from './worker-tools.ts';
 
 export const SESSION_TOOL_NAMES = [
   'list_session_segments',
@@ -345,12 +346,13 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
   private readonly stagedFinishes = new WeakMap<object, StagedFinish>();
   private readonly overflowRetries = new WeakMap<object, number>();
   private readonly measurementFallbackWarned = new WeakSet<object>();
+  private readonly workerTools: WorkerToolScope;
 
   constructor(ctx: any, config: SessionCompactionConfig, coordinator: MemoryCoordinator) {
     super(ctx);
     this.config = resolveConfig(config);
     this.coordinator = coordinator;
-    this.registerTools();
+    this.workerTools = this.createWorkerTools();
     if (this.config.auto) this.registerAutomaticCompaction();
     ctx.logger.info('turn-memory: session compaction mounted (main-model fork first, segmentTokens=' + this.config.segmentTokens + ')');
   }
@@ -425,9 +427,11 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
     }
   }
 
-  private registerTools(): void {
+  private createWorkerTools(): WorkerToolScope {
     const output = { schema: { type: 'string' as const }, render: (_args: unknown, value: string) => [{ type: 'text' as const, text: value }] };
-    this.ctx.tools.register(defineTool({
+    const definitions: any[] = [];
+    const add = (definition: any): void => { definitions.push(definition); };
+    add(defineTool({
       name: 'list_session_segments',
       description: 'List the compact global directory of source segments for the active session-compaction worker. It returns metadata and previews, not every source node body.',
       parameters: {},
@@ -438,7 +442,7 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
         return 'revision=' + job.editor.revision + '\n' + renderSegmentCatalog(job.segments, (segment) => job.editor.status(segment));
       },
     }));
-    this.ctx.tools.register(defineTool({
+    add(defineTool({
       name: 'read_session_source_nodes',
       description: 'Read exact source content for several opaque node ids or continuous node ranges in one call. Requests above the host character cap fail and should be narrowed.',
       parameters: {
@@ -469,7 +473,7 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
         return readSessionSourceNodes(job.session, job.segments, args.ranges as SourceNodeRange[], this.config.maxReadChars);
       },
     }));
-    this.ctx.tools.register(defineTool({
+    add(defineTool({
       name: 'list_session_memory',
       description: 'Page through the current host-owned working-checkpoint node directory at its current revision.',
       parameters: {
@@ -480,7 +484,7 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
       isConcurrencySafe: () => true,
       execute: async (args: any, exec: any) => this.jobFor(exec).editor.catalog(args.cursor ?? 0, args.limit ?? 80, this.config.previewChars),
     }));
-    this.ctx.tools.register(defineTool({
+    add(defineTool({
       name: 'read_session_memory',
       description: 'Read exact current working-checkpoint nodes by id or continuous id ranges. Replaced ids are stale.',
       parameters: {
@@ -501,7 +505,7 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
       isConcurrencySafe: () => true,
       execute: async (args: any, exec: any) => this.jobFor(exec).editor.read(args.ranges as SessionMemoryRange[], this.config.maxReadChars),
     }));
-    this.ctx.tools.register(defineTool({
+    add(defineTool({
       name: 'search_session_memory',
       description: 'Case-insensitively search current generated memory content and return matching ids with previews.',
       parameters: {
@@ -512,7 +516,7 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
       isConcurrencySafe: () => true,
       execute: async (args: any, exec: any) => this.jobFor(exec).editor.search(args.query, args.limit ?? 20),
     }));
-    this.ctx.tools.register(defineTool({
+    add(defineTool({
       name: 'replace_session_memory',
       description: 'At an exact revision, replace one current memory node or continuous range with ordered user/assistant nodes. The range must cover the assigned segment and may include earlier memory, but never a future placeholder. Returns the new revision and local neighborhood.',
       parameters: {
@@ -542,7 +546,7 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
           + '\nlocal-neighborhood:\n' + result.neighborhood;
       },
     }));
-    this.ctx.tools.register(defineTool({
+    add(defineTool({
       name: 'finish_session_segment',
       description: 'Validate and submit the assigned segment at the exact current revision. This is the worker’s only accepted completion path and concludes its turn on success.',
       parameters: {
@@ -567,6 +571,7 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
       staged.job.editor.finishSegment(staged.segment, staged.revision);
       staged.job.finishConfirmed = true;
     });
+    return new WorkerToolScope(this.ctx, definitions);
   }
 
   private measureSession(session: any): SessionMeasurement {
@@ -627,8 +632,8 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
                 provider: target.provider,
                 model: target.model,
                 maxTokens: this.config.workerMaxTokens,
+                ...this.workerTools.agentOptions(),
               },
-              toolFilter: { allow: SESSION_TOOL_NAMES },
             });
             const result = await run.result;
             if (result.stopReason !== 'completed') throw new Error(provider + ' worker ended with ' + JSON.stringify(result.stopReason));

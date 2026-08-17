@@ -7,6 +7,9 @@ import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { foldSurface } from '@deepseek-ai/dsh-session';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
+import { TURN_TOOL_NAMES } from '../index.ts';
+import { SESSION_TOOL_NAMES } from '../lib/session-compaction.ts';
+
 const name = 'turn-memory-e2e-runner';
 const inject = ['agentDefaultModel', 'agents', 'sessionQuery', 'sessions', 'tools'];
 
@@ -14,6 +17,7 @@ const USER_SENTINEL = 'E2E-USER-GAMMA-194';
 const TOOL_SENTINEL = 'E2E-FIXTURE-ALPHA-771';
 const FINAL_SENTINEL = 'PARENT-FINAL-BETA-332';
 const DRAFT_SENTINEL = '__DRAFT_PASS__';
+const INTERNAL_TOOL_NAMES = [...TURN_TOOL_NAMES, ...SESSION_TOOL_NAMES];
 
 function textOf(event: any): string {
   return (event?.data?.message?.content ?? event?.data?.content ?? [])
@@ -26,6 +30,13 @@ function compressionNodes(session: any): any[] {
   return session.surface.nodes
     .map((seq: number) => session.events[seq])
     .filter((event: any) => event?.data?.source?.plugin === 'turn-memory' && event.data.source.phase === 'compression');
+}
+
+function assertInternalToolsHidden(session: any, phase: string): void {
+  const visible = new Set((session.requestHeader()?.tools ?? []).map((tool: any) => tool.name));
+  for (const name of INTERNAL_TOOL_NAMES) {
+    assert.ok(!visible.has(name), phase + ': internal worker tool leaked into the parent request header: ' + name);
+  }
 }
 
 async function waitForCompression(session: any, timeoutMs: number): Promise<any[]> {
@@ -118,6 +129,7 @@ async function run(ctx: any): Promise<void> {
     });
     await agent.whenIdle();
     assert.equal(fixtureCalls, 1, 'parent fixture tool should run exactly once');
+    assertInternalToolsHidden(agent.session, 'live parent');
     const timeoutMs = Number(process.env.TURN_MEMORY_E2E_TIMEOUT_MS ?? 240000);
     await sessions.flush(agent.session);
     assert.equal(compressionNodes(agent.session).length, 0, 'live turn should be intentionally left uncompressed for recovery');
@@ -131,6 +143,7 @@ async function run(ctx: any): Promise<void> {
       setup,
     });
     await recoveryHandle.agent.whenIdle();
+    assertInternalToolsHidden(recoveryHandle.agent.session, 'recovered parent');
     const compressed = await waitForCompression(recoveryHandle.agent.session, timeoutMs);
     assertProjection(recoveryHandle.agent.session, compressed, 'recovered');
     await sessions.flush(recoveryHandle.agent.session);

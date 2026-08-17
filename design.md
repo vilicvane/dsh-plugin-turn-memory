@@ -67,7 +67,7 @@
 ### 可行性依据
 
 - fork child 能看到父 session 当前 surface 的消息内容，但模型上下文不会给出可供插件安全寻址的 surface seq、精确节点边界或原始覆盖关系；因此“内容已在上下文”与“prompt 内仍需紧凑目录”并不重复，二者分别解决理解和定位。
-- `SubagentStartRequest.toolFilter` 会在 child scope 同时限制工具展示与执行，可以让该 child 只看到上述编辑工具；当前 fork provider 明确支持该能力。
+- 早期探针用 `SubagentStartRequest.toolFilter` 把 child 限制为上述编辑工具；后续发现这种做法要求工具先存在于 global registry，因而会把 schema 暴露给 parent。D-009 已取代这部分挂载方案，编辑协议与工具体不变。
 - DSH 的 tool execute context 带 owning `agent`，host 可以把调用绑定到对应 fork job；工具成功结果还可以调用 `concludeTurn()`，所以 finish 可以同时充当最终验证点和 one-shot child 的权威结束信号。
 - `defineTool` 的 `isConcurrencySafe` 能把 mutation 声明为 exclusive；批量 read 可声明为只读并一次返回多个节点。批量读取不会减少正文自身 token，但会减少固定的 tool-call／tool-result 包装和可能的额外模型轮次。
 - 首版探针验证了在内存列表上执行 `n2..n3 → r1`、再执行 `r1 → r2` 或 `r1..n4 → r2` 的可行性；D-003 在此基础上把单输出扩展为联合多输出。
@@ -189,7 +189,7 @@
 
 ### 可行性依据
 
-- `SubagentStartRequest` 支持 parent、agentOptions、toolFilter 和 cancellation，但没有 seed range；fork provider 的 completed-turn prefix 也没有可配置切片。fresh spawn 则不继承 parent history。上述双路径分别利用了两者真实能力，没有把 range selection 假装成 fork API。
+- `SubagentStartRequest` 支持 parent、agentOptions、toolFilter 和 cancellation，但没有 seed range；fork provider 的 completed-turn prefix 也没有可配置切片。fresh spawn 则不继承 parent history。上述双路径分别利用了两者真实能力，没有把 range selection 假装成 fork API；内部工具的实际挂载按 D-009 使用 agentOptions marker 与 scope-local registration，而不是 global tools 加 toolFilter。
 - 工具 execute context 能把调用绑定到具体 child；`concludeTurn()` 与 `tools/result` 事件可将 finish tool 的成功结果作为权威完成信号。working state 位于 host，因此 child dispose、重启或 provider fallback 不会丢掉已经接受的 revision。
 - 全部 segment 最终落成一个 replacement event，不受 turn-memory N→M landing capacity 限制；内部 user/assistant memory node 数只影响 checkpoint 正文结构。
 
@@ -253,3 +253,20 @@
 - D-007 的 accepted `r*` working state 仍只存在当前进程。进程停止后的恢复粒度是整个尚未落地的 turn，不会继续停止前 child 的半成品；父 surface 未提交，因此重做是安全的。
 - 恢复只能处理仍有 eligible current surface range 的 turn。若另一个 compaction/rewrite 已经遮蔽原目标而又没有 turn-memory marker，本实现记录 skip，但没有 durable 的“不可恢复”墓碑；后续每次 cold resume 仍可能再次发现并快速跳过该 turn。
 - 本条不提供跨进程 exactly-once 执行。它提供 durable landing detection 和 at-least-once recovery；设计继续采用 D-001 的单进程、同步 landing 假设，不处理在多个 replacement append 中间强制终止造成的部分提交。
+
+## D-009：压缩编辑工具仅属于对应 worker scope
+
+状态：**已确认**
+
+### 约定
+
+- turn editor 与 session-memory editor 工具不得通过插件根 `ctx.tools.register()` 注册。普通插件 context 的注册属于全局层，会把 schema 注入主会话及无关 subagent 的 request header；工具体内再检查 active job 只能阻止错误执行，不能阻止模型看到工具、浪费 schema token 或误判自身角色。
+- 每类 compression worker 使用独立的进程内 tool-scope marker。marker 通过 DSH 明确可扩展的 `AgentOptions` 随 one-shot child 创建请求传递；同步 `agent/created` 边界在 child 第一份 prompt 组装前识别 marker，先对该 agent 设置空 global allow-list，再通过 `agent.ctx.tools.register()` 只挂载该类 worker 的工具。marker 不提供权限，`jobFor()` 的 parent、active job 和 child identity 校验仍是执行边界。
+- turn worker 只能看到 turn editor 工具；session compaction worker 只能看到 session-memory editor 工具；主会话、普通 subagent 和另一类 worker都看不到这些内部工具。不得把 `SubagentStartRequest.toolFilter` 的 `allow` 误解成工具归属声明：它只过滤 child 已经继承的可见全局工具，不会从 parent 隐藏全局注册。
+- E2E 除了要求 worker 实际完成工具协议，还必须检查主会话持久化的 `request/header.tools`，逐项确认两类内部工具均不存在。这样验证的是实际发给 provider 的 model-facing catalog，而不只是工具执行时的拒绝逻辑。
+
+### 可行性依据
+
+- DSH `AgentOptions` 是 merge-extensible creation state；in-process subagent 会把 caller options 合并进 child options。Agent registry 同步派发 `agent/created`，随后 provider 才向 child inbox 发送初始 prompt，因此 listener 中的 agent-scope restriction 与注册会在第一次 request assembly 前完成。
+- DSH tool registry 明确区分 plain plugin context 的 global registration 与 `agent.ctx` 的 scope-local registration。global allow-list restriction 隐藏继承能力后，scope-local definitions 仍合并到该 agent 的最终 catalog，并随 agent scope dispose 自动清理。
+- 历史主会话 `session-2ce5…` 的首个 request header 已包含两套内部工具；turn 3 的主模型因此误判自己是 compaction worker，并调用 `list_turn_nodes` 与 `list_session_segments`。两次调用虽被 `jobFor()` 拒绝，仍证明仅靠运行时校验不能满足工具隔离。

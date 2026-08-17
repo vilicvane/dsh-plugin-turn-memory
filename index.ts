@@ -24,13 +24,14 @@ import {
   findCompletedTurnEnd,
   turnCompressionBypassReason,
 } from './lib/turn-recovery.ts';
+import { WorkerToolScope } from './lib/worker-tools.ts';
 import type { SessionCompactionConfig } from './lib/session-compaction.ts';
 import type { NodeRange, TurnNodeOutput, TurnNodeSeed } from './lib/editor.ts';
 
 const name = 'turn-memory';
 const inject = ['agents', 'llm', 'sessionQuery', 'sessions', 'subagents', 'tokenMeter', 'tools'];
 
-const TOOL_NAMES = [
+export const TURN_TOOL_NAMES = [
   'list_turn_nodes',
   'read_turn_nodes',
   'replace_turn_nodes',
@@ -283,7 +284,10 @@ function apply(ctx: any, config: PluginConfig = {}): void {
     return job;
   };
 
-  ctx.tools.register(defineTool({
+  const turnToolDefinitions: any[] = [];
+  const addTurnTool = (definition: any): void => { turnToolDefinitions.push(definition); };
+
+  addTurnTool(defineTool({
     name: 'list_turn_nodes',
     description: 'Return the complete rich catalog of the authoritative host-owned turn working surface. Current n* ids are unchanged original nodes; current r* ids are accepted rewrites produced by this or an earlier worker.',
     parameters: {},
@@ -294,7 +298,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
     },
   }));
 
-  ctx.tools.register(defineTool({
+  addTurnTool(defineTool({
     name: 'read_turn_nodes',
     description: 'Read exact content from the current host-owned working surface. A current r* node is accepted compressed work that may not appear in inherited parent context. Several ids or continuous ranges may be read in one call; shadowed ids are stale.',
     parameters: {
@@ -318,7 +322,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
     },
   }));
 
-  ctx.tools.register(defineTool({
+  addTurnTool(defineTool({
     name: 'replace_turn_nodes',
     description: 'Jointly replace one current node or continuous current range with one or more ordered nodes. Select a range containing every current node whose information the outputs use; all outputs derive from that complete range. A tool output is allowed only as the sole output replacing exactly one current tool node. The host immediately accepts the outputs as new r* working nodes and returns the complete current structural catalog.',
     parameters: {
@@ -354,7 +358,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
     },
   }));
 
-  ctx.tools.register(defineTool({
+  addTurnTool(defineTool({
     name: 'finish_turn_compression',
     description: 'Validate and submit the complete current host-owned working surface as the authoritative compressed turn transcript. This is the only accepted completion path and concludes the active worker on success.',
     parameters: {},
@@ -368,6 +372,8 @@ function apply(ctx: any, config: PluginConfig = {}): void {
       return 'turn compression accepted for commit\n' + job.editor.structuralCatalog();
     },
   }));
+
+  const turnWorkerTools = new WorkerToolScope(ctx, turnToolDefinitions);
 
   ctx.on('tools/result', (exec: any, result: any) => {
     const job = stagedFinishes.get(exec as object);
@@ -415,7 +421,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
             }],
             parent: job.agent,
             signal: job.controller.signal,
-            toolFilter: { allow: TOOL_NAMES },
+            agentOptions: turnWorkerTools.agentOptions(),
           });
           const result = await run.result;
           if (result.stopReason !== 'completed') {

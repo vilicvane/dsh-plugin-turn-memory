@@ -91,6 +91,11 @@
 ### 约定
 
 - turn-memory 的产物是压缩后的 transcript，不是回顾式的 assistant-only summary。压缩必须保留总体时序、因果演进和可辨认的 user／assistant 交互过程；低价值的连续 working trace 和补充性质的 steer 可以合并，时间或因果上关键的转折、纠正、约束、发现、失败、决策和外部结果应高保真保留，必要时继续作为独立节点。
+- 保留优先级应考虑信息的可恢复性：灵感与洞见、仍带不确定性的假设、试错和弯路所验证或排除的内容、发现、决策及其理由、结论及其范围和证据，通常难以仅从当前代码或外部状态重新推导，应优先保留。弯路不会因为问题最终解决而自动成为可删除信息；可以压缩机械执行流水，但应保留有意义的尝试、失败原因、所得认识和后续调整之间的因果关系。
+- 高保真保留的是语义而非原始节点边界。后续 steer／纠正可以完整融入合并后的 user 节点，assistant 的尝试、失败、调整和结果也可以融入合并后的 assistant 节点；只有交互发生的先后或中间状态本身具有持续的因果价值时，才需要保留为多个 exchange。
+- 因用户口误或信息不全而偏离原定路线的工作是一类特殊试错：若后续 steer 揭示的是用户原本就想表达的路线，而非真正改变目标，应联合改写受影响的连续范围，把相关 user 消息合成一个引用了后续 steer 作为 semantic source 的纠正后意图。“用户原本想要什么”与“assistant 实际做过什么”必须独立处理：合并 user 意图不得把 assistant／tool 的尝试、失败或发现改写成用户陈述，也不得因纠正意图而自动删除已经发生且有独立结果的试错；这些工作可压缩进后续 assistant 节点，不必保留原交互边界或原始 tool trace。
+- 节点边界表达语义工作单元，不强制 user／assistant 角色交替。相邻同角色节点若承载不同的工作或信息可以保留；只有当边界只是原执行流水的残留、两者实际属于一个 coherent unit 时才应合并。真正改变目标、由中间结果触发用户决策或需要保留未解决分支的 steer 也不属于上述“补全原意”合并规则。
+- fork 继承的完整 parent context 只提供语义理解，不替代 working editor 的 provenance。任一改写节点若在内容中使用某条 steer、试错、发现或结果，所选连续范围必须包含承载该信息的当前节点，使返回的 semantic sources 与内容实际来源一致；不得从未选择的 inherited context 偷渡信息。
 - 允许把 `user₁ → assistant₁ → user₂ → assistant₂` 联合压缩为 `user′ → assistant′`：`user′` 合并初始意图与后续 steer，`assistant′` 合并原响应、因 steer 发生的调整及最终结果。输出粒度由信息结构决定，不设固定节点数，也不默认把整个 turn 压成一个 assistant 节点。
 - working surface 覆盖该 completed turn 的全部当前 surface 节点，包括第一个 user message；否则无法表达“初始请求 + 后续 steer”的联合 user 节点。没有被编辑的 working node 在最终落地时保持原 surface event，不追加等价 replacement copy。
 - `replace_turn_nodes` 取代 D-002 的 K→1 版本：一次调用选择一个当前节点或一个当前连续范围，并用 `nodes[]` 提交 1..M 个有序输出。所有输出**共同**派生自完整选中范围，不要求每个输出只总结某个连续输入子区间；成功后为每个输出分配新的 `r*` id，并返回完整结构目录。
@@ -105,6 +110,7 @@
 
 - 当前 canonical surface 校验对 replacement 的要求是：`start/end` 必须定位一个当前连续范围，且 `sourceEventSeqs` 必须至少包含该次遮蔽的全部当前节点；它允许同时引用其他更早事件。因此多个输出可以分别遮蔽不重叠的 landing slices，同时各自诚实引用完整联合输入作为 provenance。
 - editor 可以在父 session 之外完成全部 K→M 规划，再将最终 landing partition 以 M 次同步 replacement append 落地；这仍满足 D-001 的物理 `M <= N` 约束，不需要 append-assisted 插入。
+- fork 已继承目标 `turn/end` 及其完整对话上下文，能够直接判断灵感、试错、纠正和结论之间的语义及因果关系；目录只承担已知内容到可编辑 opaque id 的映射。联合 K→M 允许把这些信息保留在重新组织后的 user／assistant 节点中，不要求为每段被保留的信息维持原始节点边界。
 - 新的真实 fork E2E 已完成一次 6→2 联合压缩：首轮生成 user／assistant 两个节点，第二轮使用返回的两个 `r*` id 再次联合改写；最终两个 durable event 均引用全部六个 semantic sources，landing slices 分别遮蔽前三和后三个原节点。实时 surface、完整 `foldSurface()`、`deriveMessages()`、session query 与冷加载结果一致。
 
 ### 已知边界
@@ -113,3 +119,25 @@
 - `tool/result` 若保留为 tool 节点，物理 landing slice 仍必须一对一指向原 tool result，并只能改写 result content。普通 working trace 更适合把完整 tool-call／result 单元一起吸收到 assistant 节点；不能只遮蔽配对的一半。
 - `@deepseek-ai/dsh-session` 的 canonical surface 契约支持 turn 结束后的 replacement。`0.1.0-rc.6` 的可选 `@deepseek-ai/dsh-session/invariant` companion 会对 replacement assistant message 继续施加 open-step 约束；当前 base、headless E2E 和测试 Web composition 均未加载该 companion。若未来 profile 启用它，需要先调整 upstream invariant 或改换落地生命周期，不能假设本路径仍可用。
 - 多 event 落地继续采用 D-001 的运行假设：提交前完整验证、同步 append 期间没有其他 writer，也不处理进程突然停止造成的部分提交。
+
+## D-004：实时读取的 Markdown prompt 模板
+
+状态：**已确认**
+
+### 约定
+
+- fork 的完整行为 prompt 以独立 Markdown 文件 `prompts/turn-compression.md` 为唯一正文来源，使每次 prompt 重构都能直接审视完整文档；TypeScript 不再用字符串数组维护另一份行为说明。
+- 每次创建 compression fork 前重新读取模板文件。模板修改对下一个 completed turn 立即生效，无需重启 Web；单个 job 在启动时得到一次完整渲染，执行期间不受后续文件修改影响。
+- 模板只需要原样标量替换 `{{name}}` 与非嵌套条件块 `{{#if flag}}...{{/if}}`。当前使用项目内严格小型 renderer，不引入通用模板依赖，也不支持 helper、partial、`else`、嵌套条件或任意表达式。
+- renderer 对未知变量、未知条件和残留模板表达式直接失败。目录正文按原样插入，不做 HTML escaping；模板作者负责只把 host 已构造的 prompt 数据传入已知占位符。
+- 生产协议与 deterministic E2E 指令共用一份模板，但 E2E 内容必须完全位于 `e2eSmoke` 条件块内；关闭条件后的渲染结果不得包含任何 smoke 指令或 sentinel。
+
+### 可行性依据
+
+- Node ESM 可以用相对 `import.meta.url` 稳定定位并同步读取包内 Markdown 资源；发布文件列表显式包含 `prompts/*.md`，link profile 与打包安装使用同一路径语义。prompt 每个 completed turn 只读取一次，文件体量很小，同步读取不会进入模型或工具的长时执行路径。
+- 当前动态内容只有初始节点目录、原始节点数、四个 smoke sentinel 和一个布尔条件，简单 renderer 足以完整表达且可用单元测试穷举其语法边界，无需承担 Handlebars 的额外依赖和能力面。
+
+### 已知边界
+
+- 模板文件缺失、读取失败或渲染失败会使该 turn 的 compression job 失败并保留原始 surface；不会回退到进程内缓存的旧 prompt，因为那会破坏“修改立即生效”的语义。
+- 若将来确实需要嵌套、循环、escaping policy 或复用 partial，应重新调研模板能力并更新本条；不得在小型 renderer 上逐步堆出一个未经设计的通用模板语言。

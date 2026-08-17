@@ -24,6 +24,22 @@ tools, surface landing, or persistence:
 pnpm e2e
 ```
 
+When production prompt behavior changes, also run the qualitative steer
+regression:
+
+```bash
+pnpm e2e:prompt
+```
+
+This creates a real multi-step turn whose first `/repo` attempt fails and whose
+later user steer says `playground`. Unlike the deterministic smoke protocol, it
+uses the production compression prompt and requires the two user messages to
+become one corrected intent whose provenance includes both sources. Assistant
+work may remain in more than one semantic node, but together it must retain both
+the failed detour and the final 6-type/9-device conclusion. It checks live folding, persistence,
+cold loading, and session-query projection, then writes
+`.tmp/prompt-eval-surface-<session-id>.json` for inspection.
+
 The e2e workflow uses the dedicated `~/.dsh/profiles/test-turn-memory` profile
 and the configured real model. It creates a fresh parent session, forces a
 multi-node tool turn, waits for the turn-end fork to perform `n* -> r1 -> r2`,

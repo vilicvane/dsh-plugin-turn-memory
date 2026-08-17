@@ -1,0 +1,14 @@
+# Production-prompt evaluation overlay for the dedicated test profile.
+- id: turn-memory
+  config:
+    enabled: true
+    e2eSmoke: false
+    previewChars: 120
+    maxReadChars: 30000
+
+- id: test-runner
+  disabled: true
+
+- insert:
+    - id: turn-memory-prompt-eval-runner
+      name: dsh-plugin-turn-memory/prompt-eval-runner

@@ -8,11 +8,13 @@
   "files": [
     "index.ts",
     "lib/*.ts",
-    "e2e/runner.ts"
+    "e2e/*.ts",
+    "prompts/*.md"
   ],
   "exports": {
     ".": "./index.ts",
     "./e2e-runner": "./e2e/runner.ts",
+    "./prompt-eval-runner": "./e2e/prompt-eval-runner.ts",
     "./package.json": "./package.json"
   },
   "dependencies": {
@@ -28,6 +30,7 @@
     "test": "node --test \"test/*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "check": "pnpm test && pnpm typecheck",
-    "e2e": "bash scripts/e2e-smoke.sh"
+    "e2e": "bash scripts/e2e-smoke.sh",
+    "e2e:prompt": "bash scripts/e2e-prompt.sh"
   }
 }

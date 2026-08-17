@@ -15,6 +15,11 @@ Treat these as stable requirements to reconstruct the prompt from, not as wordin
 - Preserve the overall chronology, causal progression, and recognizable user-assistant interaction. The compressed surface should still read like a conversation.
 - Merge low-value continuous working traces and supplementary steers when they form one coherent interaction. In particular, support semantic `user → assistant → user → assistant` to `user → assistant` compression: the new user node combines the human intent and later steer, while the new assistant node combines the response, adjustment, and outcome.
 - Preserve temporally or causally decisive moments at higher fidelity and, when useful, as separate nodes. This includes changed direction, corrections, constraints, discoveries, failures, decisions, and externally visible results.
+- Give preservation priority to information that is costly or impossible to reconstruct later: insights and inspirations, hypotheses with their uncertainty intact, trials and detours with what they taught or ruled out, discoveries, decisions and their rationale, and conclusions with their scope and evidence. A failed or indirect path may remain valuable after the immediate problem is solved. Compress its mechanical trace when useful, but do not erase the path merely because it was a detour.
+- Preserve semantics independently of original node boundaries. A correction or steer may be retained faithfully inside a consolidated user node, and an assistant's attempts, failures, adjustments, and result may be retained inside a consolidated assistant node. Keeping information does not imply keeping every source node as a separate exchange.
+- Treat off-route work caused by a typo or missing user information as a special trial-and-error case: when a later steer reveals the route intended all along, consolidate the affected user messages into the corrected intent while retaining useful evidence from the superseded path. Correcting what the user intended and preserving what the assistant actually did are independent decisions: do not erase executed trial history or attribute assistant/tool outcomes to the consolidated user node. Distinguish this from a genuine change of objective.
+- Node boundaries represent semantic units rather than forced role alternation. Adjacent same-role nodes may remain when they contain materially different work; merge them only when the boundary is execution residue rather than useful structure.
+- Inherited parent context supplies understanding, not provenance for arbitrary edits. Every rewritten node must select a continuous range containing the current nodes whose information it claims to use; specifically, a corrected user intent that incorporates a later steer must include that steer in its semantic sources.
 - Choose granularity from the interaction's information structure. Do not target a fixed node count or collapse a turn to one assistant node by default.
 - Treat the preceding 4→2 example as a joint semantic K→M rewrite. Its role-specific outputs depend on interleaved, non-contiguous source nodes inside one continuous input span. Do not fake it with misleading per-node coverage or weaken the product requirement to fit a K→1 editor; redesign the editing contract when necessary.
 
@@ -24,7 +29,7 @@ When the user clarifies another original prompt requirement, update this section
 
 Before editing:
 
-1. Read the entire `buildPrompt` implementation, not only the suspected line.
+1. Read the entire Markdown prompt template and its renderer, not only the suspected line.
 2. Read every tool name, description, parameter description, return shape, and validation rule visible to the fork subagent.
 3. Read the applicable confirmed agreements in `design.md`. Do not silently change their semantics. Research and confirm any new design decision before recording or implementing it.
 4. Inspect the concrete evidence that motivated the change, such as an E2E trace, tool-call sequence, landed surface, or failure. Separate observed behavior from the proposed explanation.
@@ -35,7 +40,7 @@ Before editing:
    - which metadata belongs exclusively to the host;
    - how successful completion is signaled.
 
-Treat the main prompt, initial catalog, tool affordances, tool results, host validation, and completion path as one protocol. A wording change in one part requires checking every other part for consistency.
+Treat the Markdown prompt, template values and conditionals, initial catalog, tool affordances, tool results, host validation, and completion path as one protocol. A wording change in one part requires checking every other part for consistency.
 
 ## Refactor the whole prompt
 
@@ -54,6 +59,8 @@ Prefer direct, positive instructions in execution order. Remove duplication, obs
 Do not preserve old wording merely for textual compatibility. Preserve behavior only when it remains part of the reconstructed contract.
 
 Keep deterministic E2E instructions isolated from the production prompt. Never distort production compression behavior to make a smoke fixture pass.
+
+Keep the complete prompt body in `prompts/turn-compression.md`. The TypeScript renderer may supply data and strict conditionals but must not become a second home for behavioral prose.
 
 ## Review from the model's perspective
 

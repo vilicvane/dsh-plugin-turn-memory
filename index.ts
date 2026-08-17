@@ -6,6 +6,13 @@ import { fileURLToPath } from 'node:url';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
 import { TurnNodeEditor } from './lib/editor.ts';
+import {
+  DRAFT_SENTINEL,
+  E2E_FINAL_SENTINEL,
+  E2E_TOOL_SENTINEL,
+  E2E_USER_SENTINEL,
+  buildCompressionPrompt,
+} from './lib/prompt.ts';
 import { validateProjectedToolProtocol } from './lib/tool-protocol.ts';
 import type { NodeRange, TurnNodeOutput, TurnNodeSeed } from './lib/editor.ts';
 
@@ -19,10 +26,6 @@ const TOOL_NAMES = [
   'finish_turn_compression',
 ];
 
-const DRAFT_SENTINEL = '__DRAFT_PASS__';
-const E2E_USER_SENTINEL = 'E2E-USER-GAMMA-194';
-const E2E_TOOL_SENTINEL = 'E2E-FIXTURE-ALPHA-771';
-const E2E_FINAL_SENTINEL = 'PARENT-FINAL-BETA-332';
 const DEFAULT_SURFACE_DUMP_DIR = fileURLToPath(new URL('.tmp/', import.meta.url));
 
 interface PluginConfig {
@@ -116,40 +119,6 @@ function prepareJob(agent: any, event: any): CompressionJob | undefined {
     mutationCount: 0,
     finishConfirmed: false,
   };
-}
-
-function buildPrompt(job: CompressionJob, previewChars: number, e2eSmoke: boolean): string {
-  const base = [
-    'Compress the editable nodes of the completed parent turn into a shorter transcript while preserving its causal sequence and recognizable user-assistant interaction. Do not replace the interaction with a retrospective assistant-only summary.',
-    'The exact conversation is already present in your inherited context. The catalog maps that content to opaque ids on an isolated in-memory working surface.',
-    '',
-    '<initial-node-catalog>',
-    job.editor.richCatalog(previewChars),
-    '</initial-node-catalog>',
-    '',
-    'Compression contract:',
-    '- Preserve the order and causal role of requests, responses, steers, corrections, discoveries, failures, decisions, and results. Keep temporally decisive moments separate or high fidelity.',
-    '- Condense low-value continuous working traces and supplementary steers into coherent exchanges. A user-assistant-user-assistant span may become one user node combining the human intent and steer, followed by one assistant node combining the response, adjustment, and outcome.',
-    '- Choose granularity from the interaction. Do not target a fixed node count, and do not collapse the turn to one assistant node by default.',
-    '',
-    'Editing protocol:',
-    '- Use replace_turn_nodes to jointly replace one current node or continuous current range with one or more ordered nodes. Every output may use the entire selected range as context.',
-    '- Successful edits return new r* ids and the complete current structural catalog. Shadowed ids are stale; generated nodes may be selected again for further restructuring or refinement.',
-    '- Leave useful nodes unchanged. Use read_turn_nodes only when inherited context and previews are insufficient; one call can read several ids or ranges.',
-    '- Keep complete tool-call/result interactions together when compressing them. A tool output is valid only as a one-to-one rewrite of one current tool node; otherwise leave the pair intact or absorb the complete interaction into conversational nodes.',
-    '- The host owns session seqs, surface operations, provenance fields, message ids, turn/step fields, and tool pairing metadata.',
-    '- Submit only through finish_turn_compression. A plain text answer is not accepted.',
-  ];
-  if (e2eSmoke) {
-    base.push(
-      '',
-      'E2E smoke protocol (follow exactly):',
-      '- First replace the entire current range n1..n' + job.editor.originalCount + ' with exactly two nodes: a user node containing ' + E2E_USER_SENTINEL + ' and ' + DRAFT_SENTINEL + ', followed by an assistant node containing both ' + E2E_TOOL_SENTINEL + ' and ' + E2E_FINAL_SENTINEL + ' and also ' + DRAFT_SENTINEL + '.',
-      '- Then select both returned r* ids in a second replace_turn_nodes call and refine them into exactly one user node followed by one assistant node. Preserve all three E2E sentinels exactly and remove every ' + DRAFT_SENTINEL + '.',
-      '- Finally call finish_turn_compression.',
-    );
-  }
-  return base.join('\n');
 }
 
 function validateLanding(job: CompressionJob, e2eSmoke: boolean): void {
@@ -334,7 +303,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
 
   ctx.tools.register(defineTool({
     name: 'replace_turn_nodes',
-    description: 'Jointly replace one current node or continuous current range with one or more ordered nodes. All outputs derive from the complete selected range. Returns new r* ids and the complete current structural catalog.',
+    description: 'Jointly replace one current node or continuous current range with one or more ordered nodes. Select a range containing every current node whose information the outputs use; all outputs derive from that complete range. A tool output is allowed only as the sole output replacing exactly one current tool node. Returns new r* ids and the complete current structural catalog.',
     parameters: {
       start: { type: 'string', required: true, description: 'First current node id.' },
       end: { type: 'string', description: 'Last current node id, inclusive; omit for one node.' },
@@ -346,7 +315,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
           type: 'object',
           additionalProperties: false,
           properties: {
-            kind: { type: 'string', required: true, enum: ['user', 'assistant', 'tool'], description: 'Semantic role. Tool is valid only for a one-to-one rewrite of one current tool node.' },
+            kind: { type: 'string', required: true, enum: ['user', 'assistant', 'tool'], description: 'Semantic role. Tool is valid only when it is the sole output and the selected range is exactly one current tool node.' },
             content: { type: 'string', required: true, description: 'Complete content of this output node.' },
           },
         },
@@ -391,7 +360,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
     try {
       run = await ctx.subagents.start('fork', {
         label: 'turn-memory compression ' + job.turn,
-        prompt: [{ type: 'text', text: buildPrompt(job, previewChars, e2eSmoke) }],
+        prompt: [{ type: 'text', text: buildCompressionPrompt(job.editor, previewChars, e2eSmoke) }],
         parent: job.agent,
         signal: job.controller.signal,
         toolFilter: { allow: TOOL_NAMES },

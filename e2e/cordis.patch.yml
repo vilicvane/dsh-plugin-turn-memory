@@ -1,0 +1,14 @@
+# Overlay for the dedicated ~/.dsh/profiles/test-turn-memory profile.
+- id: turn-memory
+  config:
+    enabled: true
+    e2eSmoke: true
+    previewChars: 120
+    maxReadChars: 30000
+
+- id: test-runner
+  disabled: true
+
+- insert:
+    - id: turn-memory-e2e-runner
+      name: dsh-plugin-turn-memory/e2e-runner

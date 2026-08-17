@@ -1,39 +1,33 @@
 {
   "name": "dsh-plugin-turn-memory",
-  "version": "0.1.0",
-  "description": "Turn-granular context memory for DeepSeek Harness: per-turn flowing summaries replace completed turns on the surface, with verbatim tags and a three-mode recall tool.",
+  "version": "0.2.0-dev",
+  "description": "Turn-scoped memory rewriting for DeepSeek Harness.",
   "license": "MIT",
   "author": "vilicvane",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/vilicvane/dsh-plugin-turn-memory.git"
-  },
   "type": "module",
   "files": [
     "index.ts",
-    "lib/*.ts"
+    "lib/*.ts",
+    "e2e/runner.ts"
   ],
   "exports": {
     ".": "./index.ts",
+    "./e2e-runner": "./e2e/runner.ts",
     "./package.json": "./package.json"
   },
   "dependencies": {
+    "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-session": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
   },
-  "keywords": [
-    "dsh",
-    "deepseek-harness",
-    "plugin",
-    "memory",
-    "summarization",
-    "compaction"
-  ],
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3"
+  },
   "scripts": {
     "test": "node --test \"test/*.test.ts\"",
-    "typecheck": "tsc --noEmit"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@types/node": "^24.10.0"
+    "typecheck": "tsc --noEmit",
+    "check": "pnpm test && pnpm typecheck",
+    "e2e": "bash scripts/e2e-smoke.sh"
   }
 }

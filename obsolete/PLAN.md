@@ -790,6 +790,15 @@ long turn 提醒文案各加收敛子句(代理可能不加载技能、只凭提
   (开闭标签各独占一行、kind 限定三选一、闭标签回引 kind+id、正文贪婪),
   上下文里内联的标签示例不再误匹配;test/draft.test.ts 加 3 例锚点测试,
   53/53 全过。
+- turn 107 清理:用户要求删版本号、去 <turn-summary turn=N version=N>
+  包裹、统一清理过时说法——删除 TURN_SUMMARY_VERSION 常量与 source
+  .version 字段;tryReplace 落地的 checkpoint 文本 = 草稿裸标签序列(无
+  包裹、无 turn 号文本);新增 turn-identity runtime 上下文贡献(Current
+  turn: N,isTurnMemorySession 限定),MEMORY_SECTION 加 turn 编号规则
+  (按 surface 上逐字起始用户消息计数映射历史 turn 号,供 expand_turn/
+  compact_turn 用);MEMORY_SECTION 的 compacted 措辞改 summarized、
+  运维技能与工具描述与 README(格式节去掉 version 6、两处 root wrapper
+  措辞、source 字段清单)同步;55/55 全过。
 - turn 102 追加:用户要求保留原始 turn 文件供总结后评估——新增
   rawPathFor(session,turn)(.dsh-turn-raw-<sessionId>-turn-<N>.md,命名避开
   draft 工具 basename 校验),runTurnSummary 播种草稿时把原始转录另存一份、
@@ -802,3 +811,85 @@ long turn 提醒文案各加收敛子句(代理可能不加载技能、只凭提
   buildSummaryPrompt 明确"传裸内容、工具自己补换行";测试 +2 例(裸内容
   可重解析、两端空白剥离),55/55 全过。
   转录里的内联标签示例不再误解析;测试 +3 例,53/53 全过。
+
+## 22. N→M 角色保留 + JSONL 草稿 + 恢复阻塞(turn 122)
+
+- 动因:用户定案三点——恢复最初 subagent 阻塞方案(不设时限)、落盘改
+  N→M(M≤N,按段分组保留 role 结构、去掉无用的注入/系统信息)、草稿改
+  JSON/JSONL(工具由我们提供、解析零歧义)。
+- 机制先行:用 foldSurface 探针验证 K 次连续 replace 合法——同一 span 上
+  互不相交的子区间各插一个替身节点(投影 [6,7,8,5]、replacements
+  [[0,2,6],[3,3,7],[4,4,8]]),tool/result 的 1:1 内容改写过 harness 专用
+  校验(content-only rewrite)。
+- 实现:lib/render.ts 重写——renderSpanNode/renderSpanDraft 输出 JSONL
+  (一行一个原始 surface 节点,seq 即行 id;kind=user/assistant/tool/context;
+  assistant 行只含正文、tool-call 块不进草稿);lib/draft.ts 重写——
+  parseDraftLines/readLineContent/replaceLineContent/grepDraftLines/
+  draftShapeCheck(user/assistant 逐字、行序列与 kind 不变)与
+  buildReplacementUnits(kept 行按 role 组单元:user→user/message、
+  assistant→assistant/message、tool→1:1 tool/result 克隆原 data 只换
+  content、context 保留时并入 assistant;空行=删节点、coverage 并给相邻
+  非 tool 单元,tool 单元绝不吸收删节点、全删时一个空 assistant 单元覆盖
+  全 span);index.ts——tryReplace 改 shape check + 单元循环 K 次 append、
+  buildSummaryPrompt 改 JSONL 指令、三个 draft 工具改按行、草稿扩展名
+  .jsonl、pre-step 恢复边界阻塞(等全部 forkInFlight 的 fork settle、无
+  墙钟时限、失败也放行 turn 保持 raw);删 verbatim 解析死代码。
+- 测试:render.test/draft.test 全量重写,47/47 全过。
+- 测试:render.test/draft.test 全量重写,47/47 全过。
+
+## 23. 落盘事件形状修复 + 会话损坏修复(turn 125)
+
+- 事故:turn 123 的 N→M 落盘后会话加载失败("session event at seq
+  1884763 lacks an identified message")——三层问题:①assistant 替换节点只写
+  {message:{content},source}、缺 message.id/role/model source,重启加载时
+  harness 的 adoptSessionEvent 形状校验拒绝整会话;②保留的 tool/result 节点
+  前的 assistant 节点没有 tool-call 块,turn 124 首请求被 provider 拒
+  ("Messages with role 'tool' must be a response to a preceding message with
+  'tool_calls'");③replacedTurnNumbers/foreignCheckpointOf 只认 user/message
+  marker,新格式 assistant 节点在检测与下个 turn span 排除上不可见。
+- 修复(lib/draft.ts + index.ts):ReplacementUnit 加 toolCalls 字段;新增
+  assistantUnitBlocks(有文则 text 块 + tool-call 块、全空则 content:[],
+  deriveEventMessage 对空 content 投影为无消息)与 pairToolUnits(每个保留
+  tool 单元必须直接跟在带同 callId tool-call 块的 assistant 单元后;配对不
+  上则并入相邻非 tool 单元,孤立 tool 单元降级为 assistant)——provider 工具
+  配对在落盘时保证;tryReplace 平衡遍历顺带记录 callInfo(callId→name/
+  arguments),从 span 内原始 assistant 消息取 model source(无则 turn 保持
+  raw),assistant 落盘改为完整形状 {message:{id,role,source:
+  {kind:model,...},content:blocks},source:marker}(marker 只能放 data 层——
+  message.source 必须是 model source 才能过形状校验;user 节点 marker 仍在
+  message.source);replacedTurnNumbers 增认 assistant 节点 data.source
+  marker;foreignCheckpointOf 增认 tool/result replace 节点(其必属前一个 turn
+  的落盘,因为本 turn 的替换发生在 turn/end 之后)与 assistant 节点 marker。
+- 会话修复:session-2ae48b8c 的 7 个畸形 assistant 替换事件(seq 1884763/
+  65/67/69/71/73/75)逐行修补——补 id/role/model source(取 1884757 的
+  deepseek-v4-pro)、空文本节点 content 改为其后续 tool 节点的 tool-call 块、
+  1884775 保留 759 字文本;其余 1884775 个事件逐字节不变;重压为单 zstd 帧。
+  验证:全部事件过形状校验、foldSurface 折叠通过、surface 上每个 tool 节点
+  前都有带同 callId tool-call 块的 assistant 节点。原文件备份
+  .tmp-session-2ae48b8c.jsonl.zstd.corrupt-bak(workspace)。写回 $DSH_HOME
+  需 danger-full-access 审批(两次超时未获答),留给用户手动 cp/mv 或批准后
+  重试。
+- 测试:draft.test.ts +9 例(assistantUnitBlocks 3、pairToolUnits 6),
+  56/56 全过、typecheck 干净。
+- 遗留:重启 web 前当前会话仍跑着旧插件,下一个 turn 结束会再次落盘畸形
+  替换——重启须优先于继续使用本会话;turn 124 会在重启后由 sweep 自动重新
+  总结。
+
+## 24. 替换节点补 data.turn/step(turn 128)
+
+- 现象:重启后新落盘的 checkpoint 在 web 轨迹里显示为独立的 "Turn
+  undefined / Step undefined" 分组,不在被总结的 turn 内。核对
+  session-b3c577f4 日志:10 个 assistant 替换节点 data 只有
+  {message,source},缺 turn/step;9 个 tool/result 替换因克隆原始 data 而带
+  全。轨迹 UI(dsh-client-ui-trajectory)按 event.data.turn/step 分组,
+  surfaceOp 不折叠,替换节点落在 turn/end 与下个 turn/start 之间、无 turn
+  即自成分组。
+- 修复:lib/draft.ts 新增 unitLandingStep(coveredSeqs, spanSeqs, stepOf)
+  ——取单元遮蔽的最后一个带 step 的原始节点,否则整个 span 最后一个带 step
+  的节点;index.ts 落盘前扫 spanFallbackStep(registerTurn 保证 span 必有
+  assistant 内容,扫不到则 SKIP 保持 raw),assistant 分支补
+  {turn: item.turn, step}。user 分支不动(规范 user/message data 本无
+  turn/step,轨迹靠相邻 assistant 推断)。
+- 测试:draft.test.ts +3 例(unitLandingStep),59/59 全过、typecheck 干净。
+- 说明:已落盘的 "turn undefined" 节点是历史事件,不追溯修复;重启 web 后
+  新压缩的 checkpoint 即正确归组。

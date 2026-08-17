@@ -1,0 +1,39 @@
+{
+  "name": "dsh-plugin-turn-memory",
+  "version": "0.1.0",
+  "description": "Turn-granular context memory for DeepSeek Harness: per-turn flowing summaries replace completed turns on the surface, with verbatim tags and a three-mode recall tool.",
+  "license": "MIT",
+  "author": "vilicvane",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vilicvane/dsh-plugin-turn-memory.git"
+  },
+  "type": "module",
+  "files": [
+    "index.ts",
+    "lib/*.ts"
+  ],
+  "exports": {
+    ".": "./index.ts",
+    "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "memory",
+    "summarization",
+    "compaction"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "@types/node": "^24.10.0"
+  }
+}

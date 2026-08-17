@@ -5,13 +5,17 @@
     "moduleResolution": "nodenext",
     "lib": ["es2023"],
     "strict": true,
+    // The entry file (index.ts) consumes the harness runtime structurally and
+    // is typed incrementally; the extracted lib/ modules are fully typed.
     "noImplicitAny": false,
     "noEmit": true,
+    // Node runs the sources natively via type stripping, so only erasable
+    // syntax is allowed (no enums/namespaces/parameter properties).
     "erasableSyntaxOnly": true,
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["index.ts", "lib/**/*.ts", "test/**/*.ts", "e2e/**/*.ts"]
+  "include": ["index.ts", "lib/**/*.ts", "test/**/*.ts"]
 }

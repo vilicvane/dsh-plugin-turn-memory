@@ -10,6 +10,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 const name = 'turn-memory-e2e-runner';
 const inject = ['agentDefaultModel', 'agents', 'sessionQuery', 'sessions', 'tools'];
 
+const USER_SENTINEL = 'E2E-USER-GAMMA-194';
 const TOOL_SENTINEL = 'E2E-FIXTURE-ALPHA-771';
 const FINAL_SENTINEL = 'PARENT-FINAL-BETA-332';
 const DRAFT_SENTINEL = '__DRAFT_PASS__';
@@ -21,40 +22,46 @@ function textOf(event: any): string {
     .join('');
 }
 
-function checkpoints(session: any): any[] {
+function compressionNodes(session: any): any[] {
   return session.surface.nodes
     .map((seq: number) => session.events[seq])
-    .filter((event: any) => event?.data?.source?.plugin === 'turn-memory' && event.data.source.phase === 'editor-smoke');
+    .filter((event: any) => event?.data?.source?.plugin === 'turn-memory' && event.data.source.phase === 'compression');
 }
 
-async function waitForCheckpoint(session: any, timeoutMs: number): Promise<any> {
+async function waitForCompression(session: any, timeoutMs: number): Promise<any[]> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const found = checkpoints(session);
-    if (found.length > 0) return found[found.length - 1];
+    const found = compressionNodes(session);
+    if (found.length === 2) return found;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error('timed out waiting for the turn-memory replacement after ' + timeoutMs + 'ms');
+  throw new Error('timed out waiting for the turn-memory compression after ' + timeoutMs + 'ms');
 }
 
-function assertProjection(session: any, checkpoint: any, phase: string): void {
+function assertProjection(session: any, nodes: any[], phase: string): void {
   const folded = foldSurface(session.events);
   assert.deepEqual(folded.nodes, [...session.surface.nodes], phase + ': live surface must equal full fold replay');
-  assert.equal(checkpoints(session).length, 1, phase + ': expected exactly one turn-memory checkpoint on surface');
-  assert.equal(checkpoint.type, 'assistant/message', phase + ': checkpoint must be a complete assistant message');
-  assert.equal(checkpoint.surfaceOp?.op, 'replace', phase + ': checkpoint must be a positional replacement');
-  assert.equal(checkpoint.sourceEventSeqs.length, checkpoint.data.source.originalNodes, phase + ': coverage metadata must match original node count');
-  assert.ok(checkpoint.data.source.originalNodes >= 3, phase + ': fixture turn should exercise a multi-node merge');
-  assert.ok(checkpoint.data.source.mutations >= 2, phase + ': generated id should have been edited again');
-  const text = textOf(checkpoint);
-  assert.ok(text.includes(TOOL_SENTINEL), phase + ': tool-result sentinel missing from summary');
-  assert.ok(text.includes(FINAL_SENTINEL), phase + ': final assistant sentinel missing from summary');
-  assert.ok(!text.includes(DRAFT_SENTINEL), phase + ': draft-pass sentinel leaked into final summary');
+  assert.equal(compressionNodes(session).length, 2, phase + ': expected exactly one compressed user-assistant exchange on surface');
+  assert.equal(nodes[0].type, 'user/message', phase + ': first compressed node must be a user message');
+  assert.equal(nodes[1].type, 'assistant/message', phase + ': second compressed node must be an assistant message');
+  for (const node of nodes) {
+    assert.equal(node.surfaceOp?.op, 'replace', phase + ': compressed nodes must be positional replacements');
+    assert.equal(node.sourceEventSeqs.length, node.data.source.originalNodes, phase + ': each output must cite the complete joint source range');
+    assert.ok(node.data.source.originalNodes >= 4, phase + ': fixture turn should exercise a four-node-or-larger joint rewrite');
+    assert.ok(node.data.source.mutations >= 2, phase + ': generated ids should have been edited again');
+    assert.ok(!textOf(node).includes(DRAFT_SENTINEL), phase + ': draft-pass sentinel leaked into final compression');
+  }
+  assert.ok(textOf(nodes[0]).includes(USER_SENTINEL), phase + ': initial user sentinel missing from compressed user node');
+  assert.ok(textOf(nodes[1]).includes(TOOL_SENTINEL), phase + ': tool-result sentinel missing from compressed assistant node');
+  assert.ok(textOf(nodes[1]).includes(FINAL_SENTINEL), phase + ': final assistant sentinel missing from compressed assistant node');
   const derivedText = session.deriveMessages().flatMap((message: any) => message.content ?? [])
     .filter((block: any) => block.type === 'text')
     .map((block: any) => block.text)
     .join('\n');
-  assert.ok(derivedText.includes(TOOL_SENTINEL) && derivedText.includes(FINAL_SENTINEL), phase + ': deriveMessages lost checkpoint text');
+  assert.ok(
+    derivedText.includes(USER_SENTINEL) && derivedText.includes(TOOL_SENTINEL) && derivedText.includes(FINAL_SENTINEL),
+    phase + ': deriveMessages lost compressed transcript text',
+  );
 }
 
 async function run(ctx: any): Promise<void> {
@@ -102,18 +109,18 @@ async function run(ctx: any): Promise<void> {
       role: 'user',
       content: [{
         type: 'text',
-        text: 'Call turn_memory_e2e_fixture exactly once. After it returns, reply with exactly: ' + FINAL_SENTINEL + ': parent turn complete.',
+        text: USER_SENTINEL + ': Call turn_memory_e2e_fixture exactly once. After it returns, reply with exactly: ' + FINAL_SENTINEL + ': parent turn complete.',
       }],
       source: { kind: 'user' },
     });
     await agent.whenIdle();
     assert.equal(fixtureCalls, 1, 'parent fixture tool should run exactly once');
     const timeoutMs = Number(process.env.TURN_MEMORY_E2E_TIMEOUT_MS ?? 240000);
-    const checkpoint = await waitForCheckpoint(agent.session, timeoutMs);
-    assertProjection(agent.session, checkpoint, 'live');
+    const compressed = await waitForCompression(agent.session, timeoutMs);
+    assertProjection(agent.session, compressed, 'live');
     await sessions.flush(agent.session);
     const sessionId = agent.session.id;
-    const expectedCheckpointSeq = checkpoint.seq;
+    const expectedCompressionSeqs = compressed.map((node) => node.seq);
     await liveHandle.dispose();
     liveHandle = undefined;
 
@@ -123,10 +130,9 @@ async function run(ctx: any): Promise<void> {
       setup,
     });
     await coldHandle.agent.whenIdle();
-    const coldCheckpoint = checkpoints(coldHandle.agent.session)[0];
-    assert.ok(coldCheckpoint !== undefined, 'cold load lost the replacement checkpoint');
-    assert.equal(coldCheckpoint.seq, expectedCheckpointSeq, 'cold load changed checkpoint identity');
-    assertProjection(coldHandle.agent.session, coldCheckpoint, 'cold');
+    const coldCompression = compressionNodes(coldHandle.agent.session);
+    assert.deepEqual(coldCompression.map((node) => node.seq), expectedCompressionSeqs, 'cold load changed compression identities');
+    assertProjection(coldHandle.agent.session, coldCompression, 'cold');
     await sessions.flush(coldHandle.agent.session);
     const snapshot = await sessionQuery.readSurface(sessionId);
     const expectedSurfaceEvents = coldHandle.agent.session.surface.nodes
@@ -137,8 +143,8 @@ async function run(ctx: any): Promise<void> {
     await mkdir(artifactDir, { recursive: true });
     await writeFile(surfacePath, JSON.stringify(snapshot, null, 2) + '\n', 'utf8');
     console.log('E2E_SESSION_ID=' + sessionId);
-    console.log('E2E_REPLACEMENT=' + checkpoint.data.source.originalNodes + '->1');
-    console.log('E2E_MUTATIONS=' + checkpoint.data.source.mutations);
+    console.log('E2E_REPLACEMENT=' + compressed[0].data.source.originalNodes + '->2');
+    console.log('E2E_MUTATIONS=' + compressed[0].data.source.mutations);
     console.log('E2E_SURFACE_PATH=' + surfacePath);
     console.log('E2E_RESULT=PASS');
   } finally {

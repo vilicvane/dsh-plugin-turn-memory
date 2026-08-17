@@ -46,7 +46,7 @@
 
 ## D-002：fork subagent 的内存节点编辑协议
 
-状态：**已确认**
+状态：**已确认（`replace_turn_nodes` 的 K→1 部分已由 D-003 取代）**
 
 ### 约定
 
@@ -56,13 +56,13 @@
 - 首版工具能力固定为：
   - `list_turn_nodes`：返回当前 working surface 的完整富目录；
   - `read_turn_nodes`：一次读取多个 id 或连续范围的当前完整内容，并受单次总输出上限约束；
-  - `replace_turn_nodes`：把一个当前节点或一个当前连续区间替换为一个新节点；
-  - `finish_turn_summary`：请求 host 验证最终 working surface，并以 authoritative tool result 结束 child turn。
-- 每次 `replace_turn_nodes` 成功后必须返回完整的当前**结构目录**：包含新节点 id、它覆盖的原始节点范围，以及所有当前节点的顺序、kind 和 changed/unchanged 状态。它不重复返回所有节点的完整内容；需要富目录时调用 `list_turn_nodes`，需要正文时调用批量 `read_turn_nodes`。
-- 每个 working node 在 host 内部携带其覆盖的原始节点集合。初始 `n*` 各覆盖一个原节点；合并／再修改生成的 `r*` 继承被替换区间覆盖集合的有序并集。最终 working surface 因而始终是全部目标原节点的一个有序、无遗漏、无重叠分区。
+  - `replace_turn_nodes`：首版把一个当前节点或当前连续区间替换为一个新节点；该 K→1 形态已由 D-003 的联合 K→M 取代；
+  - `finish_turn_compression`（由 D-003 更名）：请求 host 验证最终 working surface，并以 authoritative tool result 结束 child turn。
+- 每次 `replace_turn_nodes` 成功后必须返回完整的当前**结构目录**：包含所有新节点 id、landing slice、semantic sources，以及所有当前节点的顺序、kind 和 changed/unchanged 状态。它不重复返回所有节点的完整内容；需要富目录时调用 `list_turn_nodes`，需要正文时调用批量 `read_turn_nodes`。
+- 首版 working node 只有一类“覆盖集合”；D-003 将其拆为可重叠的 semantic sources 与构成有序无遗漏分区的 landing slices，以支持联合 K→M。
 - state-changing 工具按 exclusive 执行；一次 replacement 只按调用开始时的 working surface 解析一个连续范围。若下一步需要引用本次刚生成的 id，必须在后续工具调用中进行。
 - subagent 不构造 `surfaceOp`、`sourceEventSeqs`、session seq、message id、turn／step 或 tool pairing 元数据；这些均由 host 从最终分区及原始事件推导并验证。
-- `finish_turn_summary` 是唯一成功出口：只有其验证通过并调用 `concludeTurn()`，host 才接受产物。普通文本 `DONE`、child 自然停止或未调用 finish 均不构成可提交结果。
+- `finish_turn_compression` 是唯一成功出口：只有其验证通过并调用 `concludeTurn()`，host 才接受产物。普通文本 `DONE`、child 自然停止或未调用 finish 均不构成可提交结果。
 
 ### 可行性依据
 
@@ -70,17 +70,46 @@
 - `SubagentStartRequest.toolFilter` 会在 child scope 同时限制工具展示与执行，可以让该 child 只看到上述编辑工具；当前 fork provider 明确支持该能力。
 - DSH 的 tool execute context 带 owning `agent`，host 可以把调用绑定到对应 fork job；工具成功结果还可以调用 `concludeTurn()`，所以 finish 可以同时充当最终验证点和 one-shot child 的权威结束信号。
 - `defineTool` 的 `isConcurrencySafe` 能把 mutation 声明为 exclusive；批量 read 可声明为只读并一次返回多个节点。批量读取不会减少正文自身 token，但会减少固定的 tool-call／tool-result 包装和可能的额外模型轮次。
-- 在内存列表上执行连续区间 K→1 后分配新 id，可自然支持 `n2..n3 → r1`、再执行 `r1 → r2` 或 `r1..n4 → r2`；覆盖集合的并集让 host 无需信任模型重述原始范围。
+- 首版探针验证了在内存列表上执行 `n2..n3 → r1`、再执行 `r1 → r2` 或 `r1..n4 → r2` 的可行性；D-003 在此基础上把单输出扩展为联合多输出。
 
 ### 已知边界
 
 - subagent 继承的是 fork 时的当前 surface；已经被其他 replacement 遮蔽的原始正文不会因此重新进入 child 上下文。目录和 read 工具也只面向本次 working surface，不隐式提供被遮蔽历史。
 - `read_turn_nodes` 的批量参数节省的是调用包装与轮次，不会压缩所读取正文；host 必须设置总字符／token 上限并在超限时要求缩小范围。
-- 本协议的 K→1 编辑天然只产生 `M <= N` 的最终分区。D-001 中 append-assisted 的 M>N 若以后被接受，必须设计成另一个明确的能力，不能隐藏在 `replace_turn_nodes` 里。
+- D-003 的联合 K→M 仍受原始 landing capacity 约束并保持最终 `M <= N`。D-001 中 append-assisted 的 M>N 若以后被接受，必须设计成另一个明确的能力，不能隐藏在 `replace_turn_nodes` 里。
 - `tool/result` 的最终落地仍受 D-001 的一对一 content-only rewrite 限制；通用节点编辑协议不取消 host 对 role、消息形状和 tool pairing 的最终验证责任。
 
 ### 本条未决定
 
 - 初始目录 preview 的最终截断长度，以及富目录对非文本 block、tool call 和 tool result 元数据的具体展示格式。
-- `replace_turn_nodes` 可选择的最终 kind／role 集合及每种 kind 的内容 schema；它必须与 D-001 尚未决定的 M 节点格式一起确定。
 - 是否在一个调用中支持多个互不相交的 replacement。该能力只节省调用包装，不影响核心表达力，首版不需要。
+
+## D-003：保留交互形态的联合 K→M 压缩
+
+状态：**已确认**
+
+### 约定
+
+- turn-memory 的产物是压缩后的 transcript，不是回顾式的 assistant-only summary。压缩必须保留总体时序、因果演进和可辨认的 user／assistant 交互过程；低价值的连续 working trace 和补充性质的 steer 可以合并，时间或因果上关键的转折、纠正、约束、发现、失败、决策和外部结果应高保真保留，必要时继续作为独立节点。
+- 允许把 `user₁ → assistant₁ → user₂ → assistant₂` 联合压缩为 `user′ → assistant′`：`user′` 合并初始意图与后续 steer，`assistant′` 合并原响应、因 steer 发生的调整及最终结果。输出粒度由信息结构决定，不设固定节点数，也不默认把整个 turn 压成一个 assistant 节点。
+- working surface 覆盖该 completed turn 的全部当前 surface 节点，包括第一个 user message；否则无法表达“初始请求 + 后续 steer”的联合 user 节点。没有被编辑的 working node 在最终落地时保持原 surface event，不追加等价 replacement copy。
+- `replace_turn_nodes` 取代 D-002 的 K→1 版本：一次调用选择一个当前节点或一个当前连续范围，并用 `nodes[]` 提交 1..M 个有序输出。所有输出**共同**派生自完整选中范围，不要求每个输出只总结某个连续输入子区间；成功后为每个输出分配新的 `r*` id，并返回完整结构目录。
+- 已生成节点仍可被后续调用选择。只要所选 working range 尚拥有足够的原始 landing positions，一个当前节点也可以被重新拆成多个输出；因此 refinement 可以改变内容、角色和节点数，而不局限于再次 K→1。
+- host 对每个 working node 分别维护两种关系：
+  - semantic sources：内容实际派生自哪些原始目标节点，联合 K→M 的每个输出都继承所选范围 semantic sources 的有序并集，允许不同输出重叠；
+  - landing slice：该节点最终在 surface 上遮蔽哪些原始位置，所有当前节点的 landing slices 始终构成原目标范围的有序、无遗漏、无重叠分区。
+- 联合 K→M 时，host 把选中范围拥有的 landing positions 确定性地分成 M 个非空连续切片，只用于持久化位置。每个落地 event 的 `surfaceOp.start/end` 使用自己的切片，但 `sourceEventSeqs` 使用该输出的完整 semantic sources；不得把 landing slice 描述成该输出的唯一语义来源。
+- 最终 compressed turn 必须以 user 节点开始、以 assistant 节点结束。subagent 仍不构造 durable session 元数据；唯一成功出口更名为 `finish_turn_compression`，以免 summary 命名把模型推向单一 assistant checkpoint。
+
+### 可行性依据
+
+- 当前 canonical surface 校验对 replacement 的要求是：`start/end` 必须定位一个当前连续范围，且 `sourceEventSeqs` 必须至少包含该次遮蔽的全部当前节点；它允许同时引用其他更早事件。因此多个输出可以分别遮蔽不重叠的 landing slices，同时各自诚实引用完整联合输入作为 provenance。
+- editor 可以在父 session 之外完成全部 K→M 规划，再将最终 landing partition 以 M 次同步 replacement append 落地；这仍满足 D-001 的物理 `M <= N` 约束，不需要 append-assisted 插入。
+- 新的真实 fork E2E 已完成一次 6→2 联合压缩：首轮生成 user／assistant 两个节点，第二轮使用返回的两个 `r*` id 再次联合改写；最终两个 durable event 均引用全部六个 semantic sources，landing slices 分别遮蔽前三和后三个原节点。实时 surface、完整 `foldSurface()`、`deriveMessages()`、session query 与冷加载结果一致。
+
+### 已知边界
+
+- 输出总数不能超过所选 working range 拥有的原始 landing positions；整个 turn 的最终节点数仍满足 `M <= N`。这里允许的是“一个当前生成节点重新拆分”，不是凭空增加 durable surface positions。
+- `tool/result` 若保留为 tool 节点，物理 landing slice 仍必须一对一指向原 tool result，并只能改写 result content。普通 working trace 更适合把完整 tool-call／result 单元一起吸收到 assistant 节点；不能只遮蔽配对的一半。
+- `@deepseek-ai/dsh-session` 的 canonical surface 契约支持 turn 结束后的 replacement。`0.1.0-rc.6` 的可选 `@deepseek-ai/dsh-session/invariant` companion 会对 replacement assistant message 继续施加 open-step 约束；当前 base、headless E2E 和测试 Web composition 均未加载该 companion。若未来 profile 启用它，需要先调整 upstream invariant 或改换落地生命周期，不能假设本路径仍可用。
+- 多 event 落地继续采用 D-001 的运行假设：提交前完整验证、同步 append 期间没有其他 writer，也不处理进程突然停止造成的部分提交。

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Turn Memory Prompt Refactor"
+  short_description: "Refactor the complete turn-memory agent prompt"
+  default_prompt: "Use $turn-memory-prompt-refactor to redesign the turn-memory agent prompt as one coherent whole."

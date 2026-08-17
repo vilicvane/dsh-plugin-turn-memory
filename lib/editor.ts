@@ -6,12 +6,21 @@ export interface TurnNodeSeed {
   sourceSeq: number;
 }
 
+export interface TurnNodeOutput {
+  kind: TurnNodeKind;
+  content: string;
+}
+
 export interface TurnNodeSnapshot {
   id: string;
   kind: TurnNodeKind;
   content: string;
+  /** Durable events that semantically contribute to this node. */
   sourceSeqs: number[];
-  originalIndexes: number[];
+  sourceIndexes: number[];
+  /** Disjoint positional slice used only to land this node on the surface. */
+  landingSeqs: number[];
+  landingIndexes: number[];
   changed: boolean;
 }
 
@@ -21,7 +30,8 @@ export interface NodeRange {
 }
 
 export interface ReplaceResult {
-  created: TurnNodeSnapshot;
+  created: TurnNodeSnapshot[];
+  sourceIndexes: number[];
   catalog: string;
 }
 
@@ -36,11 +46,43 @@ function cloneNode(node: TurnNodeSnapshot): TurnNodeSnapshot {
   return {
     ...node,
     sourceSeqs: [...node.sourceSeqs],
-    originalIndexes: [...node.originalIndexes],
+    sourceIndexes: [...node.sourceIndexes],
+    landingSeqs: [...node.landingSeqs],
+    landingIndexes: [...node.landingIndexes],
   };
 }
 
-/** Mutable, isolated working surface used by one summary fork. */
+function unique<T>(values: readonly T[]): T[] {
+  return [...new Set(values)];
+}
+
+function renderIndexes(indexes: readonly number[]): string {
+  const ranges: string[] = [];
+  let start = indexes[0];
+  let end = start;
+  const flush = () => ranges.push(start === end ? 'n' + start : 'n' + start + '..n' + end);
+  for (const index of indexes.slice(1)) {
+    if (index === end + 1) {
+      end = index;
+      continue;
+    }
+    flush();
+    start = index;
+    end = index;
+  }
+  flush();
+  return ranges.join(',');
+}
+
+function partition<T>(values: readonly T[], count: number): T[][] {
+  return Array.from({ length: count }, (_, index) => {
+    const start = Math.floor(index * values.length / count);
+    const end = Math.floor((index + 1) * values.length / count);
+    return values.slice(start, end);
+  });
+}
+
+/** Mutable, isolated working surface used by one compression fork. */
 export class TurnNodeEditor {
   readonly originalCount: number;
   private nodes: TurnNodeSnapshot[];
@@ -54,7 +96,9 @@ export class TurnNodeEditor {
       kind: seed.kind,
       content: seed.content,
       sourceSeqs: [seed.sourceSeq],
-      originalIndexes: [index + 1],
+      sourceIndexes: [index + 1],
+      landingSeqs: [seed.sourceSeq],
+      landingIndexes: [index + 1],
       changed: false,
     }));
   }
@@ -68,7 +112,8 @@ export class TurnNodeEditor {
       node.id,
       node.kind,
       node.content.length + ' chars',
-      'covers=' + this.coverage(node),
+      'lands=' + renderIndexes(node.landingIndexes),
+      'sources=' + renderIndexes(node.sourceIndexes),
       node.changed ? 'changed' : 'unchanged',
       'preview=' + JSON.stringify(preview(node.content, previewChars)),
     ].join(' | ')).join('\n');
@@ -79,28 +124,52 @@ export class TurnNodeEditor {
       (index + 1) + '.',
       node.id,
       node.kind,
-      'covers=' + this.coverage(node),
+      'lands=' + renderIndexes(node.landingIndexes),
+      'sources=' + renderIndexes(node.sourceIndexes),
       node.changed ? 'changed' : 'unchanged',
     ].join(' ')).join('\n');
   }
 
-  replace(startId: string, endId: string | undefined, kind: TurnNodeKind, content: string): ReplaceResult {
-    if (content.trim() === '') throw new Error('replacement content must not be empty');
+  replace(startId: string, endId: string | undefined, outputs: readonly TurnNodeOutput[]): ReplaceResult {
+    if (outputs.length === 0) throw new Error('replacement requires at least one output node');
+    for (const [index, output] of outputs.entries()) {
+      if (output.content.trim() === '') throw new Error('replacement output ' + (index + 1) + ' must not be empty');
+    }
     const start = this.indexOf(startId);
     const end = this.indexOf(endId ?? startId);
     if (start > end) throw new Error('replacement range is reversed: ' + startId + '..' + (endId ?? startId));
     const removed = this.nodes.slice(start, end + 1);
-    const created: TurnNodeSnapshot = {
+    const landing = removed.flatMap((node) => node.landingIndexes.map((originalIndex, index) => ({
+      originalIndex,
+      seq: node.landingSeqs[index],
+    })));
+    if (outputs.some((output) => output.kind === 'tool')
+      && (outputs.length !== 1 || removed.length !== 1 || removed[0].kind !== 'tool' || landing.length !== 1)) {
+      throw new Error('a tool output is valid only as a one-to-one rewrite of one current tool node');
+    }
+    if (outputs.length > landing.length) {
+      throw new Error('replacement has ' + outputs.length + ' outputs but the selected range owns only ' + landing.length + ' original landing positions');
+    }
+    const sourceSeqs = unique(removed.flatMap((node) => node.sourceSeqs));
+    const sourceIndexes = unique(removed.flatMap((node) => node.sourceIndexes)).sort((left, right) => left - right);
+    const slices = partition(landing, outputs.length);
+    const created = outputs.map((output, index): TurnNodeSnapshot => ({
       id: 'r' + this.nextReplacement++,
-      kind,
-      content,
-      sourceSeqs: removed.flatMap((node) => node.sourceSeqs),
-      originalIndexes: removed.flatMap((node) => node.originalIndexes),
+      kind: output.kind,
+      content: output.content,
+      sourceSeqs: [...sourceSeqs],
+      sourceIndexes: [...sourceIndexes],
+      landingSeqs: slices[index].map((item) => item.seq),
+      landingIndexes: slices[index].map((item) => item.originalIndex),
       changed: true,
-    };
-    this.nodes.splice(start, removed.length, created);
+    }));
+    this.nodes.splice(start, removed.length, ...created);
     this.assertPartition();
-    return { created: cloneNode(created), catalog: this.structuralCatalog() };
+    return {
+      created: created.map(cloneNode),
+      sourceIndexes: [...sourceIndexes],
+      catalog: this.structuralCatalog(),
+    };
   }
 
   read(ranges: readonly NodeRange[], maxChars: number): string {
@@ -119,7 +188,7 @@ export class TurnNodeEditor {
       }
     }
     const rendered = selected.map((node) => [
-      '<node id="' + node.id + '" kind="' + node.kind + '" covers="' + this.coverage(node) + '">',
+      '<node id="' + node.id + '" kind="' + node.kind + '" lands="' + renderIndexes(node.landingIndexes) + '" sources="' + renderIndexes(node.sourceIndexes) + '">',
       node.content,
       '</node>',
     ].join('\n')).join('\n\n');
@@ -144,23 +213,21 @@ export class TurnNodeEditor {
     return index;
   }
 
-  private coverage(node: TurnNodeSnapshot): string {
-    const first = node.originalIndexes[0];
-    const last = node.originalIndexes[node.originalIndexes.length - 1];
-    return first === last ? 'n' + first : 'n' + first + '..n' + last;
-  }
-
   private assertPartition(): void {
-    const flattened = this.nodes.flatMap((node) => node.originalIndexes);
-    if (flattened.length !== this.originalCount) throw new Error('working surface lost or duplicated original coverage');
+    const flattened = this.nodes.flatMap((node) => node.landingIndexes);
+    if (flattened.length !== this.originalCount) throw new Error('working surface lost or duplicated original landing coverage');
     for (let index = 0; index < flattened.length; index += 1) {
-      if (flattened[index] !== index + 1) throw new Error('working surface coverage is not an ordered contiguous partition');
+      if (flattened[index] !== index + 1) throw new Error('working surface landing coverage is not an ordered contiguous partition');
     }
     for (const node of this.nodes) {
-      for (let index = 1; index < node.originalIndexes.length; index += 1) {
-        if (node.originalIndexes[index] !== node.originalIndexes[index - 1] + 1) {
-          throw new Error('node ' + node.id + ' has non-contiguous original coverage');
-        }
+      if (node.landingIndexes.length === 0 || node.landingSeqs.length !== node.landingIndexes.length) {
+        throw new Error('node ' + node.id + ' has invalid landing coverage');
+      }
+      if (node.sourceIndexes.length === 0 || node.sourceSeqs.length !== node.sourceIndexes.length) {
+        throw new Error('node ' + node.id + ' has invalid semantic sources');
+      }
+      for (const index of node.landingIndexes) {
+        if (!node.sourceIndexes.includes(index)) throw new Error('node ' + node.id + ' semantic sources omit landing index n' + index);
       }
     }
   }

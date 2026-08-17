@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
 import { TurnNodeEditor } from './lib/editor.ts';
-import type { NodeRange, TurnNodeKind, TurnNodeSeed, TurnNodeSnapshot } from './lib/editor.ts';
+import { validateProjectedToolProtocol } from './lib/tool-protocol.ts';
+import type { NodeRange, TurnNodeOutput, TurnNodeSeed } from './lib/editor.ts';
 
 const name = 'turn-memory';
 const inject = ['agents', 'sessionQuery', 'sessions', 'subagents', 'tools'];
@@ -15,10 +16,11 @@ const TOOL_NAMES = [
   'list_turn_nodes',
   'read_turn_nodes',
   'replace_turn_nodes',
-  'finish_turn_summary',
+  'finish_turn_compression',
 ];
 
 const DRAFT_SENTINEL = '__DRAFT_PASS__';
+const E2E_USER_SENTINEL = 'E2E-USER-GAMMA-194';
 const E2E_TOOL_SENTINEL = 'E2E-FIXTURE-ALPHA-771';
 const E2E_FINAL_SENTINEL = 'PARENT-FINAL-BETA-332';
 const DEFAULT_SURFACE_DUMP_DIR = fileURLToPath(new URL('.tmp/', import.meta.url));
@@ -31,7 +33,7 @@ interface PluginConfig {
   surfaceDumpDir?: string;
 }
 
-interface SummaryJob {
+interface CompressionJob {
   id: string;
   parentSessionId: string;
   childSessionId?: string;
@@ -86,21 +88,13 @@ function seedOf(event: any): TurnNodeSeed | undefined {
   return undefined;
 }
 
-function prepareJob(agent: any, event: any): SummaryJob | undefined {
+function prepareJob(agent: any, event: any): CompressionJob | undefined {
   const session = agent.session;
   const turn = event.data?.turn;
   if (!Number.isSafeInteger(turn)) return undefined;
   const start = session.events.findLast((candidate: any) => candidate.type === 'turn/start' && candidate.data?.turn === turn);
   if (start === undefined) return undefined;
-  let initialUserSeq: number | undefined;
-  for (let seq = start.seq + 1; seq <= event.seq; seq += 1) {
-    const candidate = session.events[seq];
-    if (candidate?.type === 'user/message' && candidate.surfaceOp === 'append' && candidate.data?.source?.kind === 'user') {
-      initialUserSeq = seq;
-      break;
-    }
-  }
-  const targetSeqs = session.surface.nodes.filter((seq: number) => seq > start.seq && seq <= event.seq && seq !== initialUserSeq);
+  const targetSeqs = session.surface.nodes.filter((seq: number) => seq > start.seq && seq <= event.seq);
   if (targetSeqs.length === 0) return undefined;
   const firstIndex = session.surface.nodes.indexOf(targetSeqs[0]);
   if (firstIndex < 0 || targetSeqs.some((seq: number, index: number) => session.surface.nodes[firstIndex + index] !== seq)) {
@@ -124,60 +118,75 @@ function prepareJob(agent: any, event: any): SummaryJob | undefined {
   };
 }
 
-function buildPrompt(job: SummaryJob, previewChars: number, e2eSmoke: boolean): string {
+function buildPrompt(job: CompressionJob, previewChars: number, e2eSmoke: boolean): string {
   const base = [
-    'Summarize the target surface nodes of the completed parent turn by editing the isolated in-memory working surface.',
-    'The exact conversation content is already present in your inherited context. The catalog below exists only to map that content to editable node ids.',
+    'Compress the editable nodes of the completed parent turn into a shorter transcript while preserving its causal sequence and recognizable user-assistant interaction. Do not replace the interaction with a retrospective assistant-only summary.',
+    'The exact conversation is already present in your inherited context. The catalog maps that content to opaque ids on an isolated in-memory working surface.',
     '',
     '<initial-node-catalog>',
     job.editor.richCatalog(previewChars),
     '</initial-node-catalog>',
     '',
-    'Rules:',
-    '- Use replace_turn_nodes to replace one whole current node or merge one current continuous range into one new node.',
-    '- A successful replacement returns a new r* id and the complete current structural catalog. Shadowed ids are stale. You may refine a generated node by replacing that r* id in a later call.',
-    '- Use read_turn_nodes only if the inherited context and previews are insufficient; it can read several ids/ranges in one call.',
-    '- Do not invent session seqs, surface operations, sourceEventSeqs, message ids, turn/step fields, or tool pairing metadata.',
-    '- Finish only with finish_turn_summary. A plain text answer is not accepted.',
+    'Compression contract:',
+    '- Preserve the order and causal role of requests, responses, steers, corrections, discoveries, failures, decisions, and results. Keep temporally decisive moments separate or high fidelity.',
+    '- Condense low-value continuous working traces and supplementary steers into coherent exchanges. A user-assistant-user-assistant span may become one user node combining the human intent and steer, followed by one assistant node combining the response, adjustment, and outcome.',
+    '- Choose granularity from the interaction. Do not target a fixed node count, and do not collapse the turn to one assistant node by default.',
+    '',
+    'Editing protocol:',
+    '- Use replace_turn_nodes to jointly replace one current node or continuous current range with one or more ordered nodes. Every output may use the entire selected range as context.',
+    '- Successful edits return new r* ids and the complete current structural catalog. Shadowed ids are stale; generated nodes may be selected again for further restructuring or refinement.',
+    '- Leave useful nodes unchanged. Use read_turn_nodes only when inherited context and previews are insufficient; one call can read several ids or ranges.',
+    '- Keep complete tool-call/result interactions together when compressing them. A tool output is valid only as a one-to-one rewrite of one current tool node; otherwise leave the pair intact or absorb the complete interaction into conversational nodes.',
+    '- The host owns session seqs, surface operations, provenance fields, message ids, turn/step fields, and tool pairing metadata.',
+    '- Submit only through finish_turn_compression. A plain text answer is not accepted.',
   ];
   if (e2eSmoke) {
     base.push(
       '',
       'E2E smoke protocol (follow exactly):',
-      '- First replace the entire current range n1..n' + job.editor.originalCount + ' with one assistant node whose draft summary contains both exact sentinels ' + E2E_TOOL_SENTINEL + ' and ' + E2E_FINAL_SENTINEL + ', and also contains ' + DRAFT_SENTINEL + '.',
-      '- Then use the returned r* id in a second replace_turn_nodes call to refine that one node. Preserve both E2E sentinels exactly and remove ' + DRAFT_SENTINEL + '.',
-      '- Finally call finish_turn_summary.',
+      '- First replace the entire current range n1..n' + job.editor.originalCount + ' with exactly two nodes: a user node containing ' + E2E_USER_SENTINEL + ' and ' + DRAFT_SENTINEL + ', followed by an assistant node containing both ' + E2E_TOOL_SENTINEL + ' and ' + E2E_FINAL_SENTINEL + ' and also ' + DRAFT_SENTINEL + '.',
+      '- Then select both returned r* ids in a second replace_turn_nodes call and refine them into exactly one user node followed by one assistant node. Preserve all three E2E sentinels exactly and remove every ' + DRAFT_SENTINEL + '.',
+      '- Finally call finish_turn_compression.',
     );
   }
   return base.join('\n');
 }
 
-function validateLanding(job: SummaryJob, e2eSmoke: boolean): void {
+function validateLanding(job: CompressionJob, e2eSmoke: boolean): void {
   job.editor.validateFinal();
   const nodes = job.editor.snapshot();
+  if (nodes[0].kind !== 'user' || nodes[nodes.length - 1].kind !== 'assistant') {
+    throw new Error('compressed turn must start with a user node and end with an assistant node');
+  }
   if (e2eSmoke) {
     if (job.mutationCount < 2) throw new Error('e2e smoke requires at least two successful replacements');
-    if (nodes.length !== 1 || nodes[0].kind !== 'assistant') throw new Error('e2e smoke requires one final assistant node');
-    if (!nodes[0].content.includes(E2E_TOOL_SENTINEL) || !nodes[0].content.includes(E2E_FINAL_SENTINEL)) {
-      throw new Error('e2e smoke final node must preserve both exact sentinels');
+    if (nodes.length !== 2 || nodes[0].kind !== 'user' || nodes[1].kind !== 'assistant') {
+      throw new Error('e2e smoke requires one final user-assistant exchange');
     }
-    if (nodes[0].content.includes(DRAFT_SENTINEL)) throw new Error('e2e smoke draft sentinel still exists; refine the generated node before finishing');
+    if (!nodes[0].content.includes(E2E_USER_SENTINEL)) throw new Error('e2e smoke user node must preserve its exact sentinel');
+    if (!nodes[1].content.includes(E2E_TOOL_SENTINEL) || !nodes[1].content.includes(E2E_FINAL_SENTINEL)) {
+      throw new Error('e2e smoke assistant node must preserve both exact sentinels');
+    }
+    if (nodes.some((node) => node.content.includes(DRAFT_SENTINEL))) {
+      throw new Error('e2e smoke draft sentinel still exists; refine the generated nodes before finishing');
+    }
   }
   const events = job.session.events;
+  validateProjectedToolProtocol(nodes, events);
   const modelSource = job.targetSeqs.map((seq) => events[seq])
     .find((event) => event?.type === 'assistant/message' && event.data?.message?.source?.kind === 'model')
     ?.data?.message?.source;
   for (const node of nodes) {
     if (node.kind === 'assistant' && modelSource === undefined) throw new Error('assistant output has no original model source to inherit');
     if (node.kind === 'tool') {
-      if (node.sourceSeqs.length !== 1 || events[node.sourceSeqs[0]]?.type !== 'tool/result') {
+      if (node.landingSeqs.length !== 1 || events[node.landingSeqs[0]]?.type !== 'tool/result') {
         throw new Error('tool output must remain a one-to-one tool/result content rewrite');
       }
     }
   }
 }
 
-function land(job: SummaryJob): void {
+function land(job: CompressionJob): void {
   const session = job.session;
   const current = session.surface.nodes;
   const firstIndex = current.indexOf(job.targetSeqs[0]);
@@ -199,15 +208,16 @@ function land(job: SummaryJob): void {
   const marker = {
     kind: 'plugin',
     plugin: 'turn-memory',
-    phase: 'editor-smoke',
+    phase: 'compression',
     turn: job.turn,
     draftId: job.id,
     originalNodes: job.targetSeqs.length,
     mutations: job.mutationCount,
   };
   for (const node of job.editor.snapshot()) {
-    const first = node.sourceSeqs[0];
-    const last = node.sourceSeqs[node.sourceSeqs.length - 1];
+    if (!node.changed) continue;
+    const first = node.landingSeqs[0];
+    const last = node.landingSeqs[node.landingSeqs.length - 1];
     const meta = {
       surfaceOp: { op: 'replace', start: first, end: last },
       sourceEventSeqs: [...node.sourceSeqs],
@@ -270,18 +280,18 @@ function apply(ctx: any, config: PluginConfig = {}): void {
   const surfaceDumpDir = typeof config.surfaceDumpDir === 'string' && config.surfaceDumpDir.trim() !== ''
     ? resolve(config.surfaceDumpDir)
     : DEFAULT_SURFACE_DUMP_DIR;
-  const jobs = new Map<string, SummaryJob>();
-  const stagedFinishes = new WeakMap<object, SummaryJob>();
+  const jobs = new Map<string, CompressionJob>();
+  const stagedFinishes = new WeakMap<object, CompressionJob>();
 
-  const jobFor = (exec: any): SummaryJob => {
+  const jobFor = (exec: any): CompressionJob => {
     const child = exec.agent;
     const parentSessionId = child?.session?.header?.parentSession;
-    if (parentSessionId === undefined) throw new Error('turn-memory editor tools are available only inside the active summary fork');
+    if (parentSessionId === undefined) throw new Error('turn-memory editor tools are available only inside the active compression fork');
     const job = jobs.get(String(parentSessionId));
     if (job === undefined) throw new Error('no active turn-memory job for this fork parent');
     const childSessionId = String(child.session.id);
     if (job.childSessionId !== undefined && job.childSessionId !== childSessionId) {
-      throw new Error('this summary job is bound to a different fork child');
+      throw new Error('this compression job is bound to a different fork child');
     }
     job.childSessionId = childSessionId;
     return job;
@@ -289,7 +299,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
 
   ctx.tools.register(defineTool({
     name: 'list_turn_nodes',
-    description: 'Return the complete rich catalog of the current isolated turn-summary working surface, including current ids, kind, size, original coverage, and preview.',
+    description: 'Return the complete rich catalog of the current isolated turn-compression working surface, including current ids, kind, size, landing position, semantic sources, state, and preview.',
     parameters: {},
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
     isConcurrencySafe: () => true,
@@ -324,26 +334,39 @@ function apply(ctx: any, config: PluginConfig = {}): void {
 
   ctx.tools.register(defineTool({
     name: 'replace_turn_nodes',
-    description: 'Replace one current node or one current continuous range with one new node. Returns the new r* id and the complete current structural catalog; use that new id for later refinement.',
+    description: 'Jointly replace one current node or continuous current range with one or more ordered nodes. All outputs derive from the complete selected range. Returns new r* ids and the complete current structural catalog.',
     parameters: {
       start: { type: 'string', required: true, description: 'First current node id.' },
       end: { type: 'string', description: 'Last current node id, inclusive; omit for one node.' },
-      kind: { type: 'string', required: true, enum: ['user', 'assistant', 'tool'], description: 'Semantic role of the replacement node.' },
-      content: { type: 'string', required: true, description: 'Complete content of the replacement node.' },
+      nodes: {
+        type: 'array',
+        required: true,
+        description: 'Ordered replacement nodes jointly derived from the selected range.',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            kind: { type: 'string', required: true, enum: ['user', 'assistant', 'tool'], description: 'Semantic role. Tool is valid only for a one-to-one rewrite of one current tool node.' },
+            content: { type: 'string', required: true, description: 'Complete content of this output node.' },
+          },
+        },
+      },
     },
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
     isConcurrencySafe: () => false,
     async execute(args, exec) {
       const job = jobFor(exec);
-      const result = job.editor.replace(args.start, args.end, args.kind as TurnNodeKind, args.content);
+      const result = job.editor.replace(args.start, args.end, args.nodes as TurnNodeOutput[]);
       job.mutationCount += 1;
-      return 'created=' + result.created.id + ' covers=' + result.created.originalIndexes.map((index) => 'n' + index).join(',') + '\ncurrent:\n' + result.catalog;
+      return 'created=' + result.created.map((node) => node.id).join(',')
+        + ' jointly-derived-from=' + result.sourceIndexes.map((index) => 'n' + index).join(',')
+        + '\ncurrent:\n' + result.catalog;
     },
   }));
 
   ctx.tools.register(defineTool({
-    name: 'finish_turn_summary',
-    description: 'Validate and submit the current working surface as the authoritative final turn summary. This is the only accepted completion path and concludes the fork turn on success.',
+    name: 'finish_turn_compression',
+    description: 'Validate and submit the current working surface as the authoritative compressed turn transcript. This is the only accepted completion path and concludes the fork turn on success.',
     parameters: {},
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
     isConcurrencySafe: () => false,
@@ -352,7 +375,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
       validateLanding(job, e2eSmoke);
       stagedFinishes.set(exec as object, job);
       exec.concludeTurn();
-      return 'turn summary accepted for commit\n' + job.editor.structuralCatalog();
+      return 'turn compression accepted for commit\n' + job.editor.structuralCatalog();
     },
   }));
 
@@ -363,19 +386,19 @@ function apply(ctx: any, config: PluginConfig = {}): void {
     if (!result.isError) job.finishConfirmed = true;
   });
 
-  const runSummary = async (job: SummaryJob): Promise<void> => {
+  const runCompression = async (job: CompressionJob): Promise<void> => {
     let run: any;
     try {
       run = await ctx.subagents.start('fork', {
-        label: 'turn-memory ' + job.turn,
+        label: 'turn-memory compression ' + job.turn,
         prompt: [{ type: 'text', text: buildPrompt(job, previewChars, e2eSmoke) }],
         parent: job.agent,
         signal: job.controller.signal,
         toolFilter: { allow: TOOL_NAMES },
       });
       const result = await run.result;
-      if (result.stopReason !== 'completed') throw new Error('summary fork ended with ' + JSON.stringify(result.stopReason));
-      if (!job.finishConfirmed) throw new Error('summary fork completed without an authoritative finish_turn_summary result');
+      if (result.stopReason !== 'completed') throw new Error('compression fork ended with ' + JSON.stringify(result.stopReason));
+      if (!job.finishConfirmed) throw new Error('compression fork completed without an authoritative finish_turn_compression result');
       validateLanding(job, e2eSmoke);
       land(job);
       try {
@@ -388,9 +411,9 @@ function apply(ctx: any, config: PluginConfig = {}): void {
       } catch (error) {
         ctx.logger.warn('turn-memory: surface snapshot failed: ' + (error instanceof Error ? error.message : String(error)));
       }
-      ctx.logger.info('turn-memory: turn ' + job.turn + ' smoke summary landed (' + job.targetSeqs.length + ' -> ' + job.editor.snapshot().length + ', mutations=' + job.mutationCount + ')');
+      ctx.logger.info('turn-memory: turn ' + job.turn + ' compression landed (' + job.targetSeqs.length + ' -> ' + job.editor.snapshot().length + ', mutations=' + job.mutationCount + ')');
     } catch (error) {
-      ctx.logger.warn('turn-memory: turn ' + job.turn + ' summary failed: ' + (error instanceof Error ? error.message : String(error)));
+      ctx.logger.warn('turn-memory: turn ' + job.turn + ' compression failed: ' + (error instanceof Error ? error.message : String(error)));
     } finally {
       jobs.delete(job.parentSessionId);
       if (run !== undefined) {
@@ -402,7 +425,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
   ctx.on('session/event', (session: any, event: any) => {
     if (event.type !== 'turn/end' || session.header?.parentSession !== undefined) return;
     if (jobs.has(String(session.id))) {
-      ctx.logger.warn('turn-memory: skipped turn ' + String(event.data?.turn) + ' because a summary job is already active for this parent');
+      ctx.logger.warn('turn-memory: skipped turn ' + String(event.data?.turn) + ' because a compression job is already active for this parent');
       return;
     }
     const agent = ctx.agents.get(session.id);
@@ -411,7 +434,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
       const job = prepareJob(agent, event);
       if (job === undefined) return;
       jobs.set(job.parentSessionId, job);
-      queueMicrotask(() => void runSummary(job));
+      queueMicrotask(() => void runCompression(job));
     } catch (error) {
       ctx.logger.warn('turn-memory: could not prepare turn ' + String(event.data?.turn) + ': ' + (error instanceof Error ? error.message : String(error)));
     }

@@ -198,3 +198,58 @@
 - fork worker仍携带完整 completed parent prefix；普通 pressure trigger 必须为其 prompt、工具轮次和输出预留 headroom。context overflow 时 fork 可能立即失败，fresh spawn 是必要的恢复路径，而不是 range-limited fork。
 - segment token 数来自 token-meter 的 surface-node估价，不是 worker prompt 的精确 provider tokenizer 数；segment budget 和 read character cap 都需要保守配置。
 - 当前 working checkpoint 只在内存中可续跑。它支持更换 child 继续同一进程内 job，但不把半成品持久化为可跨进程恢复的 session 状态；进程突然停止后由未闭合 compaction marker 暴露失败，原 surface 仍未被替换。
+
+## D-007：turn compression 的新 fork 续跑
+
+状态：**已确认**
+
+### 约定
+
+- turn compression 的 working surface 继续由 host 内的 `TurnNodeEditor` 持有。每次成功的 `replace_turn_nodes` 都立即成为该 job 已接受的内存状态；worker 自身是否随后正常结束，不回滚这些 mutation。
+- worker 未通过 `finish_turn_compression` 权威完成时，本次 worker 失败。插件先 dispose 当前 child，再从同一个 parent 启动全新的 fork，并把 editor 的最新完整目录放进新 prompt。`turnWorkerAttempts` 限制的是连续未产生 accepted replacement 的失败 worker 数，默认三个；任何一次成功的 `replace_turn_nodes` 都把该预算重置。只要持续产生 accepted progress，worker 总数不受这个值限制；连续无进展失败耗尽预算后才放弃整个 job，父 surface 始终保持原样。
+- 不继续使用已经失败的 child：context overflow 的直接成因可能正是其累积的 reasoning／tool history。新 fork 清空这段 worker-local 历史，同时仍从 parent 继承原 completed turn 的语义背景。
+- current catalog 是编辑结构的唯一事实源。`n*` 表示尚未被该 job 改写的 original node；`r*` 表示本 worker 或更早 worker 已成功写入 host editor 的 replacement，不是临时草稿。parent fork seed 仍是原 transcript，不含 `r*` 的完整新正文；恢复 worker 必须按当前 ids 继续，并在 preview 不足时用 `read_turn_nodes` 读取精确内容。
+- 每个 worker 只允许其当前 child 调用工具。切换 worker 前清空 child binding；前一个 run quiesce 后才绑定新 child，因此旧 worker 不能用 stale ids 与恢复 worker 并发修改 editor。
+- 任意非 authoritative completion 都按有无 accepted progress 更新连续无进展预算，包括 provider error、context overflow 映射后的 `error`、max-tokens、基础设施异常，以及 child 正常停止但漏掉 finish。有 replacement 就重置预算并续跑；没有 replacement 就消耗一次预算。父 job 的 cancellation 直接终止，不启动恢复 worker。
+- landing provenance 记录实际使用的 worker 总数。真实 E2E 把连续无进展预算设为一，在首个 worker 完成一次 replacement 后强制其无 finish 结束；该进展重置预算，因而第二个 fork 仍能识别已接受的 `r*`、继续二次改写、finish、落地并通过冷加载。
+
+### 可行性依据
+
+- `SubagentRun.result` 只把 child 失败归一为非 `completed` stop reason，provider 的 `CONTEXT_WINDOW_EXCEEDED` 细节仍保存在 child log；续跑协议无需依赖易变的错误文本，因为任何未 finish 的 attempt 都不能提交，而 editor 是否已有进度可由 host 直接观察。
+- one-shot `dispose()` 会等待 child resource quiescence，随后再次 `start('fork', { parent })` 会创建新的 child session。`TurnNodeEditor`、opaque id 计数器、semantic sources 与 landing partition 都位于插件 job，不随 child dispose 丢失。
+- replacement 工具返回当前目录，prompt 又在每个 worker 启动时嵌入同一 editor 的 rich catalog；恢复 worker 因此能从最新结构开始，不需要 replay 前一个 worker 的隐藏 reasoning 或工具调用。
+
+### 已知边界
+
+- 续跑状态只存在于当前进程的 job 内；Web 进程突然终止后不会恢复半成品，但父 surface 仍未被替换。
+- 如果 parent seed 加初始 prompt 在第一次模型请求前就已超过 context window，且没有任何工具 mutation 可以成为续跑进度，重复 fork 不会缩小输入；连续无进展预算会让 job 有界失败。该场景需要另行设计不继承完整 parent 的 source-range／fresh-spawn 路径。
+
+## D-008：completed turn 的重启恢复与串行回补
+
+状态：**已确认**
+
+### 约定
+
+- 实时 `turn/end` 与进程重启后的恢复使用同一个 per-root-session 待处理队列。已有 turn compression job 时，新完成的 turn 只排队而不丢弃；同一 session 始终只有一个 drain 和一个 active compression job，按最旧 turn 优先串行处理。
+- root agent 每次 `agent/created` 时扫描 append-only session events 中所有合法 `turn/end`，而非只检查最后一个 turn。凡没有 durable turn-memory compression marker 的 completed turn 均加入队列；因此 Web 在 `turn/end` 后、replacement 落地前停止时，下次 cold resume 会重新执行该 turn。
+- 已完成判断以每个 turn 最新的 durable `turn/end` 为准。已落地判断扫描完整事件日志中 `source.plugin=turn-memory`、`phase=compression`、匹配 turn number 的 marker，不只扫描当前 surface；即使 marker 后来被 session checkpoint 遮蔽，也不得把该 turn 当作漏压缩重新执行。
+- subagent 可以权威 finish 一个已经足够紧凑、无需 mutation 的 turn。DSH 尚无第三方 log-only event 注册面，因此 no-op landing 用该 turn 第一个 current user node 的 exact-content 1→1 positional replacement 持久化：正文、角色和 surface 位置不变，只生成新的 message identity 并携带 turn-memory marker。它不是为了伪造压缩量，而是让“已审视且无需改写”成为可冷加载的幂等事实；不得用强制 mutation 逼模型扩写短 turn。
+- job prepare 后必须先做 host-side 可满足性检查。若 completed turn 以 user 开始但没有任何非空 assistant transcript（典型场景是第一份模型请求立即 error／abort），不得启动 compression worker：纯 replacement 无法从单一 user landing 产生满足 `user → assistant` 的两个节点，模型也不得根据隐藏上下文编造未发生的 assistant 结果。host 直接保留原 surface、写入上述 no-op marker，并记录 `workerAttempts=0`。
+- 队列真正开始某个 turn 前重新读取当前 agent/session、marker、目标 `turn/end` 和 current surface range，不持有恢复扫描时的陈旧 surface 计划。目标已被其他 rewrite 遮蔽或不再构成可压缩 current range 时，本轮记录原因并跳过，不试图复活已离开 surface 的原始节点。
+- `agent` 暂时不可用、队列正在处理其他 turn、目标缺少 durable `turn/end`、无 eligible current range、prepare 失败和 worker 失败都必须有可定位 session/turn 的日志，不能再通过无声 return 表现为“没有触发”。agent 不可用时保留队列，等待下一次 `agent/created`；worker 有界失败后本进程继续后续 turn，且由于没有落地 marker，下次 agent 恢复仍可再次回补。
+- per-session queue 的完整 drain promise 是 turn rewrite 与 session compaction 之间的 barrier。新 turn 在 active drain 期间加入时必须由同一 drain 接着处理；drain 退出边界上出现的新 work 必须启动下一次 drain，不能因 promise 清理竞态永久滞留。
+
+### 可行性依据
+
+- root session 的 completed-turn 事实、turn number 和原消息都已持久化在 append-only events；successful landing 又会在 replacement user/assistant event 上写入 turn-memory marker，所以恢复所需的“候选集合减已完成集合”不依赖进程内状态或 child session。
+- `agent/created` 在新建和 cold resume 时均提供已加载的 agent/session；过滤 `header.parentSession` 后不会把 compression fork child 纳入 root recovery。实际 fork 仍需 active parent agent，因此无 agent 时只能排队，不能仅凭 detached session 启动。
+- rc.6 与 rc.7 的 detached surface probe 均验证了 no-op marker 路径：替换前后的 `deriveMessages()` 文本和角色完全一致，实时 surface 与完整 `foldSurface()` 都得到同一 `[marker user, original assistant]` 顺序。
+- 历史实例 `session-6cee…` 的首 turn 只有一个 1080 字 user 节点；旧 worker 在不可同时满足“两种角色”和“最多一个 landing output”的条件下执行了 31 次 replacement、8 次失败 finish，最终才因 transport error 停止。该实例证明重试预算不能修复 host 提交的不可满足问题，必须在 fork 前旁路。
+- current surface 在每次 job prepare 时重新计算，且最终 landing 前已有连续范围稳定性校验。多个 missed turn 可以从旧到新依次替换互不相交的 current ranges；某一个失败也不要求阻断后续 turn。
+- restart-recovery E2E 故意让 live `turn/end` 不启动压缩，flush 并销毁 parent agent，再 cold resume 同一 session。恢复扫描随后完成真实 fork、跨 worker 续跑和 6→2 landing；第二次 cold resume 验证 durable marker 去重且 replacement seq identity 不变。
+
+### 已知边界
+
+- D-007 的 accepted `r*` working state 仍只存在当前进程。进程停止后的恢复粒度是整个尚未落地的 turn，不会继续停止前 child 的半成品；父 surface 未提交，因此重做是安全的。
+- 恢复只能处理仍有 eligible current surface range 的 turn。若另一个 compaction/rewrite 已经遮蔽原目标而又没有 turn-memory marker，本实现记录 skip，但没有 durable 的“不可恢复”墓碑；后续每次 cold resume 仍可能再次发现并快速跳过该 turn。
+- 本条不提供跨进程 exactly-once 执行。它提供 durable landing detection 和 at-least-once recovery；设计继续采用 D-001 的单进程、同步 landing 假设，不处理在多个 replacement append 中间强制终止造成的部分提交。

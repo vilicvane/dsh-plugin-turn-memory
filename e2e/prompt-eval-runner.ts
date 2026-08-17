@@ -4,6 +4,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
+import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { foldSurface } from '@deepseek-ai/dsh-session';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
@@ -112,7 +113,7 @@ async function run(ctx: any): Promise<void> {
   let steerSent = false;
   const setup = (agentCtx: any) => {
     installModelSelection(agentCtx, {
-      current: { ...selection, reasoningEffort: 'max' },
+      current: { ...selection },
       assembled: undefined,
     });
     agentCtx.tools.restrict({ allow: [] });
@@ -124,28 +125,26 @@ async function run(ctx: any): Promise<void> {
       },
       output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
       isConcurrencySafe: () => false,
-      async execute(args) {
+      async execute(args, exec) {
         const target = String(args.target);
         inspected.push(target);
         if (target === '/repo') {
+          if (!steerSent) {
+            if (exec.agent === undefined) throw new Error('inspect_home_fixture has no owning agent');
+            steerSent = true;
+            exec.agent.steer(createUserMessage({
+              content: [{
+                type: 'text',
+                text: '刚才目录说错了：我一开始指的就是 playground，不是 /repo。前面的检查算作因口误走偏的试错。',
+              }],
+              source: { kind: 'user' },
+            }));
+          }
           return 'The attempt failed because /repo does not exist, so it produced no device conclusion.';
         }
         return 'Conclusion from packages/playground/src/program/home.ts: the home declares 6 device types and 9 device instances.';
       },
     }));
-    agentCtx.on('agent/turn-stopping', ({ agent }: any) => {
-      if (steerSent || inspected.length !== 1 || inspected[0] !== '/repo') return;
-      steerSent = true;
-      agent.steer({
-        id: randomUUID(),
-        role: 'user',
-        content: [{
-          type: 'text',
-          text: '刚才目录说错了：我一开始指的就是 playground，不是 /repo。前面的检查算作因口误走偏的试错。',
-        }],
-        source: { kind: 'user' },
-      });
-    });
   };
 
   let liveHandle: any;

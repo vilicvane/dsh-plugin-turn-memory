@@ -17,6 +17,13 @@ import {
 } from './lib/prompt.ts';
 import { validateProjectedToolProtocol } from './lib/tool-protocol.ts';
 import { SessionMemoryCompactionEngine } from './lib/session-compaction.ts';
+import {
+  appendNoopCompressionMarker,
+  completedTurnEnds,
+  compressedTurnNumbers,
+  findCompletedTurnEnd,
+  turnCompressionBypassReason,
+} from './lib/turn-recovery.ts';
 import type { SessionCompactionConfig } from './lib/session-compaction.ts';
 import type { NodeRange, TurnNodeOutput, TurnNodeSeed } from './lib/editor.ts';
 
@@ -35,7 +42,10 @@ const DEFAULT_SURFACE_DUMP_DIR = fileURLToPath(new URL('.tmp/', import.meta.url)
 interface PluginConfig {
   enabled?: boolean;
   turnCompression?: boolean;
+  turnWorkerAttempts?: number;
   e2eSmoke?: boolean;
+  e2eInterruptAfterFirstMutation?: boolean;
+  e2eDeferTurnCompressionUntilResume?: boolean;
   previewChars?: number;
   maxReadChars?: number;
   surfaceDumpDir?: string;
@@ -54,6 +64,7 @@ interface CompressionJob {
   controller: AbortController;
   mutationCount: number;
   finishConfirmed: boolean;
+  workerNumber: number;
 }
 
 function seedOf(event: any): TurnNodeSeed | undefined {
@@ -74,7 +85,7 @@ function prepareJob(agent: any, event: any): CompressionJob | undefined {
   const turn = event.data?.turn;
   if (!Number.isSafeInteger(turn)) return undefined;
   const start = session.events.findLast((candidate: any) => candidate.type === 'turn/start' && candidate.data?.turn === turn);
-  if (start === undefined) return undefined;
+  if (start === undefined) throw new Error('turn ' + turn + ' has a durable turn/end but no matching turn/start');
   const targetSeqs = session.surface.nodes.filter((seq: number) => {
     if (seq <= start.seq || seq > event.seq) return false;
     const source = session.events[seq]?.data?.source;
@@ -102,6 +113,7 @@ function prepareJob(agent: any, event: any): CompressionJob | undefined {
     controller: new AbortController(),
     mutationCount: 0,
     finishConfirmed: false,
+    workerNumber: 0,
   };
 }
 
@@ -166,8 +178,13 @@ function land(job: CompressionJob): void {
     draftId: job.id,
     originalNodes: job.targetSeqs.length,
     mutations: job.mutationCount,
+    workerAttempts: job.workerNumber,
   };
-  for (const node of job.editor.snapshot()) {
+  const nodes = job.editor.snapshot();
+  if (nodes.every((node) => !node.changed)) {
+    appendNoopCompressionMarker(session, events[job.targetSeqs[0]], marker);
+  }
+  for (const node of nodes) {
     if (!node.changed) continue;
     const first = node.landingSeqs[0];
     const last = node.landingSeqs[node.landingSeqs.length - 1];
@@ -237,12 +254,20 @@ function apply(ctx: any, config: PluginConfig = {}): void {
   }
   const previewChars = Number.isSafeInteger(config.previewChars) && (config.previewChars ?? 0) > 0 ? config.previewChars! : 120;
   const maxReadChars = Number.isSafeInteger(config.maxReadChars) && (config.maxReadChars ?? 0) > 0 ? config.maxReadChars! : 30000;
+  const turnNoProgressAttempts = Number.isSafeInteger(config.turnWorkerAttempts) && (config.turnWorkerAttempts ?? 0) > 0
+    ? config.turnWorkerAttempts!
+    : 3;
   const e2eSmoke = config.e2eSmoke === true;
+  const e2eInterruptAfterFirstMutation = config.e2eInterruptAfterFirstMutation === true;
+  const e2eDeferTurnCompressionUntilResume = config.e2eDeferTurnCompressionUntilResume === true;
   const surfaceDumpDir = typeof config.surfaceDumpDir === 'string' && config.surfaceDumpDir.trim() !== ''
     ? resolve(config.surfaceDumpDir)
     : DEFAULT_SURFACE_DUMP_DIR;
   const jobs = new Map<string, CompressionJob>();
+  const pendingTurns = new Map<string, Map<number, Set<string>>>();
+  const pumps = new Map<string, Promise<void>>();
   const stagedFinishes = new WeakMap<object, CompressionJob>();
+  let disposed = false;
 
   const jobFor = (exec: any): CompressionJob => {
     const child = exec.agent;
@@ -260,7 +285,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
 
   ctx.tools.register(defineTool({
     name: 'list_turn_nodes',
-    description: 'Return the complete rich catalog of the current isolated turn-compression working surface, including current ids, kind, size, landing position, semantic sources, state, and preview.',
+    description: 'Return the complete rich catalog of the authoritative host-owned turn working surface. Current n* ids are unchanged original nodes; current r* ids are accepted rewrites produced by this or an earlier worker.',
     parameters: {},
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
     isConcurrencySafe: () => true,
@@ -271,7 +296,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
 
   ctx.tools.register(defineTool({
     name: 'read_turn_nodes',
-    description: 'Read the exact current content of several node ids or continuous ranges in one call. Use generated r* ids after edits; shadowed ids are stale.',
+    description: 'Read exact content from the current host-owned working surface. A current r* node is accepted compressed work that may not appear in inherited parent context. Several ids or continuous ranges may be read in one call; shadowed ids are stale.',
     parameters: {
       ranges: {
         type: 'array',
@@ -295,7 +320,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
 
   ctx.tools.register(defineTool({
     name: 'replace_turn_nodes',
-    description: 'Jointly replace one current node or continuous current range with one or more ordered nodes. Select a range containing every current node whose information the outputs use; all outputs derive from that complete range. A tool output is allowed only as the sole output replacing exactly one current tool node. Returns new r* ids and the complete current structural catalog.',
+    description: 'Jointly replace one current node or continuous current range with one or more ordered nodes. Select a range containing every current node whose information the outputs use; all outputs derive from that complete range. A tool output is allowed only as the sole output replacing exactly one current tool node. The host immediately accepts the outputs as new r* working nodes and returns the complete current structural catalog.',
     parameters: {
       start: { type: 'string', required: true, description: 'First current node id.' },
       end: { type: 'string', description: 'Last current node id, inclusive; omit for one node.' },
@@ -319,15 +344,19 @@ function apply(ctx: any, config: PluginConfig = {}): void {
       const job = jobFor(exec);
       const result = job.editor.replace(args.start, args.end, args.nodes as TurnNodeOutput[]);
       job.mutationCount += 1;
-      return 'created=' + result.created.map((node) => node.id).join(',')
+      const output = 'created=' + result.created.map((node) => node.id).join(',')
         + ' jointly-derived-from=' + result.sourceIndexes.map((index) => 'n' + index).join(',')
         + '\ncurrent:\n' + result.catalog;
+      if (e2eInterruptAfterFirstMutation && job.workerNumber === 1 && job.mutationCount === 1) {
+        exec.concludeTurn();
+      }
+      return output;
     },
   }));
 
   ctx.tools.register(defineTool({
     name: 'finish_turn_compression',
-    description: 'Validate and submit the current working surface as the authoritative compressed turn transcript. This is the only accepted completion path and concludes the fork turn on success.',
+    description: 'Validate and submit the complete current host-owned working surface as the authoritative compressed turn transcript. This is the only accepted completion path and concludes the active worker on success.',
     parameters: {},
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
     isConcurrencySafe: () => false,
@@ -347,67 +376,239 @@ function apply(ctx: any, config: PluginConfig = {}): void {
     if (!result.isError) job.finishConfirmed = true;
   });
 
-  const runCompression = async (job: CompressionJob): Promise<void> => {
-    let run: any;
+  const persistLanding = async (job: CompressionJob): Promise<void> => {
     try {
-      run = await ctx.subagents.start('fork', {
-        label: 'turn-memory compression ' + job.turn,
-        prompt: [{ type: 'text', text: buildCompressionPrompt(job.editor, previewChars, e2eSmoke) }],
-        parent: job.agent,
-        signal: job.controller.signal,
-        toolFilter: { allow: TOOL_NAMES },
-      });
-      const result = await run.result;
-      if (result.stopReason !== 'completed') throw new Error('compression fork ended with ' + JSON.stringify(result.stopReason));
-      if (!job.finishConfirmed) throw new Error('compression fork completed without an authoritative finish_turn_compression result');
+      await ctx.sessions.flush(job.session);
+      const snapshot = await ctx.sessionQuery.readSurface(job.parentSessionId);
+      const surfacePath = resolve(surfaceDumpDir, 'e2e-surface-' + encodeURIComponent(job.parentSessionId) + '.json');
+      await mkdir(surfaceDumpDir, { recursive: true });
+      await writeFile(surfacePath, JSON.stringify(snapshot, null, 2) + '\n', 'utf8');
+      ctx.logger.info('turn-memory: surface snapshot written to ' + surfacePath);
+    } catch (error) {
+      ctx.logger.warn('turn-memory: surface snapshot failed: ' + (error instanceof Error ? error.message : String(error)));
+    }
+  };
+
+  const runCompression = async (job: CompressionJob): Promise<void> => {
+    try {
+      let completed = false;
+      let lastError: unknown;
+      let noProgressAttempts = 0;
+      while (noProgressAttempts < turnNoProgressAttempts) {
+        job.controller.signal.throwIfAborted();
+        job.workerNumber += 1;
+        job.childSessionId = undefined;
+        job.finishConfirmed = false;
+        const mutationsBefore = job.mutationCount;
+        let run: any;
+        try {
+          run = await ctx.subagents.start('fork', {
+            label: 'turn-memory compression ' + job.turn + ' (worker ' + job.workerNumber + ')',
+            prompt: [{
+              type: 'text',
+              text: buildCompressionPrompt(job.editor, {
+                previewChars,
+                e2eSmoke,
+                workerNumber: job.workerNumber,
+                acceptedMutations: job.mutationCount,
+              }),
+            }],
+            parent: job.agent,
+            signal: job.controller.signal,
+            toolFilter: { allow: TOOL_NAMES },
+          });
+          const result = await run.result;
+          if (result.stopReason !== 'completed') {
+            throw new Error('compression fork ended with ' + JSON.stringify(result.stopReason));
+          }
+          if (!job.finishConfirmed) {
+            throw new Error('compression fork completed without an authoritative finish_turn_compression result');
+          }
+          completed = true;
+          break;
+        } catch (error) {
+          lastError = error;
+          if (job.controller.signal.aborted) job.controller.signal.throwIfAborted();
+          const accepted = job.mutationCount - mutationsBefore;
+          if (accepted > 0) {
+            noProgressAttempts = 0;
+          } else {
+            noProgressAttempts += 1;
+          }
+          const continuation = noProgressAttempts < turnNoProgressAttempts
+            ? '; starting a new fork from ' + job.mutationCount + ' accepted mutation(s)'
+            : '';
+          const progress = accepted > 0
+            ? '; accepted progress reset consecutive no-progress attempts to 0/' + turnNoProgressAttempts
+            : '; consecutive no-progress attempts=' + noProgressAttempts + '/' + turnNoProgressAttempts;
+          ctx.logger.warn('turn-memory: turn ' + job.turn + ' worker ' + job.workerNumber
+            + ' failed after ' + accepted + ' new mutation(s): '
+            + (error instanceof Error ? error.message : String(error)) + progress + continuation);
+        } finally {
+          if (run !== undefined) {
+            try { await run.dispose(); } catch { /* best-effort child cleanup */ }
+          }
+        }
+      }
+      if (!completed) {
+        throw new Error('compression exhausted ' + turnNoProgressAttempts
+          + ' consecutive no-progress worker attempts', { cause: lastError });
+      }
       validateLanding(job, e2eSmoke);
       land(job);
-      try {
-        await ctx.sessions.flush(job.session);
-        const snapshot = await ctx.sessionQuery.readSurface(job.parentSessionId);
-        const surfacePath = resolve(surfaceDumpDir, 'e2e-surface-' + encodeURIComponent(job.parentSessionId) + '.json');
-        await mkdir(surfaceDumpDir, { recursive: true });
-        await writeFile(surfacePath, JSON.stringify(snapshot, null, 2) + '\n', 'utf8');
-        ctx.logger.info('turn-memory: surface snapshot written to ' + surfacePath);
-      } catch (error) {
-        ctx.logger.warn('turn-memory: surface snapshot failed: ' + (error instanceof Error ? error.message : String(error)));
-      }
-      ctx.logger.info('turn-memory: turn ' + job.turn + ' compression landed (' + job.targetSeqs.length + ' -> ' + job.editor.snapshot().length + ', mutations=' + job.mutationCount + ')');
+      await persistLanding(job);
+      ctx.logger.info('turn-memory: turn ' + job.turn + ' compression landed (' + job.targetSeqs.length + ' -> '
+        + job.editor.snapshot().length + ', mutations=' + job.mutationCount + ', workerAttempts=' + job.workerNumber + ')');
     } catch (error) {
       ctx.logger.warn('turn-memory: turn ' + job.turn + ' compression failed: ' + (error instanceof Error ? error.message : String(error)));
     } finally {
-      jobs.delete(job.parentSessionId);
-      if (run !== undefined) {
-        try { await run.dispose(); } catch { /* best-effort child cleanup */ }
+      if (jobs.get(job.parentSessionId) === job) jobs.delete(job.parentSessionId);
+    }
+  };
+
+  const enqueueTurn = (sessionId: string, turn: number, source: string): boolean => {
+    if (!Number.isSafeInteger(turn)) {
+      ctx.logger.warn('turn-memory: ignored ' + source + ' with invalid turn ' + String(turn) + ' for session ' + sessionId);
+      return false;
+    }
+    let turns = pendingTurns.get(sessionId);
+    if (turns === undefined) {
+      turns = new Map();
+      pendingTurns.set(sessionId, turns);
+    }
+    let sources = turns.get(turn);
+    const added = sources === undefined;
+    if (sources === undefined) {
+      sources = new Set();
+      turns.set(turn, sources);
+    }
+    sources.add(source);
+    return added;
+  };
+
+  const drainTurns = async (sessionId: string): Promise<void> => {
+    while (!disposed) {
+      const turns = pendingTurns.get(sessionId);
+      const nextTurn = turns === undefined ? undefined : [...turns.keys()].sort((left, right) => left - right)[0];
+      if (nextTurn === undefined) {
+        pendingTurns.delete(sessionId);
+        return;
+      }
+      const agent = ctx.agents.get(sessionId);
+      if (agent === undefined) {
+        ctx.logger.warn('turn-memory: session ' + sessionId + ' has ' + turns!.size
+          + ' queued turn(s), but its agent is unavailable; they will be retried when the agent is created');
+        return;
+      }
+      const sources = [...(turns!.get(nextTurn) ?? [])].join(', ');
+      turns!.delete(nextTurn);
+      if (turns!.size === 0) pendingTurns.delete(sessionId);
+      if (compressedTurnNumbers(agent.session).has(nextTurn)) {
+        ctx.logger.info('turn-memory: turn ' + nextTurn + ' is already compressed; removed duplicate queued work');
+        continue;
+      }
+      const event = findCompletedTurnEnd(agent.session, nextTurn);
+      if (event === undefined) {
+        ctx.logger.warn('turn-memory: queued turn ' + nextTurn + ' from ' + sources
+          + ' has no durable turn/end in session ' + sessionId);
+        continue;
+      }
+      try {
+        const job = prepareJob(agent, event);
+        if (job === undefined) {
+          ctx.logger.warn('turn-memory: turn ' + nextTurn + ' from ' + sources
+            + ' has no eligible current surface range; it may already be shadowed by another rewrite');
+          continue;
+        }
+        const bypassReason = turnCompressionBypassReason(job.editor.snapshot());
+        if (bypassReason !== undefined) {
+          ctx.logger.info('turn-memory: recording turn ' + nextTurn + ' as a durable no-op without a worker: ' + bypassReason);
+          land(job);
+          await persistLanding(job);
+          ctx.logger.info('turn-memory: turn ' + nextTurn + ' no-op marker landed (' + job.targetSeqs.length
+            + ' nodes, workerAttempts=0)');
+          continue;
+        }
+        jobs.set(sessionId, job);
+        ctx.logger.info('turn-memory: starting turn ' + nextTurn + ' compression from ' + sources);
+        await runCompression(job);
+      } catch (error) {
+        ctx.logger.warn('turn-memory: could not prepare or process turn ' + nextTurn + ' from ' + sources + ': '
+          + (error instanceof Error ? error.message : String(error)));
       }
     }
   };
 
-  ctx.on('session/event', (session: any, event: any) => {
-    if (event.type !== 'turn/end' || session.header?.parentSession !== undefined) return;
-    if (jobs.has(String(session.id))) {
-      ctx.logger.warn('turn-memory: skipped turn ' + String(event.data?.turn) + ' because a compression job is already active for this parent');
+  const ensurePump = (sessionId: string): void => {
+    if (disposed || pumps.has(sessionId)) return;
+    if (ctx.agents.get(sessionId) === undefined) {
+      const count = pendingTurns.get(sessionId)?.size ?? 0;
+      ctx.logger.warn('turn-memory: queued ' + count + ' turn(s) for session ' + sessionId
+        + ', but no agent is currently available');
       return;
     }
-    const agent = ctx.agents.get(session.id);
-    if (agent === undefined) return;
-    try {
-      const job = prepareJob(agent, event);
-      if (job === undefined) return;
-      jobs.set(job.parentSessionId, job);
-      queueMicrotask(() => {
-        const work = runCompression(job);
-        coordinator.trackTurnRewrite(job.parentSessionId, work);
-        void work;
-      });
-    } catch (error) {
-      ctx.logger.warn('turn-memory: could not prepare turn ' + String(event.data?.turn) + ': ' + (error instanceof Error ? error.message : String(error)));
+    const work = Promise.resolve().then(() => drainTurns(sessionId));
+    pumps.set(sessionId, work);
+    coordinator.trackTurnRewrite(sessionId, work);
+    void work.finally(() => {
+      if (pumps.get(sessionId) === work) pumps.delete(sessionId);
+      if (!disposed && (pendingTurns.get(sessionId)?.size ?? 0) > 0 && ctx.agents.get(sessionId) !== undefined) {
+        queueMicrotask(() => ensurePump(sessionId));
+      }
+    }).catch((error) => {
+      ctx.logger.warn('turn-memory: turn queue for session ' + sessionId + ' failed: '
+        + (error instanceof Error ? error.message : String(error)));
+    });
+  };
+
+  ctx.on('session/event', (session: any, event: any) => {
+    if (event.type !== 'turn/end' || session.header?.parentSession !== undefined) return;
+    const sessionId = String(session.id);
+    const turn = event.data?.turn;
+    if (e2eDeferTurnCompressionUntilResume) {
+      ctx.logger.info('turn-memory: e2e deferred live turn ' + String(turn) + ' until agent resume recovery');
+      return;
     }
+    const added = enqueueTurn(sessionId, turn, 'live turn/end');
+    if (added && jobs.has(sessionId)) {
+      ctx.logger.info('turn-memory: queued turn ' + String(turn) + ' behind the active compression for session ' + sessionId);
+    }
+    if (ctx.agents.get(sessionId) === undefined) {
+      ctx.logger.warn('turn-memory: queued turn ' + String(turn) + ' from turn/end, but session ' + sessionId
+        + ' has no active agent; recovery will retry it on agent creation');
+    }
+    queueMicrotask(() => ensurePump(sessionId));
+  });
+
+  ctx.on('agent/created', ({ agent }: any) => {
+    const session = agent?.session;
+    if (session === undefined || session.header?.parentSession !== undefined) return;
+    queueMicrotask(() => {
+      if (disposed) return;
+      const sessionId = String(session.id);
+      const ends = completedTurnEnds(session);
+      const compressed = compressedTurnNumbers(session);
+      let queued = 0;
+      for (const end of ends) {
+        if (compressed.has(end.data.turn)) continue;
+        if (enqueueTurn(sessionId, end.data.turn, 'agent recovery scan')) queued += 1;
+      }
+      if (ends.length > 0 || (pendingTurns.get(sessionId)?.size ?? 0) > 0) {
+        const landed = ends.filter((end) => compressed.has(end.data.turn)).length;
+        ctx.logger.info('turn-memory: recovery scan for session ' + sessionId + ': completed=' + ends.length
+          + ', compressed=' + landed + ', newlyQueued=' + queued
+          + ', pending=' + (pendingTurns.get(sessionId)?.size ?? 0));
+      }
+      ensurePump(sessionId);
+    });
   });
 
   ctx.effect(() => () => {
+    disposed = true;
     for (const job of jobs.values()) job.controller.abort();
     jobs.clear();
+    pendingTurns.clear();
+    pumps.clear();
   });
 }
 

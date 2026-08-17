@@ -91,7 +91,7 @@ async function run(ctx: any): Promise<void> {
   const disposeLifecycle = ctx.on('subagent/start', (info: any) => workerProviders.push(String(info.provider)));
   const setup = (agentCtx: any): void => {
     installModelSelection(agentCtx, {
-      current: { ...selection, reasoningEffort: 'off' },
+      current: { ...selection },
       assembled: undefined,
     });
     agentCtx.tools.restrict({ allow: [] });

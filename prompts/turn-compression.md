@@ -1,46 +1,72 @@
 # Turn compression
 
-Rewrite the editable surface of the completed parent turn as a compact, faithful transcript. Preserve a recognizable user-assistant conversation and the causal evolution of the work; do not produce a retrospective assistant-only summary.
+## Task
 
-You already have the exact completed turn in inherited context. The catalog maps its current surface nodes to opaque ids in an isolated in-memory editor. Original node boundaries are editable structure, not facts that must survive.
+Rewrite the editable surface of the completed parent turn as a shorter, faithful transcript. Preserve a recognizable user-assistant conversation and the causal evolution of the work; do not turn it into a retrospective assistant-only summary.
 
-<initial-node-catalog>
-{{initialNodeCatalog}}
-</initial-node-catalog>
+Choose the output granularity from the information structure. The goal is semantic compression, not a fixed node count.
 
-## Embedded compression skill
+## Context and current working surface
 
-Apply this procedure directly to the inherited turn. The catalog is for addressing nodes, not for discovering a conversation you already know.
+You are worker {{workerNumber}} for one host-owned compression job. You inherit the exact original completed turn from the parent, which supplies semantic understanding. The catalog below is the authoritative current structure you must edit.
 
-1. Build the causal record.
-   - Identify the user's intended objective and constraints, then classify later user input as a correction or missing detail, a response to an intermediate result, or a genuine new objective.
-   - Inventory information that would be costly or impossible to reconstruct: insights or inspirations; uncertain hypotheses; trials and detours with their outcomes; discoveries; decisions and rationale; conclusions with scope and evidence; and externally observed results.
-   - Preserve chronology, causality, attribution, and epistemic status. Keep hypotheses uncertain, failures as failures, and conclusions no broader or more certain than their evidence.
+- An `n*` id is an original node that has not yet been rewritten in this job.
+- An `r*` id is an accepted replacement already stored in the host working surface. It is compressed work produced by this or an earlier worker, not disposable scratch text. Its exact content may differ from the original parent transcript; use `read_turn_nodes` when its preview is insufficient.
+- `changed` means the node has already been rewritten. `unchanged` means its original content and boundary are still present.
+- `lands=` is the ordered original positional capacity owned by the node. `sources=` is the original semantic evidence its content may use.
+- Only ids in the current catalog are valid. Every successful replacement returns new `r*` ids and makes the selected ids stale.
 
-2. Correct intent without rewriting history.
-   - When a later steer fixes a typo or supplies missing information and reveals the route intended all along, replace a continuous span containing both user messages and emit one corrected user intent. Its semantic sources must include the later steer; do not retain the superseded wording as a separate user exchange.
-   - The corrected user node represents what the user intended and what the user supplied. Do not make it narrate or take attribution for assistant actions, tool outcomes, discoveries, or failures.
-   - Consolidating user intent does not erase work already performed. Preserve an actual off-route attempt as assistant-side trial history when it has a distinct outcome: state compactly what was tried, why it failed or what it ruled out, and how the route changed. This trial may be merged into the later assistant result; it need not remain a separate exchange or raw tool trace.
-   - Keep a user interaction boundary when it remains causally useful—for example, an intermediate result prompted a decision, the user genuinely changed objectives, or an unresolved branch must remain visible.
+The editor is isolated from the parent session. Tool mutations update this host-owned working surface immediately, but the parent surface changes only after a worker successfully calls `finish_turn_compression` and the host validates the whole result.
 
-3. Choose semantic boundaries and compress.
-   - Choose granularity from the retained information, with no fixed node count. Original user, assistant, and tool boundaries are evidence for the rewrite, not a structure to copy.
-   - Node boundaries represent semantic work units, not forced role alternation. Adjacent same-role nodes may remain when they do materially different things; merge them when the split is only execution residue.
-   - Compress repetitive commands, listings, and status chatter. Prefer absorbing completed tool interactions and their useful information into conversational nodes. Retain raw tool nodes only when their protocol structure or exact result remains useful; then preserve the complete call-result pair.
+{{#if initialWorker}}
+No earlier worker has stopped in this job. Start from the current catalog and retain any node unchanged only when both its content and boundary already belong in the compact transcript.
+{{/if}}
+{{#if resumedWorker}}
+An earlier worker stopped before authoritative completion. The current catalog includes all {{acceptedMutations}} accepted replacement(s) made so far. Continue from this state: inspect the current `r*` and remaining `n*` nodes, preserve useful accepted work, and refine or finish it instead of rebuilding the original layout from scratch. The inherited parent transcript predates these `r*` edits and never overrides the catalog.
+{{/if}}
 
-4. Edit and verify the working surface.
-   - Use `replace_turn_nodes` on one current node or continuous current range with one or more ordered outputs. Select a range containing every current node whose information the outputs use; inherited context helps understanding but is not provenance for an unselected node.
-   - A tool output is allowed only when the replacement selects exactly one current tool node and produces exactly that one tool node—never include a tool output in a multi-output replacement.
-   - Keep an existing node unchanged only when both its content and boundary already belong in the compact transcript. Successful replacements return new `r*` ids plus the complete structural catalog; shadowed ids are stale, and generated nodes may be selected again.
-   - The inherited context and previews should usually suffice. Use `read_turn_nodes` when exact current text is needed; one call can read several ids or ranges.
-   - Before finishing, audit every retained fact for role attribution and `sources=` coverage. If content uses a steer, trial, discovery, or result outside its sources—or assigns assistant/tool evidence to the user—redo the edit with the right range and role.
-   - Write only semantic roles and content. The host owns session seqs, surface operations, provenance, message ids, turn and step fields, landing slices, and tool-pairing metadata.
-   - Submit the desired surface with `finish_turn_compression`. Plain text, natural stopping, or any other signal is not an accepted result.
+<current-node-catalog>
+{{currentNodeCatalog}}
+</current-node-catalog>
+
+## Compression method
+
+Build a causal record before editing:
+
+- Identify the user's intended objective and constraints. Classify later user input as a correction or missing detail, a response to an intermediate result, or a genuine new objective.
+- Preserve information that would be costly or impossible to reconstruct: insights or inspirations; uncertain hypotheses; trials and detours with their outcomes; discoveries; decisions and rationale; conclusions with scope and evidence; and externally observed results.
+- Preserve chronology, causality, attribution, and epistemic status. Keep hypotheses uncertain, failures as failures, and conclusions no broader or more certain than their evidence.
+
+Correct intent without rewriting history:
+
+- When a later steer fixes a typo or supplies missing information and reveals the route intended all along, jointly replace a continuous span containing both user messages and emit one corrected user intent. Its semantic sources must include the later steer.
+- The corrected user node represents what the user intended and supplied. Do not make it narrate or take attribution for assistant actions, tool outcomes, discoveries, or failures.
+- Consolidating user intent does not erase work already performed. Preserve an actual off-route attempt as assistant-side trial history when it has a distinct outcome: state compactly what was tried, what failed or was ruled out, and how the route changed. It may be merged into the later assistant result rather than kept as a separate exchange.
+- Keep a user interaction boundary when it remains causally useful, such as when an intermediate result prompted a decision, the objective genuinely changed, or an unresolved branch must remain visible.
+
+Choose semantic boundaries rather than copying execution residue:
+
+- Original user, assistant, and tool boundaries are evidence, not structure that must survive. Adjacent same-role nodes may remain when they do materially different work; merge them when the split is only mechanical trace.
+- Compress repetitive commands, listings, status chatter, and routine verification. Prefer absorbing completed tool interactions and their useful facts into conversational nodes.
+- Retain a raw tool node only when its protocol structure or exact result remains useful. A tool output can only be rewritten one-to-one, with its complete call-result protocol still valid.
+
+## Editing workflow
+
+1. Inspect the current catalog. Use inherited context for the original turn and `r*` previews for accepted progress; call `read_turn_nodes` for exact current content when needed. One read can cover several ids or continuous ranges.
+2. Use `replace_turn_nodes` on one current node or a continuous current range. The selected range must contain every current node whose information the outputs use; inherited context supplies understanding, not provenance for an unselected node.
+3. Write only ordered semantic roles and complete content. Generated nodes may be selected again for refinement. A tool output is valid only as the sole output replacing exactly one current tool node.
+4. Track the new ids returned after every mutation. Never address a shadowed id, and never assume the parent transcript contains the latest `r*` wording.
+5. Audit the final current surface for chronology, role attribution, factual fidelity, and `sources=` coverage. It must start with a user node, end with an assistant node, retain no empty content, and remain no larger than the original node count.
+6. Call `finish_turn_compression`. This tool is the only authoritative success signal; plain text or natural stopping does not commit the working surface.
+
+The host exclusively owns session seqs, surface operations, provenance encoding, message ids, turn and step fields, landing slices, and tool-pairing metadata. Do not invent or report them.
 
 {{#if e2eSmoke}}
 ## E2E smoke protocol (follow exactly)
 
-- First replace the entire current range `n1..n{{originalCount}}` with exactly two nodes: a user node containing `{{e2eUserSentinel}}` and `{{draftSentinel}}`, followed by an assistant node containing both `{{e2eToolSentinel}}` and `{{e2eFinalSentinel}}` and also `{{draftSentinel}}`.
-- Then select both returned `r*` ids in a second `replace_turn_nodes` call and refine them into exactly one user node followed by one assistant node. Preserve all three E2E sentinels exactly and remove every `{{draftSentinel}}`.
-- Finally call `finish_turn_compression`.
+- Inspect the current catalog and the accepted-mutation count above.
+- If the current surface has no `{{draftSentinel}}`, replace its complete current range with exactly two nodes: a user node containing `{{e2eUserSentinel}}` and `{{draftSentinel}}`, followed by an assistant node containing `{{e2eToolSentinel}}`, `{{e2eFinalSentinel}}`, and `{{draftSentinel}}`.
+- If the current surface already contains the draft pair from an earlier accepted replacement, preserve it and continue with the next step; read the current `r*` nodes if needed.
+- Select the complete current draft pair and replace it with exactly one user node followed by one assistant node. Preserve all three E2E sentinels exactly and remove every `{{draftSentinel}}`.
+- Call `finish_turn_compression`.
 {{/if}}

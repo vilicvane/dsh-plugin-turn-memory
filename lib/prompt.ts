@@ -9,6 +9,13 @@ export const E2E_FINAL_SENTINEL = 'PARENT-FINAL-BETA-332';
 
 type TemplateValue = string | number | boolean;
 
+export interface CompressionPromptOptions {
+  previewChars: number;
+  e2eSmoke: boolean;
+  workerNumber: number;
+  acceptedMutations: number;
+}
+
 const promptTemplateUrl = new URL('../prompts/turn-compression.md', import.meta.url);
 const conditionalPattern = /{{#if\s+([A-Za-z_][A-Za-z0-9_]*)}}\n?([\s\S]*?){{\/if}}(\n|$)/g;
 const valuePattern = /{{([A-Za-z_][A-Za-z0-9_]*)}}/g;
@@ -31,13 +38,16 @@ export function renderPromptTemplate(template: string, values: Readonly<Record<s
 /** Render the complete model-facing contract for one turn-compression fork. */
 export function buildCompressionPrompt(
   editor: TurnNodeEditor,
-  previewChars: number,
-  e2eSmoke: boolean,
+  options: CompressionPromptOptions,
 ): string {
   const template = readFileSync(promptTemplateUrl, 'utf8');
   return renderPromptTemplate(template, {
-    initialNodeCatalog: editor.richCatalog(previewChars),
-    e2eSmoke,
+    currentNodeCatalog: editor.richCatalog(options.previewChars),
+    e2eSmoke: options.e2eSmoke,
+    initialWorker: options.workerNumber === 1,
+    resumedWorker: options.workerNumber > 1,
+    workerNumber: options.workerNumber,
+    acceptedMutations: options.acceptedMutations,
     originalCount: editor.originalCount,
     e2eUserSentinel: E2E_USER_SENTINEL,
     e2eToolSentinel: E2E_TOOL_SENTINEL,

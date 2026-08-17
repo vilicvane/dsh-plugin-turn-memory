@@ -3,6 +3,9 @@
   config:
     enabled: true
     e2eSmoke: true
+    e2eInterruptAfterFirstMutation: true
+    e2eDeferTurnCompressionUntilResume: true
+    turnWorkerAttempts: 1
     previewChars: 120
     maxReadChars: 30000
 

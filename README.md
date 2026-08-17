@@ -13,6 +13,12 @@ The master plugin remains disabled by default. Completed-turn compression is on
 when the plugin is enabled unless `turnCompression: false`. Session compaction
 is separately opt-in through `sessionCompaction.enabled: true`.
 
+Completed root turns are also recovered after an agent cold resume. The plugin
+scans durable `turn/end` events, skips turns that already have a turn-memory
+landing marker, and serially backfills the remaining current-surface ranges.
+This makes a Web restart between turn completion and replacement landing
+recoverable without a separate command.
+
 ## Install
 
 Add the package to a DSH profile from GitHub:
@@ -86,6 +92,7 @@ The main tuning options are:
 | --- | ---: | --- |
 | `enabled` | `false` | Enables the plugin. |
 | `turnCompression` | `true` | Compresses each completed root-session turn with a forked main-model worker. |
+| `turnWorkerAttempts` | `3` | Consecutive failed workers allowed without an accepted replacement. Every successful replacement resets this budget. |
 | `previewChars` | `120` | Characters shown for each node in the turn catalog. |
 | `maxReadChars` | `30000` | Maximum text returned by a turn-node read. |
 | `surfaceDumpDir` | plugin `.tmp/` | Directory receiving the latest folded-surface snapshot for each session. |
@@ -142,10 +149,14 @@ cold loading, and session-query projection, then writes
 
 The e2e workflow uses the dedicated `~/.dsh/profiles/test-turn-memory` profile
 and the configured real model. It creates a fresh parent session, forces a
-multi-node tool turn, waits for the turn-end fork to perform `n* -> r1 -> r2`,
-lands the actual replacement, checks live `foldSurface()` and
-`deriveMessages()`, flushes persistence, destroys the live agent, cold-resumes
-the same session, and repeats the projection checks. Success ends with
+multi-node tool turn, intentionally leaves its live `turn/end` uncompressed,
+flushes persistence, destroys the agent, and cold-resumes the same session.
+The recovery scan must then start the missed compression. The runner interrupts
+its first worker after an accepted `n* -> r*` mutation and verifies that a
+second fork continues those `r*` nodes through the final rewrite. It checks live
+`foldSurface()` and `deriveMessages()`, flushes, cold-resumes a second time, and
+verifies that durable recovery detection neither duplicates nor changes the
+replacement identities. Success ends with
 `E2E_RESULT=PASS`, prints the retained test session id, and writes the exact
 `sessionQuery.readSurface()` snapshot to
 `.tmp/e2e-surface-<session-id>.json`. The `E2E_SURFACE_PATH` output contains

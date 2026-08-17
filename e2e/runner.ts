@@ -49,6 +49,8 @@ function assertProjection(session: any, nodes: any[], phase: string): void {
     assert.equal(node.sourceEventSeqs.length, node.data.source.originalNodes, phase + ': each output must cite the complete joint source range');
     assert.ok(node.data.source.originalNodes >= 4, phase + ': fixture turn should exercise a four-node-or-larger joint rewrite');
     assert.ok(node.data.source.mutations >= 2, phase + ': generated ids should have been edited again');
+    assert.equal(node.data.source.workerAttempts, 2,
+      phase + ': accepted progress should reset a one-attempt budget and allow a second fork');
     assert.ok(!textOf(node).includes(DRAFT_SENTINEL), phase + ': draft-pass sentinel leaked into final compression');
   }
   assert.ok(textOf(nodes[0]).includes(USER_SENTINEL), phase + ': initial user sentinel missing from compressed user node');
@@ -77,7 +79,7 @@ async function run(ctx: any): Promise<void> {
   let fixtureCalls = 0;
   const setup = (agentCtx: any) => {
     installModelSelection(agentCtx, {
-      current: { ...selection, reasoningEffort: 'off' },
+      current: { ...selection },
       assembled: undefined,
     });
     agentCtx.tools.register(defineTool({
@@ -94,6 +96,7 @@ async function run(ctx: any): Promise<void> {
   };
 
   let liveHandle: any;
+  let recoveryHandle: any;
   let coldHandle: any;
   try {
     liveHandle = await agents.create({
@@ -116,13 +119,24 @@ async function run(ctx: any): Promise<void> {
     await agent.whenIdle();
     assert.equal(fixtureCalls, 1, 'parent fixture tool should run exactly once');
     const timeoutMs = Number(process.env.TURN_MEMORY_E2E_TIMEOUT_MS ?? 240000);
-    const compressed = await waitForCompression(agent.session, timeoutMs);
-    assertProjection(agent.session, compressed, 'live');
     await sessions.flush(agent.session);
+    assert.equal(compressionNodes(agent.session).length, 0, 'live turn should be intentionally left uncompressed for recovery');
     const sessionId = agent.session.id;
-    const expectedCompressionSeqs = compressed.map((node) => node.seq);
     await liveHandle.dispose();
     liveHandle = undefined;
+
+    recoveryHandle = await agents.resume({
+      resumeSessionId: sessionId,
+      agentOptions: { provider: selection.provider, model: selection.model },
+      setup,
+    });
+    await recoveryHandle.agent.whenIdle();
+    const compressed = await waitForCompression(recoveryHandle.agent.session, timeoutMs);
+    assertProjection(recoveryHandle.agent.session, compressed, 'recovered');
+    await sessions.flush(recoveryHandle.agent.session);
+    const expectedCompressionSeqs = compressed.map((node) => node.seq);
+    await recoveryHandle.dispose();
+    recoveryHandle = undefined;
 
     coldHandle = await agents.resume({
       resumeSessionId: sessionId,
@@ -131,7 +145,8 @@ async function run(ctx: any): Promise<void> {
     });
     await coldHandle.agent.whenIdle();
     const coldCompression = compressionNodes(coldHandle.agent.session);
-    assert.deepEqual(coldCompression.map((node) => node.seq), expectedCompressionSeqs, 'cold load changed compression identities');
+    assert.deepEqual(coldCompression.map((node) => node.seq), expectedCompressionSeqs,
+      'second cold load duplicated or changed recovered compression identities');
     assertProjection(coldHandle.agent.session, coldCompression, 'cold');
     await sessions.flush(coldHandle.agent.session);
     const snapshot = await sessionQuery.readSurface(sessionId);
@@ -145,10 +160,13 @@ async function run(ctx: any): Promise<void> {
     console.log('E2E_SESSION_ID=' + sessionId);
     console.log('E2E_REPLACEMENT=' + compressed[0].data.source.originalNodes + '->2');
     console.log('E2E_MUTATIONS=' + compressed[0].data.source.mutations);
+    console.log('E2E_WORKER_ATTEMPTS=' + compressed[0].data.source.workerAttempts);
+    console.log('E2E_RECOVERY=agent-resume-backfill');
     console.log('E2E_SURFACE_PATH=' + surfacePath);
     console.log('E2E_RESULT=PASS');
   } finally {
     if (coldHandle !== undefined) await coldHandle.dispose();
+    if (recoveryHandle !== undefined) await recoveryHandle.dispose();
     if (liveHandle !== undefined) await liveHandle.dispose();
   }
 }

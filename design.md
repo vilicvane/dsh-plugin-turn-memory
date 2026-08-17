@@ -141,3 +141,60 @@
 
 - 模板文件缺失、读取失败或渲染失败会使该 turn 的 compression job 失败并保留原始 surface；不会回退到进程内缓存的旧 prompt，因为那会破坏“修改立即生效”的语义。
 - 若将来确实需要嵌套、循环、escaping policy 或复用 partial，应重新调研模板能力并更新本条；不得在小型 renderer 上逐步堆出一个未经设计的通用模板语言。
+
+## D-005：同插件内的自定义 session compaction engine
+
+状态：**已确认**
+
+### 约定
+
+- turn-memory 插件同时提供逐 turn 改写和 session-level compaction，但两者仍是两个语义层：前者把一个 completed turn 压缩成较短 transcript，后者在上下文压力或显式 `/compact` 时把一段 canonical surface 合成为一个 session checkpoint。
+- session-level 实现直接继承公开的 `CompactionEngine`，不继承 `BasicCompactionEngine`，也不从旧 replay-compaction 继承 segment、patch loop、cheap model、review 或 checkpoint 格式。旧实现只作为失败经验来源。
+- session-level engine 只改写没有 `parentSession` 的根会话。compaction fork／spawn 以及其他 child agent 不递归触发这一层；fork 在上下文压力下失败时进入既定 fresh-spawn fallback。
+- session compaction 直接读取开始时的 canonical surface；逐 turn 改写与 session compaction 共享 per-session coordinator。自动 compaction 在选择范围前等待已经启动的前一 turn 改写结束，避免一边读取旧节点、一边由另一 writer 替换同一 surface。
+- 自动 pressure compaction 使用当前路由模型的 context window 和 token-meter：默认在 80% 压力触发，并保留至少 16% context window 的近期 canonical tail。range 的两端还必须落在完整 turn／standalone checkpoint 单元边界；若 token cut 落在 turn 内就向更早边界扩张 retained tail。context-overflow 可越过普通阈值，但仍不得把当前未完成 turn 纳入 checkpoint。
+- 当前上游 token-meter 会把每条 `assistant/message` 都当作 provider step 的成功输出，即使它是 turn 结束后追加的 surface replacement；因此遇到精确指向 `source.plugin=turn-memory` replacement 的 `no matching step/start` 时，本 engine 改为用 token-meter 的单消息估价重新定价当前 canonical surface，并加上同一固定启发式的 system/tools envelope。fallback 不读取已遮蔽历史，也不吞掉其他 token-meter 错误。
+- 每次成功操作只产生一个 durable checkpoint user message，并遵循标准事件协议：`compaction/start → compaction/summary → 紧邻的 replacement user/message → compaction/end`。replacement source 使用 `compactCheckpointSource(compactionId)`；`summary` 记录准确的 shadowed range、surface-order seqs、shadow token 价格及实际 worker 路由。
+- 所有模型工作期间只维护 host-owned in-memory working checkpoint，原 surface 保持不变。全部段完成、最终内容非空、覆盖完整、selected span 仍稳定、tool-pairing 边界仍平衡且新 checkpoint 的估算 token 严格小于被替换内容后，才在无 `await` 的同步提交段追加 summary、replacement 和成功 end。
+- 任一 worker、验证或提交前阶段失败都保留原 surface，并尽力追加带 error 的 `compaction/end`。manual compaction 通过 `agent.runMaintenance()` 串行化并在闭合 marker 后 flush；automatic compaction 的 marker owner 是当前 open turn。
+
+### 可行性依据
+
+- `@deepseek-ai/dsh-compaction` 公开了 `CompactionEngine`、checkpoint source、tool-pairing 边界检查和完整事件类型；`@deepseek-ai/dsh-token-meter` 公开了 replay-aware 的总压力及按当前 surface 顺序排列的 `{seq,tokens}`。因此自定义 backend 无需访问 `BasicCompactionEngine` 的未导出 transaction helper。
+- 本地 public-API 探针已验证：detached session 可以只用公开 append API写入标准 marker、summary 和 replacement，实时 surface 与完整 replay fold 一致。
+- 自动 compaction 发生在当前 turn 内时，新的 checkpoint event seq 可能高于 `turn/start`，却位于 surface 头部。实测证明按 `seq > turn/start.seq` 识别 turn 节点会把 checkpoint 错算进当前 turn，并得到非连续目标。因此 turn 归属必须排除 compact checkpoint provenance，再验证剩余目标在 surface 上连续。
+
+### 已知边界
+
+- 启用本 engine 的 profile 必须停用其他 `ctx.compaction` provider，例如 stock `compaction-basic` 或旧 replay-compaction；一个 Cordis context 只能有一个该服务实现。
+- session checkpoint 的物理角色是一个 plugin-origin user message；“保留对话形态”由其正文中的结构化 chronological transcript 表达，不会伪造多条新的 human/model durable transcript event。
+- 当前实现只压缩 completed history。若一个无法拆分的单 turn 或 retained request envelope 自身超过模型窗口，session surface replacement 无法修复。
+- canonical-surface fallback 没有上游 meter 内部的 provider usage anchor，只能使用相同的四字符启发式；含大量 CJK 或 provider tokenizer 偏差的会话，其自动 pressure 触发点不如正常 meter 路径精确。manual `/compact` 的范围选择和 replacement 定价仍保持自洽。
+
+## D-006：主模型 fork 优先的分段 working checkpoint
+
+状态：**已确认**
+
+### 约定
+
+- 一个 session compaction job 先把选中的 surface range 按 completed turn 边界聚合成 token-budgeted segments；已被 turn-memory 压缩的 turn 仍作为不可拆分的自然单元。超出 segment budget 的单一 turn 单独成段，不在 tool call/result 或 turn 内强行切开。
+- host 初始化一个由 segment placeholder 构成的 working checkpoint，并顺序处理各段。每个 worker 只负责一个 assigned segment，但可以把当前段与相邻的既有 memory nodes 联合改写，以便让后来的结论解决前面的假设、合并连续工作，或保留必要的因果过渡。
+- 每段首先启动与 parent 使用相同 provider/model 的 one-shot `fork`。当前 fork provider 只能继承从 seq 0 到最近 completed `turn/end` 的完整前缀，不能接受 history range；因此“从 checkpoint fork 指定分段”实现为：fork 提供语义背景，host prompt 指定本次 segment 和 working-checkpoint revision，工具提供精确寻址。
+- fork 因 context pressure、transport 或未完成协议而失败时，可以换成同一主模型的 fresh `spawn` 继续同一 host-owned revision。fresh worker 的 prompt 会内嵌 assigned segment 正文；它不依赖前一个 child 的隐藏上下文。有限重试耗尽后整个 compaction 失败，不提交半成品。
+- 模型可见状态采用两级目录：全局 segment 目录只列 segment id、turn 范围、token/node 数、首尾 preview、状态和 revision；assigned segment 再列 opaque source-node id 与 preview，read 工具可在一次调用中展开多个单节点或连续节点范围。working checkpoint 另有可分页目录、批量 read 和 search，避免在 1M context 下每轮返回全部节点。
+- state-changing 工具在一个 expected revision 上把一个当前 memory node／连续范围替换成若干有序 user/assistant memory nodes。初次处理某段时所选范围必须包含该段 placeholder；后续重试可以继续编辑已带该 segment provenance 的生成节点。mutation 返回新 revision、created ids 和局部 neighborhood，不返回完整全局目录；旧 id 或旧 revision 明确失败。
+- `finish_session_segment` 是每个 worker 的唯一成功出口。host 验证 assigned segment 已被 memory nodes 覆盖且其 placeholder 消失后才推进下一段。最后一个 worker 完成并不直接写 session；host 还要验证所有 segment coverage 并渲染、定价、提交最终 checkpoint。
+- 后段的预热内容不是完整重放前面各段，而是 working checkpoint 的近期 causal handoff：仍未解决的问题、活跃假设、决定、关键发现和最近交互尾部。worker 随时可通过 list/read/search 回看更早 memory nodes。
+- worker 串行直接编辑同一 working checkpoint。并行只适合未来产生互不落地的局部候选；在没有额外 merge/review 协议前，不并行修改 checkpoint。
+
+### 可行性依据
+
+- `SubagentStartRequest` 支持 parent、agentOptions、toolFilter 和 cancellation，但没有 seed range；fork provider 的 completed-turn prefix 也没有可配置切片。fresh spawn 则不继承 parent history。上述双路径分别利用了两者真实能力，没有把 range selection 假装成 fork API。
+- 工具 execute context 能把调用绑定到具体 child；`concludeTurn()` 与 `tools/result` 事件可将 finish tool 的成功结果作为权威完成信号。working state 位于 host，因此 child dispose、重启或 provider fallback 不会丢掉已经接受的 revision。
+- 全部 segment 最终落成一个 replacement event，不受 turn-memory N→M landing capacity 限制；内部 user/assistant memory node 数只影响 checkpoint 正文结构。
+
+### 已知边界
+
+- fork worker仍携带完整 completed parent prefix；普通 pressure trigger 必须为其 prompt、工具轮次和输出预留 headroom。context overflow 时 fork 可能立即失败，fresh spawn 是必要的恢复路径，而不是 range-limited fork。
+- segment token 数来自 token-meter 的 surface-node估价，不是 worker prompt 的精确 provider tokenizer 数；segment budget 和 read character cap 都需要保守配置。
+- 当前 working checkpoint 只在内存中可续跑。它支持更换 child 继续同一进程内 job，但不把半成品持久化为可跨进程恢复的 session 状态；进程突然停止后由未闭合 compaction marker 暴露失败，原 surface 仍未被替换。

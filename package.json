@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-turn-memory",
   "version": "0.2.0-dev",
-  "description": "Turn-scoped memory rewriting for DeepSeek Harness.",
+  "description": "Turn and session transcript memory rewriting for DeepSeek Harness.",
   "license": "MIT",
   "author": "vilicvane",
   "type": "module",
@@ -15,11 +15,15 @@
     ".": "./index.ts",
     "./e2e-runner": "./e2e/runner.ts",
     "./prompt-eval-runner": "./e2e/prompt-eval-runner.ts",
+    "./session-compaction-e2e-runner": "./e2e/session-compaction-runner.ts",
     "./package.json": "./package.json"
   },
   "dependencies": {
     "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-compaction": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "0.1.0-rc.6",
     "@deepseek-ai/dsh-session": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-token-meter": "0.1.0-rc.6",
     "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
   },
   "devDependencies": {
@@ -31,6 +35,7 @@
     "typecheck": "tsc --noEmit",
     "check": "pnpm test && pnpm typecheck",
     "e2e": "bash scripts/e2e-smoke.sh",
-    "e2e:prompt": "bash scripts/e2e-prompt.sh"
+    "e2e:prompt": "bash scripts/e2e-prompt.sh",
+    "e2e:session": "bash scripts/e2e-session-compaction.sh"
   }
 }

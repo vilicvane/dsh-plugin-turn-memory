@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
+import { MemoryCoordinator } from './lib/coordinator.ts';
+import { contentText } from './lib/content.ts';
 import { TurnNodeEditor } from './lib/editor.ts';
 import {
   DRAFT_SENTINEL,
@@ -14,10 +16,12 @@ import {
   buildCompressionPrompt,
 } from './lib/prompt.ts';
 import { validateProjectedToolProtocol } from './lib/tool-protocol.ts';
+import { SessionMemoryCompactionEngine } from './lib/session-compaction.ts';
+import type { SessionCompactionConfig } from './lib/session-compaction.ts';
 import type { NodeRange, TurnNodeOutput, TurnNodeSeed } from './lib/editor.ts';
 
 const name = 'turn-memory';
-const inject = ['agents', 'sessionQuery', 'sessions', 'subagents', 'tools'];
+const inject = ['agents', 'llm', 'sessionQuery', 'sessions', 'subagents', 'tokenMeter', 'tools'];
 
 const TOOL_NAMES = [
   'list_turn_nodes',
@@ -30,10 +34,12 @@ const DEFAULT_SURFACE_DUMP_DIR = fileURLToPath(new URL('.tmp/', import.meta.url)
 
 interface PluginConfig {
   enabled?: boolean;
+  turnCompression?: boolean;
   e2eSmoke?: boolean;
   previewChars?: number;
   maxReadChars?: number;
   surfaceDumpDir?: string;
+  sessionCompaction?: SessionCompactionConfig;
 }
 
 interface CompressionJob {
@@ -48,34 +54,6 @@ interface CompressionJob {
   controller: AbortController;
   mutationCount: number;
   finishConfirmed: boolean;
-}
-
-function contentText(value: unknown): string {
-  const chunks: string[] = [];
-  const visit = (item: unknown): void => {
-    if (item === null || item === undefined) return;
-    if (typeof item === 'string') {
-      chunks.push(item);
-      return;
-    }
-    if (Array.isArray(item)) {
-      for (const child of item) visit(child);
-      return;
-    }
-    if (typeof item !== 'object') return;
-    const record = item as Record<string, unknown>;
-    if (record.type === 'text' && typeof record.text === 'string') {
-      chunks.push(record.text);
-      return;
-    }
-    if (record.type === 'tool-call') {
-      chunks.push('[tool-call ' + String(record.name ?? 'unknown') + ' arguments=' + String(record.arguments ?? '') + ']');
-      return;
-    }
-    if (Object.hasOwn(record, 'content')) visit(record.content);
-  };
-  visit(value);
-  return chunks.join('\n').trim();
 }
 
 function seedOf(event: any): TurnNodeSeed | undefined {
@@ -97,7 +75,13 @@ function prepareJob(agent: any, event: any): CompressionJob | undefined {
   if (!Number.isSafeInteger(turn)) return undefined;
   const start = session.events.findLast((candidate: any) => candidate.type === 'turn/start' && candidate.data?.turn === turn);
   if (start === undefined) return undefined;
-  const targetSeqs = session.surface.nodes.filter((seq: number) => seq > start.seq && seq <= event.seq);
+  const targetSeqs = session.surface.nodes.filter((seq: number) => {
+    if (seq <= start.seq || seq > event.seq) return false;
+    const source = session.events[seq]?.data?.source;
+    if (source?.plugin === 'compact') return false;
+    if (source?.plugin === 'turn-memory' && Number.isSafeInteger(source.turn)) return source.turn === turn;
+    return true;
+  });
   if (targetSeqs.length === 0) return undefined;
   const firstIndex = session.surface.nodes.indexOf(targetSeqs[0]);
   if (firstIndex < 0 || targetSeqs.some((seq: number, index: number) => session.surface.nodes[firstIndex + index] !== seq)) {
@@ -241,6 +225,14 @@ function land(job: CompressionJob): void {
 function apply(ctx: any, config: PluginConfig = {}): void {
   if (config.enabled !== true) {
     ctx.logger.info('turn-memory: new implementation is disabled; enable explicitly for smoke testing');
+    return;
+  }
+  const coordinator = new MemoryCoordinator();
+  if (config.sessionCompaction?.enabled === true) {
+    new SessionMemoryCompactionEngine(ctx, config.sessionCompaction, coordinator);
+  }
+  if (config.turnCompression === false) {
+    ctx.logger.info('turn-memory: completed-turn compression is disabled; session compaction remains independently configured');
     return;
   }
   const previewChars = Number.isSafeInteger(config.previewChars) && (config.previewChars ?? 0) > 0 ? config.previewChars! : 120;
@@ -403,7 +395,11 @@ function apply(ctx: any, config: PluginConfig = {}): void {
       const job = prepareJob(agent, event);
       if (job === undefined) return;
       jobs.set(job.parentSessionId, job);
-      queueMicrotask(() => void runCompression(job));
+      queueMicrotask(() => {
+        const work = runCompression(job);
+        coordinator.trackTurnRewrite(job.parentSessionId, work);
+        void work;
+      });
     } catch (error) {
       ctx.logger.warn('turn-memory: could not prepare turn ' + String(event.data?.turn) + ': ' + (error instanceof Error ? error.message : String(error)));
     }

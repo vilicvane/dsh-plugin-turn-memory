@@ -1,0 +1,21 @@
+- id: compaction-basic
+  disabled: true
+
+- id: turn-memory
+  config:
+    enabled: true
+    turnCompression: false
+    sessionCompaction:
+      enabled: true
+      auto: false
+      segmentTokens: 1000
+      workerAttempts: 2
+      workerMaxTokens: 8192
+      workerTimeoutMs: 300000
+
+- id: test-runner
+  disabled: true
+
+- insert:
+    - id: turn-memory-session-compaction-e2e-runner
+      name: dsh-plugin-turn-memory/session-compaction-e2e-runner

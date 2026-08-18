@@ -1,3 +1,5 @@
+import { collectMemoryImageAttachments, renderMemoryImageReference } from './memory-images.ts';
+
 /** Flatten the text-bearing parts of one durable message event for catalogs and memory input. */
 export function contentText(value: unknown): string {
   const chunks: string[] = [];
@@ -15,6 +17,11 @@ export function contentText(value: unknown): string {
     const record = item as Record<string, unknown>;
     if (record.type === 'text' && typeof record.text === 'string') {
       chunks.push(record.text);
+      return;
+    }
+    if (record.type === 'image') {
+      const ref = collectMemoryImageAttachments(record)[0];
+      if (ref !== undefined) chunks.push(renderMemoryImageReference(ref));
       return;
     }
     if (record.type === 'tool-call') {

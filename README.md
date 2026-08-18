@@ -8,6 +8,7 @@ The plugin now has two coordinated layers:
 
 - completed-turn compression uses a parent `fork` and lands an N→M transcript rewrite;
 - optional root-session compaction provides `ctx.compaction`, processes a selected completed-history range through sequential main-model workers, and commits one standard durable checkpoint only after the host-owned working draft is complete.
+- compressed image blocks can become durable `<memory-image ref="..." />` text references; `read_memory_image` reloads the original pixels on demand instead of placing them in every later model request.
 
 The master plugin remains disabled by default. Completed-turn compression is on
 when the plugin is enabled unless `turnCompression: false`. Session compaction
@@ -102,11 +103,16 @@ The main tuning options are:
 | `sessionCompaction.retainRatio` | `0.16` | Approximate newest-history share kept outside the selected compaction range. |
 | `sessionCompaction.retainTokens` | unset | Absolute alternative to `retainRatio`; do not set both. |
 | `sessionCompaction.segmentTokens` | `32000` | Approximate source-token budget assigned to each sequential worker. |
-| `sessionCompaction.workerAttempts` | `2` | Attempts allowed per segment; later attempts can use a fresh same-model worker. |
+| `sessionCompaction.workerAttempts` | `2` | Consecutive failed workers allowed per segment without an accepted revision. Every successful replacement resets this budget. |
 | `sessionCompaction.workerMaxTokens` | `8192` | Output-token limit for each session worker. |
 | `sessionCompaction.workerTimeoutMs` | `300000` | Timeout for each worker attempt. |
+| `sessionCompaction.compactionRetries` | `1` | Additional pressure-compaction passes allowed when a successful checkpoint still leaves the surface above `thresholdRatio`. |
 
-Each session segment first uses the parent's provider/model through `fork`. If that cannot run near context pressure, later attempts use the same main model through fresh `spawn`, with the assigned canonical source embedded in the prompt. Both prompt files are read for each new worker, so prompt edits do not require a Web restart.
+Each session segment first uses the parent's provider/model through `fork`. If it stops without an authoritative finish, continuation workers use the same main model through fresh `spawn`, with the assigned canonical source and accepted host-owned revision embedded in the prompt. A provider error, timeout, max-token stop, or missing finish consumes the budget only when that worker produced no accepted revision. Both prompt files are read for each new worker, so prompt edits do not require a Web restart.
+
+The plugin exposes `read_memory_image` to the main conversation and both compression-worker types when the profile has an attachment store. Compression retains the content-addressed attachment id rather than a local path, and the tool accepts only ids that really occur in the current session or its active root parent. The original pixels are loaded only for the tool request and only when the active model declares image input.
+
+Provider-confirmed context overflow has a fixed one-shot recovery policy: compact once and replay the failed main-model request only after a durable surface replacement was committed. If that replay also overflows, the provider error is preserved rather than starting another compaction loop. This is independent of `sessionCompaction.compactionRetries`, which controls additional successful pressure compactions when one checkpoint still leaves the session above the configured threshold.
 
 ## Verification workflow
 
@@ -129,7 +135,7 @@ Run the dedicated session-compaction E2E after changing pressure selection, segm
 pnpm e2e:session
 ```
 
-It disables the stock backend in the test overlay, creates three completed turns, injects the same post-turn assistant replacement produced by turn-memory, and first proves that upstream token-meter rejects that lifecycle shape. It then forces the first two turns into separate segments, calls the custom engine manually through its canonical-surface pricing fallback, asserts that both workers use `fork`, verifies standard event adjacency, checkpoint provenance, and the untouched retained tail, then flushes and cold-resumes the exact session.
+It disables the stock backend in the test overlay, creates three completed turns, injects the same post-turn assistant replacement produced by turn-memory, and first proves that upstream token-meter rejects that lifecycle shape. It then forces the first two turns into separate segments and calls the custom engine manually through its canonical-surface pricing fallback. With a one-failure budget, the first segment's fork is deliberately stopped after an accepted mutation; the test requires a fresh-spawn continuation to finish it, then requires the next segment to begin with a fork. Finally it verifies standard event adjacency, checkpoint provenance, the untouched retained tail, persistence, and a cold resume of the exact session.
 
 When production prompt behavior changes, also run the qualitative steer
 regression:

@@ -20,12 +20,14 @@ function fixture(): { session: any; editor: SessionMemoryEditor; segments: Retur
 test('session prompt is a complete fork protocol without duplicating full source', () => {
   const { session, editor, segments } = fixture();
   const prompt = buildSessionCompactionPrompt({ editor, segments, assigned: segments[0], session, workerMode: 'fork', warmupChars: 1000 });
-  assert.match(prompt, /shorter chronological transcript/);
+  assert.match(prompt, /shorter chronological user-assistant transcript/);
   assert.match(prompt, /inspirations, discoveries, and hypotheses/);
-  assert.match(prompt, /stale cwd\/sandbox\/approval\/runtime snapshots/);
+  assert.match(prompt, /stale runtime snapshots/);
   assert.match(prompt, /origin=human/);
-  assert.match(prompt, /current integer revision/);
+  assert.match(prompt, /exact integer revision/);
   assert.match(prompt, /finish_session_segment/);
+  assert.match(prompt, /<memory-image ref="\.\.\."/);
+  assert.match(prompt, /read_memory_image/);
   assert.match(prompt, /preview="keep inspiration delta"/);
   assert.doesNotMatch(prompt, /<assigned-source/);
 });

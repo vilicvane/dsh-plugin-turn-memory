@@ -9,6 +9,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 
 import { TURN_TOOL_NAMES } from '../index.ts';
 import { SESSION_TOOL_NAMES } from '../lib/session-compaction.ts';
+import { READ_MEMORY_IMAGE_TOOL_NAME } from '../lib/memory-images.ts';
 
 const name = 'turn-memory-e2e-runner';
 const inject = ['agentDefaultModel', 'agents', 'sessionQuery', 'sessions', 'tools'];
@@ -34,6 +35,7 @@ function compressionNodes(session: any): any[] {
 
 function assertInternalToolsHidden(session: any, phase: string): void {
   const visible = new Set((session.requestHeader()?.tools ?? []).map((tool: any) => tool.name));
+  assert.ok(visible.has(READ_MEMORY_IMAGE_TOOL_NAME), phase + ': public lazy-memory image tool is missing');
   for (const name of INTERNAL_TOOL_NAMES) {
     assert.ok(!visible.has(name), phase + ': internal worker tool leaked into the parent request header: ' + name);
   }

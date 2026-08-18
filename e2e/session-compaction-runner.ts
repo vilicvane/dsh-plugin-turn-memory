@@ -125,7 +125,8 @@ async function run(ctx: any): Promise<void> {
 
     const result = await compaction.compactNow(agent, new AbortController().signal);
     assert.notEqual(result, null, 'manual session compaction unexpectedly found no range');
-    assert.deepEqual(workerProviders, ['fork', 'fork'], 'the two forced segments must each start and finish with a parent main-model fork');
+    assert.deepEqual(workerProviders, ['fork', 'spawn', 'fork'],
+      'accepted revision progress must reset a one-attempt no-progress budget and continue segment one in a fresh spawn');
     const replacement = assertCompacted(agent.session, result, 'live');
     await sessions.flush(agent.session);
     const sessionId = String(agent.session.id);

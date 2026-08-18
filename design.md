@@ -270,3 +270,51 @@
 - DSH `AgentOptions` 是 merge-extensible creation state；in-process subagent 会把 caller options 合并进 child options。Agent registry 同步派发 `agent/created`，随后 provider 才向 child inbox 发送初始 prompt，因此 listener 中的 agent-scope restriction 与注册会在第一次 request assembly 前完成。
 - DSH tool registry 明确区分 plain plugin context 的 global registration 与 `agent.ctx` 的 scope-local registration。global allow-list restriction 隐藏继承能力后，scope-local definitions 仍合并到该 agent 的最终 catalog，并随 agent scope dispose 自动清理。
 - 历史主会话 `session-2ce5…` 的首个 request header 已包含两套内部工具；turn 3 的主模型因此误判自己是 compaction worker，并调用 `list_turn_nodes` 与 `list_session_segments`。两次调用虽被 `jobFor()` 拒绝，仍证明仅靠运行时校验不能满足工具隔离。
+
+## D-010：图片压缩为可主动恢复的 lazy memory reference
+
+状态：**已确认**
+
+### 约定
+
+- DSH durable message 中的 `type=image` 已经只保存 content-addressed `ImageAttachmentRef`，但 provider adapter 会在每次包含该 surface node 的请求中自动读取并编码图片，因此它仍是 eager model context。turn-memory 压缩图片时应能把它降级成纯文本 `<memory-image ... />` marker：marker 留在 ordinary transcript context 中，图片字节不再自动进入后续请求。
+- marker 由 host 根据 canonical attachment metadata 生成，至少包含完整 `attachmentId`、media type、宽高和 encoded byte length，可附带经过转义的 display name。compression worker 可以移动或合并 marker，但不得编造、删去或改写其 reference identity；host 在 turn landing 和 session checkpoint 提交前验证选中 source 中的每个 image reference 仍出现在最终文本中。
+- `contentText()` 遇到 image block 时输出 canonical marker，而不是静默忽略图片。original turn node 未改写时仍保留原 eager image block；worker 将带 marker 的节点落为 replacement text 后，图片才成为 lazy reference。prompt 应把这种降级作为 completed-history 的常规选择，同时保留与图片相邻的 human text 和已经得到的视觉结论。
+- 插件公开 `read_memory_image({ ref })`。它只接受当前 agent session 或其 active root parent 的 append-only events 中真实出现过的 attachment id，解析完整 `ImageAttachmentRef`，通过 `ctx.attachments.readImage()` 校验后返回一个 ordinary image content block。模型只在文字 memory 不足以回答像素位置、遗漏细节或重新判断时主动调用；读取结果只进入该次 tool interaction，不把旧 checkpoint 自动恢复成 eager image surface。
+- `read_memory_image` 是主会话有意可见的普通 memory capability，不属于 D-009 要隔离的 host editor 工具。turn/session compression worker 的 global tools 被 scope 清空，因此两种 worker scope 也显式附带同一个读取工具，使 fork、fresh spawn 和主 agent 都能解析 marker。
+- 不把 attachment store 的内部 object path 写进模型上下文。浏览器上传不保留原始客户端路径；`$DSH_HOME/attachments/...` 是 backend-private、无扩展名且可能不在 workspace sandbox 中，也不能跨 attachment backend 或 DSH home 稳定迁移。
+
+### 可行性依据
+
+- `ImageAttachmentRef` 已包含持久、可序列化且由摘要校验的 identity 与图片元数据；真实 bytes 由 attachment service 独立保存。append-only 原事件即使被 surface replacement 遮蔽仍可作为授权和解析依据，session export 也会扫描完整日志并携带其中引用的 media object。
+- DSH tool renderer 可以像现有 `read_image` 一样同时返回 text block 与 image block；pi-ai adapter 仅在这个 image block 真正进入 request 时调用 attachment store 并转换成 provider image data，因此 lazy marker 本身没有视觉 token/pixel payload。
+- turn editor 和 session source renderer 都已经经过同一个 `contentText()` seam；在这里引入 canonical marker 可以覆盖 user image、assistant image 以及 nested tool-result image，不需要为每种压缩路径复制序列化逻辑。
+
+### 已知边界
+
+- 首版 resolver 依赖图片仍可在当前 session 或 active root parent 的 append-only events 中找到；不提供任意 attachment-store object 的全局读取能力，也不把 attachment id 当 bearer URL。
+- 普通 text-only 模型即使看见 marker 也不能消费返回的 image block；工具应失败明确并保留原 lazy reference，而不是把路径或 bytes 塞回文本。
+
+## D-011：turn/session worker 的连续无进展预算与一次 overflow replay
+
+状态：**已确认**
+
+### 约定
+
+- D-007 的 turn continuation 语义扩展到 session segment：配置的 worker-attempt budget 表示**连续未产生 accepted mutation 的失败 worker 数**，不是 worker 总数。每个 session worker 启动前记录 `SessionMemoryEditor.revision`；任何一次成功 `replace_session_memory` 使 revision 增加，即使 child 随后 overflow、timeout、max-tokens、transport error 或漏调 finish，也把连续无进展计数清零并从当前 host-owned revision 继续。只有无 revision 变化的失败才消耗预算。
+- 每个 segment 单独开始一份连续无进展预算。首个 worker 仍按 D-006 使用 parent fork；同一 segment 的 continuation 仍使用 fresh same-model spawn，并通过 embedded assigned source 与 working handoff 接续。`finish_session_segment` 成功是唯一完成条件；前面 segment 已完成或当前 worker 仅自然停止都不替代它。
+- turn 与 session runner 保持各自清晰实现，不为了代码去重强行抽取统一 runner。二者必须用测试维持同一 progress/no-progress/finish 语义；只有出现边界和错误处理都完全相同的极小 helper 时才共享。
+- provider-confirmed context overflow 的外层恢复固定为 one-shot：同一个 active root turn 第一次 overflow 可以运行一次 session compaction；只有 surface replacement generation 确实增加时才重放原主模型请求一次。同一 turn 的重放请求若再次 overflow，直接保留 provider error，不再 compact/replay；agent 回到 idle 后清除 one-shot 状态。删除可配置的 `maxOverflowRetries` 与数字计数器。
+- pressure compaction 成功后仍高于 threshold 时继续选择另一段属于同一次 pressure policy 的多-pass convergence，不是 worker continuation 或主请求 replay；现有 `compactionRetries` 暂时保持独立语义，不参与上述预算。
+- 当前不把 stock `compaction-basic` 作为运行时第二 provider 或自动 fallback。一个 Cordis context 只能有一个 `ctx.compaction` service；完整 basic transaction 还会重新使用不接受 post-turn assistant replacement 的 upstream meter，并在真正容量不足时一次性 replay 同一大范围。未来若需要兜底，应在本 engine 内复用 basic-style one-shot summarizer，同时继续使用本插件的 canonical-surface pricing、lazy image reference 验证和单一 transaction，而不是并排加载两个 engine。
+
+### 可行性依据
+
+- `SessionMemoryEditor.revision` 在每次 accepted replacement 后同步递增并由 host 持有，和 turn job 的 `mutationCount` 一样不依赖 child 最终 stop reason；dispose 失败 child 后 fresh spawn 可以从最新 catalog/revision 继续。
+- `agent/request-error` 的 middleware 只有在返回 `{ kind: 'retry' }` 时才会重放刚失败的主请求；surface `replaceGeneration` 能证明 compaction 已实际产生可用于重放的新上下文。per-agent one-shot set 足以区分第一次与重放后的第二次 overflow，无需可配置计数。
+- session E2E 可以把连续无进展预算设为一，在第一个 segment 的 fork 完成一次 replacement 后强制其无 finish 结束；revision progress 必须允许 fresh spawn 继续并提交，直接覆盖旧固定-attempt 实现会错误耗尽的路径。
+
+### 已知边界
+
+- accepted editor state 仍只在当前进程存活；进程重启后的 turn recovery 或下一次 session compaction 从 canonical source 重新建立 job，不恢复半成品 revision。
+- 持续提交形式上有效但语义无价值的 mutation 可以持续重置预算；final validation、prompt contract 和日志用于发现这种模型行为。当前不另设会与“有进展即可续跑”冲突的 worker 总数上限。

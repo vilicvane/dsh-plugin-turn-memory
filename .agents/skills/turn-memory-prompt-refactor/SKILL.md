@@ -22,6 +22,7 @@ Treat these as stable requirements to reconstruct the prompt from, not as wordin
 - Inherited parent context supplies understanding, not provenance for arbitrary edits. Every rewritten node must select a continuous range containing the current nodes whose information it claims to use; specifically, a corrected user intent that incorporates a later steer must include that steer in its semantic sources.
 - Choose granularity from the interaction's information structure. Do not target a fixed node count or collapse a turn to one assistant node by default.
 - Treat the preceding 4→2 example as a joint semantic K→M rewrite. Its role-specific outputs depend on interleaved, non-contiguous source nodes inside one continuous input span. Do not fake it with misleading per-node coverage or weaken the product requirement to fit a K→1 editor; redesign the editing contract when necessary.
+- Preserve recoverable media without paying its eager context cost forever. Host-rendered `<memory-image ... />` markers are durable lazy references to original image blocks: retain their exact reference identity through rewritten turn nodes and session checkpoints, keep useful visual conclusions in text, and use `read_memory_image` only when the pixels are actually needed again.
 
 When the user clarifies another original prompt requirement, update this section so later refactors begin from product intent rather than inheriting the current prompt by accident.
 

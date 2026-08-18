@@ -27,23 +27,23 @@ describe('buildCompressionPrompt', () => {
       acceptedMutations: 0,
     });
 
-    assert.match(prompt, /Original user, assistant, and tool boundaries are evidence/);
-    assert.match(prompt, /insights or inspirations/);
-    assert.match(prompt, /trials and detours with their outcomes/);
-    assert.match(prompt, /fixes a typo or supplies missing information/);
-    assert.match(prompt, /semantic sources must include the later steer/);
-    assert.match(prompt, /Adjacent same-role nodes may remain/);
+    assert.match(prompt, /inspirations and discoveries/);
+    assert.match(prompt, /trials and detours with what they proved or ruled out/);
+    assert.match(prompt, /later steer fixes a typo or reveals the intended route/);
+    assert.match(prompt, /Select every current node whose information the outputs use/);
+    assert.match(prompt, /Adjacent same-role semantic nodes are allowed/);
     assert.match(prompt, /inherited context supplies understanding, not provenance/);
-    assert.match(prompt, /Audit the final current surface for chronology, role attribution, factual fidelity, and `sources=` coverage/);
-    assert.match(prompt, /Consolidating user intent does not erase work already performed/);
-    assert.match(prompt, /Do not make it narrate or take attribution for assistant actions/);
-    assert.match(prompt, /An `n\*` id is an original node that has not yet been rewritten/);
-    assert.match(prompt, /An `r\*` id is an accepted replacement already stored/);
+    assert.match(prompt, /Audit the complete current surface/);
+    assert.match(prompt, /Preserve actual off-route assistant work compactly/);
+    assert.match(prompt, /Never attribute assistant actions, tool outcomes/);
+    assert.match(prompt, /`n\*` is an unchanged original node/);
+    assert.match(prompt, /`r\*` is an accepted replacement/);
+    assert.match(prompt, /<memory-image ref="\.\.\."/);
+    assert.match(prompt, /read_memory_image/);
     assert.match(prompt, /No earlier worker has stopped/);
     assert.doesNotMatch(prompt, /An earlier worker stopped before authoritative completion/);
     assert.match(prompt, /n1 \| user .*home 中用到了哪些设备/);
     assert.match(prompt, /n3 \| user .*playground/);
-    assert.doesNotMatch(prompt, /Leave useful nodes unchanged/);
     assert.doesNotMatch(prompt, /E2E smoke protocol/);
   });
 
@@ -59,8 +59,8 @@ describe('buildCompressionPrompt', () => {
 
     assert.match(prompt, /worker 2/);
     assert.match(prompt, /An earlier worker stopped before authoritative completion/);
-    assert.match(prompt, /all 1 accepted replacement\(s\) made so far/);
-    assert.match(prompt, /inherited parent transcript predates these `r\*` edits/);
+    assert.match(prompt, /contains all 1 accepted replacement\(s\)/);
+    assert.match(prompt, /do not rebuild from the inherited original layout/);
     assert.match(prompt, /r1 \| user .*changed/);
     assert.doesNotMatch(prompt, /No earlier worker has stopped/);
   });
@@ -74,7 +74,7 @@ describe('buildCompressionPrompt', () => {
     });
 
     assert.match(prompt, /E2E smoke protocol \(follow exactly\)/);
-    assert.match(prompt, /current surface already contains the draft pair/);
+    assert.match(prompt, /earlier accepted replacement already created that draft pair/);
     for (const sentinel of [E2E_USER_SENTINEL, E2E_TOOL_SENTINEL, E2E_FINAL_SENTINEL, DRAFT_SENTINEL]) {
       assert.ok(prompt.includes(sentinel));
     }

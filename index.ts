@@ -25,6 +25,10 @@ import {
   turnCompressionBypassReason,
 } from './lib/turn-recovery.ts';
 import { WorkerToolScope } from './lib/worker-tools.ts';
+import {
+  assertMemoryImagesRetained,
+  createReadMemoryImageTool,
+} from './lib/memory-images.ts';
 import type { SessionCompactionConfig } from './lib/session-compaction.ts';
 import type { NodeRange, TurnNodeOutput, TurnNodeSeed } from './lib/editor.ts';
 
@@ -138,6 +142,11 @@ function validateLanding(job: CompressionJob, e2eSmoke: boolean): void {
     }
   }
   const events = job.session.events;
+  assertMemoryImagesRetained(
+    job.targetSeqs.map((seq) => events[seq]?.data),
+    nodes.map((node) => node.content).join('\n'),
+    'turn compression',
+  );
   validateProjectedToolProtocol(nodes, events);
   const modelSource = job.targetSeqs.map((seq) => events[seq])
     .find((event) => event?.type === 'assistant/message' && event.data?.message?.source?.kind === 'model')
@@ -246,8 +255,12 @@ function apply(ctx: any, config: PluginConfig = {}): void {
     return;
   }
   const coordinator = new MemoryCoordinator();
+  const readMemoryImageTool = createReadMemoryImageTool(ctx);
+  ctx.inject(['attachments'], (imageCtx: any) => {
+    imageCtx.tools.register(readMemoryImageTool);
+  });
   if (config.sessionCompaction?.enabled === true) {
-    new SessionMemoryCompactionEngine(ctx, config.sessionCompaction, coordinator);
+    new SessionMemoryCompactionEngine(ctx, config.sessionCompaction, coordinator, [readMemoryImageTool]);
   }
   if (config.turnCompression === false) {
     ctx.logger.info('turn-memory: completed-turn compression is disabled; session compaction remains independently configured');
@@ -284,7 +297,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
     return job;
   };
 
-  const turnToolDefinitions: any[] = [];
+  const turnToolDefinitions: any[] = [readMemoryImageTool];
   const addTurnTool = (definition: any): void => { turnToolDefinitions.push(definition); };
 
   addTurnTool(defineTool({

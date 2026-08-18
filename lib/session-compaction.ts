@@ -28,6 +28,7 @@ import {
 import type { PricedNode, SessionSegment } from './session-segments.ts';
 import type { SourceNodeRange } from './session-segments.ts';
 import { WorkerToolScope } from './worker-tools.ts';
+import { assertMemoryImagesRetained } from './memory-images.ts';
 
 export const SESSION_TOOL_NAMES = [
   'list_session_segments',
@@ -53,7 +54,7 @@ export interface SessionCompactionConfig {
   workerAttempts?: number;
   workerTimeoutMs?: number;
   compactionRetries?: number;
-  maxOverflowRetries?: number;
+  e2eInterruptSessionAfterFirstMutation?: boolean;
 }
 
 interface ResolvedSessionCompactionConfig {
@@ -69,7 +70,7 @@ interface ResolvedSessionCompactionConfig {
   workerAttempts: number;
   workerTimeoutMs: number;
   compactionRetries: number;
-  maxOverflowRetries: number;
+  e2eInterruptSessionAfterFirstMutation: boolean;
 }
 
 interface SurfaceSelection {
@@ -100,6 +101,7 @@ interface SessionCompactionJob {
   activeSegment?: number;
   activeChildSessionId?: string;
   finishConfirmed: boolean;
+  e2eInterrupted: boolean;
 }
 
 interface StagedFinish {
@@ -151,7 +153,7 @@ function resolveConfig(config: SessionCompactionConfig = {}): ResolvedSessionCom
     workerAttempts: positiveInteger(config.workerAttempts, 2, 'session compaction workerAttempts'),
     workerTimeoutMs: positiveInteger(config.workerTimeoutMs, 300_000, 'session compaction workerTimeoutMs'),
     compactionRetries: nonNegativeInteger(config.compactionRetries, 1, 'session compaction compactionRetries'),
-    maxOverflowRetries: nonNegativeInteger(config.maxOverflowRetries, 1, 'session compaction maxOverflowRetries'),
+    e2eInterruptSessionAfterFirstMutation: config.e2eInterruptSessionAfterFirstMutation === true,
   };
 }
 
@@ -344,14 +346,16 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
   private readonly coordinator: MemoryCoordinator;
   private readonly jobs = new Map<string, SessionCompactionJob>();
   private readonly stagedFinishes = new WeakMap<object, StagedFinish>();
-  private readonly overflowRetries = new WeakMap<object, number>();
+  private readonly overflowRecovered = new WeakSet<object>();
   private readonly measurementFallbackWarned = new WeakSet<object>();
   private readonly workerTools: WorkerToolScope;
+  private readonly sharedWorkerTools: readonly any[];
 
-  constructor(ctx: any, config: SessionCompactionConfig, coordinator: MemoryCoordinator) {
+  constructor(ctx: any, config: SessionCompactionConfig, coordinator: MemoryCoordinator, sharedWorkerTools: readonly any[] = []) {
     super(ctx);
     this.config = resolveConfig(config);
     this.coordinator = coordinator;
+    this.sharedWorkerTools = sharedWorkerTools;
     this.workerTools = this.createWorkerTools();
     if (this.config.auto) this.registerAutomaticCompaction();
     ctx.logger.info('turn-memory: session compaction mounted (main-model fork first, segmentTokens=' + this.config.segmentTokens + ')');
@@ -429,7 +433,7 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
 
   private createWorkerTools(): WorkerToolScope {
     const output = { schema: { type: 'string' as const }, render: (_args: unknown, value: string) => [{ type: 'text' as const, text: value }] };
-    const definitions: any[] = [];
+    const definitions: any[] = [...this.sharedWorkerTools];
     const add = (definition: any): void => { definitions.push(definition); };
     add(defineTool({
       name: 'list_session_segments',
@@ -542,6 +546,10 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
         const job = this.jobFor(exec);
         if (job.activeSegment === undefined) throw new Error('session compaction worker has no assigned segment');
         const result = job.editor.replace(job.activeSegment, args.expectedRevision, args.start, args.end, args.nodes as SessionMemoryOutput[]);
+        if (this.config.e2eInterruptSessionAfterFirstMutation && !job.e2eInterrupted && job.activeSegment === 1) {
+          job.e2eInterrupted = true;
+          exec.concludeTurn();
+        }
         return 'revision=' + result.revision + ' created=' + result.created.map((node) => node.id).join(',')
           + '\nlocal-neighborhood:\n' + result.neighborhood;
       },
@@ -605,12 +613,16 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
         job.activeSegment = segment.index;
         let completed = false;
         let lastError: unknown;
-        for (let attempt = 0; attempt < this.config.workerAttempts; attempt += 1) {
+        let workerNumber = 0;
+        let noProgressAttempts = 0;
+        while (noProgressAttempts < this.config.workerAttempts) {
           signal?.throwIfAborted();
-          const provider = attempt === 0 ? 'fork' : 'spawn';
+          workerNumber += 1;
+          const provider = workerNumber === 1 ? 'fork' : 'spawn';
           const workerMode = provider === 'fork' ? 'fork' : 'fresh-spawn';
           job.activeChildSessionId = undefined;
           job.finishConfirmed = false;
+          const revisionBefore = job.editor.revision;
           let run: any;
           const timeoutSignal = AbortSignal.timeout(this.config.workerTimeoutMs);
           const workerSignal = signal === undefined ? timeoutSignal : AbortSignal.any([signal, timeoutSignal]);
@@ -644,14 +656,25 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
           } catch (error) {
             lastError = error;
             if (signal?.aborted) signal.throwIfAborted();
-            this.ctx.logger.warn('turn-memory: session segment ' + segment.id + ' ' + provider + ' attempt failed: ' + errorText(error));
+            const accepted = job.editor.revision - revisionBefore;
+            if (accepted > 0) noProgressAttempts = 0;
+            else noProgressAttempts += 1;
+            const progress = accepted > 0
+              ? '; accepted revision progress reset consecutive no-progress attempts to 0/' + this.config.workerAttempts
+              : '; consecutive no-progress attempts=' + noProgressAttempts + '/' + this.config.workerAttempts;
+            const continuation = noProgressAttempts < this.config.workerAttempts
+              ? '; starting a fresh same-model worker from revision ' + job.editor.revision
+              : '';
+            this.ctx.logger.warn('turn-memory: session segment ' + segment.id + ' ' + provider + ' worker ' + workerNumber
+              + ' failed after ' + accepted + ' accepted revision(s): ' + errorText(error) + progress + continuation);
           } finally {
             if (run !== undefined) {
               try { await run.dispose(); } catch { /* best-effort child cleanup */ }
             }
           }
         }
-        if (!completed) throw new Error('session segment ' + segment.id + ' exhausted worker attempts', { cause: lastError });
+        if (!completed) throw new Error('session segment ' + segment.id + ' exhausted ' + this.config.workerAttempts
+          + ' consecutive no-progress worker attempts', { cause: lastError });
       }
       job.editor.validateFinal();
     } finally {
@@ -698,6 +721,7 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
       segments,
       editor: new SessionMemoryEditor(segments.length),
       finishConfirmed: false,
+      e2eInterrupted: false,
     };
     const compactionId = CompactionId(randomUUID());
     const lifecycle = {
@@ -726,6 +750,11 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
         if (!isDeepStrictEqual(currentPriced, selectedPriced)) throw new Error('session compaction selected span was repriced while workers ran');
       }
       const checkpointText = job.editor.renderCheckpoint();
+      assertMemoryImagesRetained(
+        selection.shadowedSeqs.map((seq) => session.events[seq]?.data),
+        checkpointText,
+        'session compaction',
+      );
       const summary = [{ type: 'text' as const, text: checkpointText }];
       const checkpointMessage = createUserMessage({
         content: summary,
@@ -800,17 +829,16 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
       return next();
     });
     this.ctx.on('agent/status', ({ agent, status }: any) => {
-      if (status === 'idle') this.overflowRetries.delete(agent);
+      if (status === 'idle') this.overflowRecovered.delete(agent);
     });
     this.ctx.on('agent/request-error', async ({ agent, failure, signal }: any, next: () => Promise<any>) => {
       if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE || signal.aborted) return next();
-      const retries = this.overflowRetries.get(agent) ?? 0;
-      if (retries >= this.config.maxOverflowRetries) return next();
+      if (this.overflowRecovered.has(agent)) return next();
       const generation = agent.session.surface.replaceGeneration;
       try {
         const result = await this.compactIfNeeded(agent, 'context-overflow', signal);
         if (result === null || signal.aborted || agent.session.surface.replaceGeneration <= generation) return next();
-        this.overflowRetries.set(agent, retries + 1);
+        this.overflowRecovered.add(agent);
         return { kind: 'retry' };
       } catch (error) {
         this.ctx.logger.warn('turn-memory: context-overflow session compaction failed: ' + errorText(error));

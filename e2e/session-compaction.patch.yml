@@ -9,9 +9,10 @@
       enabled: true
       auto: false
       segmentTokens: 1000
-      workerAttempts: 2
+      workerAttempts: 1
       workerMaxTokens: 8192
       workerTimeoutMs: 300000
+      e2eInterruptSessionAfterFirstMutation: true
 
 - id: test-runner
   disabled: true

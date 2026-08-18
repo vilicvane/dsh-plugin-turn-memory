@@ -318,3 +318,11 @@
 
 - accepted editor state 仍只在当前进程存活；进程重启后的 turn recovery 或下一次 session compaction 从 canonical source 重新建立 job，不恢复半成品 revision。
 - 持续提交形式上有效但语义无价值的 mutation 可以持续重置预算；final validation、prompt contract 和日志用于发现这种模型行为。当前不另设会与“有进展即可续跑”冲突的 worker 总数上限。
+
+## D-012：content block 支持边界
+
+状态：**已确认**
+
+- DSH `0.1.0-rc.7` core 的 `ContentBlockMap` 仍只有 `text`、`reasoning`、`image`、`tool-call` 和 `tool-result`；对 rc.7 官方 base bundle 全部插件的声明扫描没有发现任何官方 module augmentation 增加其他 content block。provider SDK 内部的 audio、file、video、document 等 wire type 不属于 DSH durable message vocabulary。
+- `reasoning` 暂不投影进 turn/session compression source：当前真实 reasoning 噪音过大，直接保留会违背压缩目标。未改写的原始 turn 节点仍保持原 event；一旦节点被 turn replacement 改写或进入 session checkpoint，raw reasoning 不进入新 surface。值得延续的假设、试错结论、灵感和判断依据仍应由 worker 从可见交互中压缩为普通 assistant memory，但不为隐藏 reasoning 本身建立保真或 lazy-read 机制。
+- `tool-call`／`tool-result` 继续采用现有的部分语义投影与 host tool-pair validation，不承诺把 call id、error flag 和 provider replay metadata 复制进压缩文本。未来若官方或第三方扩展 `ContentBlockMap`，必须先明确该 block 的保留、lazy reference 或显式丢弃策略，不能因为结构里恰好存在 `content` 字段就假设已经支持。

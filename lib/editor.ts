@@ -32,6 +32,7 @@ export interface NodeRange {
 export interface ReplaceResult {
   created: TurnNodeSnapshot[];
   sourceIndexes: number[];
+  sourceRanges: string;
   catalog: string;
 }
 
@@ -168,6 +169,7 @@ export class TurnNodeEditor {
     return {
       created: created.map(cloneNode),
       sourceIndexes: [...sourceIndexes],
+      sourceRanges: renderIndexes(sourceIndexes),
       catalog: this.structuralCatalog(),
     };
   }

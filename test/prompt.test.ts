@@ -32,7 +32,7 @@ describe('buildCompressionPrompt', () => {
     assert.match(prompt, /later steer fixes a typo or reveals the intended route/);
     assert.match(prompt, /Select every current node whose information the outputs use/);
     assert.match(prompt, /Adjacent same-role semantic nodes are allowed/);
-    assert.match(prompt, /inherited context supplies understanding, not provenance/);
+    assert.match(prompt, /Inherited context supplies understanding, not provenance/);
     assert.match(prompt, /Audit the complete current surface/);
     assert.match(prompt, /Preserve actual off-route assistant work compactly/);
     assert.match(prompt, /Never attribute assistant actions, tool outcomes/);
@@ -40,6 +40,9 @@ describe('buildCompressionPrompt', () => {
     assert.match(prompt, /`r\*` is an accepted replacement/);
     assert.match(prompt, /<memory-image ref="\.\.\."/);
     assert.match(prompt, /read_memory_image/);
+    assert.match(prompt, /Runtime-context snapshots, `<turn-memory-continuation>` reminders/);
+    assert.match(prompt, /not human requests/);
+    assert.match(prompt, /intentional continuation should leave a compact assistant account/);
     assert.match(prompt, /No earlier worker has stopped/);
     assert.doesNotMatch(prompt, /An earlier worker stopped before authoritative completion/);
     assert.match(prompt, /n1 \| user .*home 中用到了哪些设备/);

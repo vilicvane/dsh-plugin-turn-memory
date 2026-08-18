@@ -10,6 +10,10 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 import { TURN_TOOL_NAMES } from '../index.ts';
 import { SESSION_TOOL_NAMES } from '../lib/session-compaction.ts';
 import { READ_MEMORY_IMAGE_TOOL_NAME } from '../lib/memory-images.ts';
+import {
+  TURN_CONTINUATION_TOOL_NAME,
+  continuationRequestForTurn,
+} from '../lib/turn-continuation.ts';
 
 const name = 'turn-memory-e2e-runner';
 const inject = ['agentDefaultModel', 'agents', 'sessionQuery', 'sessions', 'tools'];
@@ -17,6 +21,7 @@ const inject = ['agentDefaultModel', 'agents', 'sessionQuery', 'sessions', 'tool
 const USER_SENTINEL = 'E2E-USER-GAMMA-194';
 const TOOL_SENTINEL = 'E2E-FIXTURE-ALPHA-771';
 const FINAL_SENTINEL = 'PARENT-FINAL-BETA-332';
+const CONTINUATION_SENTINEL = 'CONTINUATION-DELTA-908';
 const DRAFT_SENTINEL = '__DRAFT_PASS__';
 const INTERNAL_TOOL_NAMES = [...TURN_TOOL_NAMES, ...SESSION_TOOL_NAMES];
 
@@ -36,6 +41,7 @@ function compressionNodes(session: any): any[] {
 function assertInternalToolsHidden(session: any, phase: string): void {
   const visible = new Set((session.requestHeader()?.tools ?? []).map((tool: any) => tool.name));
   assert.ok(visible.has(READ_MEMORY_IMAGE_TOOL_NAME), phase + ': public lazy-memory image tool is missing');
+  assert.ok(visible.has(TURN_CONTINUATION_TOOL_NAME), phase + ': public long-turn continuation tool is missing');
   for (const name of INTERNAL_TOOL_NAMES) {
     assert.ok(!visible.has(name), phase + ': internal worker tool leaked into the parent request header: ' + name);
   }
@@ -49,6 +55,23 @@ async function waitForCompression(session: any, timeoutMs: number): Promise<any[
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error('timed out waiting for the turn-memory compression after ' + timeoutMs + 'ms');
+}
+
+async function waitForContinuation(session: any, timeoutMs: number): Promise<{ user: any; assistant: any }> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const user = session.events.find((event: any) =>
+      event?.type === 'user/message'
+      && event.data?.source?.plugin === 'turn-memory'
+      && event.data.source.phase === 'continuation');
+    const assistant = user === undefined ? undefined : session.events.find((event: any) =>
+      event?.type === 'assistant/message'
+      && event.seq > user.seq
+      && textOf(event).includes(CONTINUATION_SENTINEL));
+    if (user !== undefined && assistant !== undefined) return { user, assistant };
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error('timed out waiting for the automatic continuation turn after ' + timeoutMs + 'ms');
 }
 
 function assertProjection(session: any, nodes: any[], phase: string): void {
@@ -111,6 +134,8 @@ async function run(ctx: any): Promise<void> {
   let liveHandle: any;
   let recoveryHandle: any;
   let coldHandle: any;
+  let continuationLiveHandle: any;
+  let continuationRecoveryHandle: any;
   try {
     liveHandle = await agents.create({
       sessionId: 'session-turn-memory-e2e-' + randomUUID(),
@@ -169,6 +194,53 @@ async function run(ctx: any): Promise<void> {
       .map((seq: number) => coldHandle.agent.session.events[seq]);
     assert.deepEqual(snapshot.events, expectedSurfaceEvents, 'sessionQuery surface must equal the cold live surface');
     const artifactDir = resolve(process.env.TURN_MEMORY_E2E_ARTIFACT_DIR ?? '.tmp');
+
+    continuationLiveHandle = await agents.create({
+      sessionId: 'session-turn-memory-continuation-e2e-' + randomUUID(),
+      meta: { cwd: process.cwd() },
+      agentOptions: { provider: selection.provider, model: selection.model },
+      setup,
+    });
+    await continuationLiveHandle.agent.whenIdle();
+    continuationLiveHandle.agent.followup({
+      id: randomUUID(),
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: USER_SENTINEL + ': Call turn_memory_e2e_fixture exactly once. Then call '
+          + TURN_CONTINUATION_TOOL_NAME + ' with this exact handoff: "' + FINAL_SENTINEL
+          + ': Reply with exactly ' + CONTINUATION_SENTINEL + ' and do no other work." Do not answer normally before calling it.',
+      }],
+      source: { kind: 'user' },
+    });
+    await continuationLiveHandle.agent.whenIdle();
+    const continuationRequest = continuationRequestForTurn(continuationLiveHandle.agent.session, 1);
+    assert.notEqual(continuationRequest, undefined, 'long live turn did not record a durable continuation request');
+    assert.equal(compressionNodes(continuationLiveHandle.agent.session).length, 0,
+      'continuation fixture should defer live compression until recovery');
+    const continuationSessionId = continuationLiveHandle.agent.session.id;
+    await sessions.flush(continuationLiveHandle.agent.session);
+    await continuationLiveHandle.dispose();
+    continuationLiveHandle = undefined;
+
+    continuationRecoveryHandle = await agents.resume({
+      resumeSessionId: continuationSessionId,
+      agentOptions: { provider: selection.provider, model: selection.model },
+      setup,
+    });
+    const continuationCompressed = await waitForCompression(continuationRecoveryHandle.agent.session, timeoutMs);
+    assertProjection(continuationRecoveryHandle.agent.session, continuationCompressed, 'continuation recovery');
+    const continued = await waitForContinuation(continuationRecoveryHandle.agent.session, timeoutMs);
+    assert.match(textOf(continued.user), /not new human input/,
+      'automatic follow-up did not disclose its plugin origin');
+    assert.ok(continued.assistant.data.turn > continuationRequest!.turn,
+      'automatic continuation did not open a later turn');
+    await sessions.flush(continuationRecoveryHandle.agent.session);
+    const continuationSnapshot = await sessionQuery.readSurface(continuationSessionId);
+    const continuationSurfacePath = resolve(artifactDir, 'e2e-surface-' + continuationSessionId + '.json');
+    await mkdir(artifactDir, { recursive: true });
+    await writeFile(continuationSurfacePath, JSON.stringify(continuationSnapshot, null, 2) + '\n', 'utf8');
+
     const surfacePath = resolve(artifactDir, 'e2e-surface-' + sessionId + '.json');
     await mkdir(artifactDir, { recursive: true });
     await writeFile(surfacePath, JSON.stringify(snapshot, null, 2) + '\n', 'utf8');
@@ -177,9 +249,13 @@ async function run(ctx: any): Promise<void> {
     console.log('E2E_MUTATIONS=' + compressed[0].data.source.mutations);
     console.log('E2E_WORKER_ATTEMPTS=' + compressed[0].data.source.workerAttempts);
     console.log('E2E_RECOVERY=agent-resume-backfill');
+    console.log('E2E_CONTINUATION=compressed-then-followup');
+    console.log('E2E_CONTINUATION_SURFACE_PATH=' + continuationSurfacePath);
     console.log('E2E_SURFACE_PATH=' + surfacePath);
     console.log('E2E_RESULT=PASS');
   } finally {
+    if (continuationRecoveryHandle !== undefined) await continuationRecoveryHandle.dispose();
+    if (continuationLiveHandle !== undefined) await continuationLiveHandle.dispose();
     if (coldHandle !== undefined) await coldHandle.dispose();
     if (recoveryHandle !== undefined) await recoveryHandle.dispose();
     if (liveHandle !== undefined) await liveHandle.dispose();

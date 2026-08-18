@@ -29,11 +29,13 @@ import {
   assertMemoryImagesRetained,
   createReadMemoryImageTool,
 } from './lib/memory-images.ts';
+import { TurnContinuationController } from './lib/turn-continuation.ts';
 import type { SessionCompactionConfig } from './lib/session-compaction.ts';
+import type { TurnContinuationConfig } from './lib/turn-continuation.ts';
 import type { NodeRange, TurnNodeOutput, TurnNodeSeed } from './lib/editor.ts';
 
 const name = 'turn-memory';
-const inject = ['agents', 'llm', 'sessionQuery', 'sessions', 'subagents', 'tokenMeter', 'tools'];
+const inject = ['agents', 'llm', 'sessionQuery', 'sessions', 'subagents', 'systemPrompt', 'tokenMeter', 'tools'];
 
 export const TURN_TOOL_NAMES = [
   'list_turn_nodes',
@@ -54,6 +56,7 @@ interface PluginConfig {
   previewChars?: number;
   maxReadChars?: number;
   surfaceDumpDir?: string;
+  turnContinuation?: TurnContinuationConfig;
   sessionCompaction?: SessionCompactionConfig;
 }
 
@@ -277,6 +280,9 @@ function apply(ctx: any, config: PluginConfig = {}): void {
   const surfaceDumpDir = typeof config.surfaceDumpDir === 'string' && config.surfaceDumpDir.trim() !== ''
     ? resolve(config.surfaceDumpDir)
     : DEFAULT_SURFACE_DUMP_DIR;
+  const turnContinuation = config.turnContinuation?.enabled === false
+    ? undefined
+    : new TurnContinuationController(ctx, config.turnContinuation);
   const jobs = new Map<string, CompressionJob>();
   const pendingTurns = new Map<string, Map<number, Set<string>>>();
   const pumps = new Map<string, Promise<void>>();
@@ -362,7 +368,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
       const result = job.editor.replace(args.start, args.end, args.nodes as TurnNodeOutput[]);
       job.mutationCount += 1;
       const output = 'created=' + result.created.map((node) => node.id).join(',')
-        + ' jointly-derived-from=' + result.sourceIndexes.map((index) => 'n' + index).join(',')
+        + ' jointly-derived-from=' + result.sourceRanges
         + '\ncurrent:\n' + result.catalog;
       if (e2eInterruptAfterFirstMutation && job.workerNumber === 1 && job.mutationCount === 1) {
         exec.concludeTurn();
@@ -395,9 +401,15 @@ function apply(ctx: any, config: PluginConfig = {}): void {
     if (!result.isError) job.finishConfirmed = true;
   });
 
-  const persistLanding = async (job: CompressionJob): Promise<void> => {
+  const persistLanding = async (job: CompressionJob): Promise<boolean> => {
     try {
       await ctx.sessions.flush(job.session);
+    } catch (error) {
+      ctx.logger.warn('turn-memory: compression landing flush failed: '
+        + (error instanceof Error ? error.message : String(error)));
+      return false;
+    }
+    try {
       const snapshot = await ctx.sessionQuery.readSurface(job.parentSessionId);
       const surfacePath = resolve(surfaceDumpDir, 'e2e-surface-' + encodeURIComponent(job.parentSessionId) + '.json');
       await mkdir(surfaceDumpDir, { recursive: true });
@@ -406,9 +418,10 @@ function apply(ctx: any, config: PluginConfig = {}): void {
     } catch (error) {
       ctx.logger.warn('turn-memory: surface snapshot failed: ' + (error instanceof Error ? error.message : String(error)));
     }
+    return true;
   };
 
-  const runCompression = async (job: CompressionJob): Promise<void> => {
+  const runCompression = async (job: CompressionJob): Promise<boolean> => {
     try {
       let completed = false;
       let lastError: unknown;
@@ -475,11 +488,13 @@ function apply(ctx: any, config: PluginConfig = {}): void {
       }
       validateLanding(job, e2eSmoke);
       land(job);
-      await persistLanding(job);
+      if (!await persistLanding(job)) return false;
       ctx.logger.info('turn-memory: turn ' + job.turn + ' compression landed (' + job.targetSeqs.length + ' -> '
         + job.editor.snapshot().length + ', mutations=' + job.mutationCount + ', workerAttempts=' + job.workerNumber + ')');
+      return true;
     } catch (error) {
       ctx.logger.warn('turn-memory: turn ' + job.turn + ' compression failed: ' + (error instanceof Error ? error.message : String(error)));
+      return false;
     } finally {
       if (jobs.get(job.parentSessionId) === job) jobs.delete(job.parentSessionId);
     }
@@ -524,6 +539,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
       if (turns!.size === 0) pendingTurns.delete(sessionId);
       if (compressedTurnNumbers(agent.session).has(nextTurn)) {
         ctx.logger.info('turn-memory: turn ' + nextTurn + ' is already compressed; removed duplicate queued work');
+        await turnContinuation?.dispatchAfterCompression(agent, nextTurn);
         continue;
       }
       const event = findCompletedTurnEnd(agent.session, nextTurn);
@@ -543,14 +559,16 @@ function apply(ctx: any, config: PluginConfig = {}): void {
         if (bypassReason !== undefined) {
           ctx.logger.info('turn-memory: recording turn ' + nextTurn + ' as a durable no-op without a worker: ' + bypassReason);
           land(job);
-          await persistLanding(job);
+          if (!await persistLanding(job)) continue;
           ctx.logger.info('turn-memory: turn ' + nextTurn + ' no-op marker landed (' + job.targetSeqs.length
             + ' nodes, workerAttempts=0)');
+          await turnContinuation?.dispatchAfterCompression(agent, nextTurn);
           continue;
         }
         jobs.set(sessionId, job);
         ctx.logger.info('turn-memory: starting turn ' + nextTurn + ' compression from ' + sources);
-        await runCompression(job);
+        const landed = await runCompression(job);
+        if (landed) await turnContinuation?.dispatchAfterCompression(agent, nextTurn);
       } catch (error) {
         ctx.logger.warn('turn-memory: could not prepare or process turn ' + nextTurn + ' from ' + sources + ': '
           + (error instanceof Error ? error.message : String(error)));
@@ -609,7 +627,8 @@ function apply(ctx: any, config: PluginConfig = {}): void {
       const compressed = compressedTurnNumbers(session);
       let queued = 0;
       for (const end of ends) {
-        if (compressed.has(end.data.turn)) continue;
+        if (compressed.has(end.data.turn)
+          && turnContinuation?.needsDispatchAfterCompression(session, end.data.turn) !== true) continue;
         if (enqueueTurn(sessionId, end.data.turn, 'agent recovery scan')) queued += 1;
       }
       if (ends.length > 0 || (pendingTurns.get(sessionId)?.size ?? 0) > 0) {

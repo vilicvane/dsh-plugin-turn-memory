@@ -1,0 +1,226 @@
+import assert from 'node:assert/strict';
+import { describe, test } from 'node:test';
+
+import {
+  TURN_CONTINUATION_TOOL_NAME,
+  TurnContinuationController,
+  countOpenTurnNodes,
+  continuationMilestone,
+  continuationRequestForTurn,
+  continuationWasDelivered,
+  latestAnnouncedMilestone,
+  openTurnNumber,
+} from '../lib/turn-continuation.ts';
+
+function message(text: string, source: any = { kind: 'user' }): any {
+  return { id: 'm-' + text, role: 'user', content: [{ type: 'text', text }], source };
+}
+
+function fixtureSession(): any {
+  const events: any[] = [];
+  const surface = { nodes: [] as number[] };
+  const append = (type: string, data: any, surfaceOp?: any): any => {
+    const event = { seq: events.length, type, data, ...(surfaceOp === undefined ? {} : { surfaceOp }) };
+    events.push(event);
+    if (surfaceOp === 'append') surface.nodes.push(event.seq);
+    return event;
+  };
+  return { events, surface, header: {}, append };
+}
+
+const meter = {
+  measure(): any {
+    return { totalTokens: 111, surfaceTokens: 0, nodes: [] };
+  },
+};
+
+describe('turn continuation measurement', () => {
+  test('counts only append-origin open-turn messages and excludes runtime snapshots', () => {
+    const session = fixtureSession();
+    session.append('user/message', message('old'), 'append');
+    session.append('turn/start', { turn: 2 });
+    session.append('user/message', message('12345'), 'append');
+    session.append('user/message', message('runtime-noise', {
+      kind: 'plugin',
+      plugin: '@deepseek-ai/dsh-system-prompt',
+      form: 'snapshot',
+      sections: [],
+    }), 'append');
+    session.append('assistant/message', {
+      turn: 2,
+      step: 1,
+      message: { id: 'a1', role: 'assistant', content: [{ type: 'text', text: '1234567' }], source: { kind: 'model', provider: 'p', model: 'm' } },
+    }, 'append');
+    const replacement = session.append('user/message', message('old-checkpoint', {
+      kind: 'plugin', plugin: 'compact', form: 'notice', summary: 'checkpoint',
+    }), { op: 'replace', start: 0, end: 0 });
+    session.surface.nodes.unshift(replacement.seq);
+
+    assert.equal(openTurnNumber(session), 2);
+    assert.equal(countOpenTurnNodes(session, 2), 2);
+    assert.equal(continuationMilestone(2, 2), 2);
+    session.append('turn/end', { turn: 2, reason: { kind: 'completed' } });
+    assert.equal(openTurnNumber(session), null);
+  });
+});
+
+describe('turn continuation lifecycle', () => {
+  test('requests, ends, dispatches, and durably deduplicates a continuation', async () => {
+    const tools = new Map<string, any>();
+    const contexts: any[] = [];
+    let flushes = 0;
+    const ctx = {
+      tokenMeter: meter,
+      tools: { register: (tool: any) => tools.set(tool.name, tool) },
+      systemPrompt: { context: (context: any) => contexts.push(context) },
+      sessions: { flush: async () => { flushes += 1; } },
+      logger: { info() {}, warn() {} },
+    };
+    const controller = new TurnContinuationController(ctx, { reminderIntervalNodes: 2 });
+    const session = fixtureSession();
+    session.append('turn/start', { turn: 1 });
+    session.append('user/message', message('123456789'), 'append');
+    session.append('assistant/message', {
+      turn: 1,
+      step: 1,
+      message: { id: 'a1', role: 'assistant', content: [{ type: 'text', text: 'tool call' }], source: { kind: 'model', provider: 'p', model: 'm' } },
+    }, 'append');
+    const delivered: any[] = [];
+    const agent = {
+      session,
+      followup(value: any) {
+        delivered.push(value);
+        session.append('agent/inbox/spliced', {
+          target: 'next-turn', start: 0, inserted: [value],
+        });
+      },
+    };
+
+    const notice = contexts[0].text({ agent });
+    assert.match(notice, /milestone-nodes="2"/);
+    assert.match(notice, /open-turn-nodes="2"/);
+    assert.match(notice, /context-estimated-tokens="111"/);
+    assert.match(notice, /<assistant-self-check>/);
+    assert.match(notice, /I need to stop and summarize this turn now/);
+    assert.match(notice, /whole task will finish in the next few actions/);
+    assert.match(notice, new RegExp(TURN_CONTINUATION_TOOL_NAME));
+    assert.ok(notice.length < 900, 'continuation notice should stay concise');
+    session.append('user/message', message(notice, {
+      kind: 'plugin',
+      plugin: '@deepseek-ai/dsh-system-prompt',
+      form: 'snapshot',
+      sections: [{ name: 'turn-memory:long-turn-continuation', text: notice }],
+    }), 'append');
+    assert.equal(latestAnnouncedMilestone(session, 1), 2);
+    assert.equal(contexts[0].text({ agent }), '', 'the same milestone must be shown only once');
+    session.append('user/message', message('1234567'), 'append');
+    session.append('assistant/message', {
+      turn: 1,
+      step: 2,
+      message: { id: 'a2', role: 'assistant', content: [{ type: 'text', text: 'next' }], source: { kind: 'model', provider: 'p', model: 'm' } },
+    }, 'append');
+    const secondNotice = contexts[0].text({ agent });
+    assert.match(secondNotice, /milestone-nodes="4"/);
+    assert.match(secondNotice, /I need to stop and summarize this turn now/);
+
+    let concluded = false;
+    const tool = tools.get(TURN_CONTINUATION_TOOL_NAME);
+    session.append('tool/call', {
+      turn: 1,
+      step: 1,
+      callId: 'call-continuation-1',
+      name: TURN_CONTINUATION_TOOL_NAME,
+      arguments: JSON.stringify({ handoff: 'Run the remaining verification.' }),
+    });
+    const result = await tool.execute({ handoff: 'Run the remaining verification.' }, {
+      agent,
+      callId: 'call-continuation-1',
+      concludeTurn: () => { concluded = true; },
+    });
+    assert.equal(concluded, true);
+    assert.match(result, /queued/);
+    assert.equal(continuationRequestForTurn(session, 1), undefined,
+      'a tool call is not authoritative before its successful result');
+    session.append('tool/result', {
+      turn: 1,
+      step: 1,
+      message: {
+        id: 'result-continuation-1',
+        role: 'user',
+        source: { kind: 'tool', callId: 'call-continuation-1' },
+        content: [{
+          type: 'tool-result',
+          toolCallId: 'call-continuation-1',
+          content: [{ type: 'text', text: result }],
+          isError: false,
+        }],
+      },
+    });
+    const request = continuationRequestForTurn(session, 1);
+    assert.equal(request?.handoff, 'Run the remaining verification.');
+    assert.equal(contexts[0].text({ agent }), '');
+    assert.equal(controller.needsDispatchAfterCompression(session, 1), true);
+
+    assert.equal(await controller.dispatchAfterCompression(agent, 1), true);
+    assert.equal(delivered.length, 1);
+    assert.match(delivered[0].content[0].text, /not new human input/);
+    assert.match(delivered[0].content[0].text, /Continue the unfinished work now/);
+    assert.equal(continuationWasDelivered(session, request!.requestId), true);
+    assert.equal(controller.needsDispatchAfterCompression(session, 1), false);
+    assert.equal(await controller.dispatchAfterCompression(agent, 1), false);
+    assert.equal(delivered.length, 1);
+    assert.equal(flushes, 1);
+  });
+
+  test('rejects premature and child-agent requests', async () => {
+    const tools = new Map<string, any>();
+    const ctx = {
+      tokenMeter: meter,
+      tools: { register: (tool: any) => tools.set(tool.name, tool) },
+      systemPrompt: { context() {} },
+      sessions: { flush: async () => {} },
+      logger: { info() {}, warn() {} },
+    };
+    new TurnContinuationController(ctx, { reminderIntervalNodes: 2 });
+    const session = fixtureSession();
+    session.append('turn/start', { turn: 1 });
+    session.append('user/message', message('short'), 'append');
+    const tool = tools.get(TURN_CONTINUATION_TOOL_NAME);
+    await assert.rejects(tool.execute({ handoff: 'next' }, {
+      agent: { session }, concludeTurn() {},
+    }), /below first reminder milestone/);
+    session.header.parentSession = 'parent';
+    await assert.rejects(tool.execute({ handoff: 'next' }, {
+      agent: { session }, concludeTurn() {},
+    }), /root conversation/);
+  });
+
+  test('recovers a successful Code Mode sub-dispatch as the same durable request', () => {
+    const session = fixtureSession();
+    session.append('turn/start', { turn: 3 });
+    session.append('tool/code-dispatch-start', {
+      rootCallId: 'run-code-1',
+      parentCallId: 'run-code-1',
+      subCallId: 'run-code-1:code:0',
+      name: TURN_CONTINUATION_TOOL_NAME,
+      arguments: { handoff: 'Resume the code-mode verification.' },
+    });
+    session.append('tool/code-dispatch', {
+      rootCallId: 'run-code-1',
+      parentCallId: 'run-code-1',
+      subCallId: 'run-code-1:code:0',
+      name: TURN_CONTINUATION_TOOL_NAME,
+      arguments: { handoff: 'Resume the code-mode verification.' },
+      isError: false,
+      content: [{ type: 'text', text: 'queued' }],
+    });
+    session.append('turn/end', { turn: 3, reason: { kind: 'completed' } });
+
+    assert.deepEqual(continuationRequestForTurn(session, 3), {
+      version: 1,
+      requestId: 'run-code-1:code:0',
+      turn: 3,
+      handoff: 'Resume the code-mode verification.',
+    });
+  });
+});

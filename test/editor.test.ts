@@ -26,6 +26,7 @@ describe('TurnNodeEditor', () => {
     assert.deepEqual(result.created[1].sourceIndexes, [1, 2, 3, 4]);
     assert.deepEqual(result.created[0].sourceSeqs, [10, 11, 12, 13]);
     assert.deepEqual(result.created[1].sourceSeqs, [10, 11, 12, 13]);
+    assert.equal(result.sourceRanges, 'n1..n4');
     assert.match(result.catalog, /r1 user lands=n1\.\.n2 sources=n1\.\.n4 changed/);
     assert.match(result.catalog, /r2 assistant lands=n3\.\.n4 sources=n1\.\.n4 changed/);
     draft.validateFinal();

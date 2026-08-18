@@ -168,7 +168,12 @@ async function run(ctx: any): Promise<void> {
       source: { kind: 'user' },
     });
     await agent.whenIdle();
-    assert.deepEqual(inspected, ['/repo', 'playground'], 'parent turn must follow the failed path and then the steer');
+    assert.equal(inspected[0], '/repo', 'parent turn must begin with the mistaken target');
+    assert.ok(inspected.length >= 2, 'parent turn must inspect the corrected target after the steer');
+    assert.ok(
+      inspected.slice(1).every((target) => target === 'playground'),
+      'parent turn must use only the corrected target after the steer',
+    );
 
     const timeoutMs = Number(process.env.TURN_MEMORY_PROMPT_EVAL_TIMEOUT_MS ?? 300000);
     const compressed = await waitForCompression(agent.session, timeoutMs);

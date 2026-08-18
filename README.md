@@ -7,6 +7,7 @@ The active implementation is being rebuilt from the researched agreements in
 The plugin now has two coordinated layers:
 
 - completed-turn compression uses a parent `fork` and lands an N→M transcript rewrite;
+- long root turns receive a model-visible handoff reminder and can continue in a fresh turn after their completed-turn compression lands;
 - optional root-session compaction provides `ctx.compaction`, processes a selected completed-history range through sequential main-model workers, and commits one standard durable checkpoint only after the host-owned working draft is complete.
 - compressed image blocks can become durable `<memory-image ref="..." />` text references; `read_memory_image` reloads the original pixels on demand instead of placing them in every later model request.
 
@@ -52,6 +53,9 @@ untouched:
       config:
         enabled: true
         turnCompression: true
+        turnContinuation:
+          enabled: true
+          reminderIntervalNodes: 30
 ```
 
 ### Completed-turn and whole-session compaction
@@ -94,6 +98,8 @@ The main tuning options are:
 | `enabled` | `false` | Enables the plugin. |
 | `turnCompression` | `true` | Compresses each completed root-session turn with a forked main-model worker. |
 | `turnWorkerAttempts` | `3` | Consecutive failed workers allowed without an accepted replacement. Every successful replacement resets this budget. |
+| `turnContinuation.enabled` | `true` | Lets a long root turn explicitly hand off, end, compress, and resume as a new turn. |
+| `turnContinuation.reminderIntervalNodes` | `30` | Open-turn surface-node interval for one-shot continuation reminders: 30, 60, 90, and so on. |
 | `previewChars` | `120` | Characters shown for each node in the turn catalog. |
 | `maxReadChars` | `30000` | Maximum text returned by a turn-node read. |
 | `surfaceDumpDir` | plugin `.tmp/` | Directory receiving the latest folded-surface snapshot for each session. |
@@ -109,6 +115,8 @@ The main tuning options are:
 | `sessionCompaction.compactionRetries` | `1` | Additional pressure-compaction passes allowed when a successful checkpoint still leaves the surface above `thresholdRatio`. |
 
 Each session segment first uses the parent's provider/model through `fork`. If it stops without an authoritative finish, continuation workers use the same main model through fresh `spawn`, with the assigned canonical source and accepted host-owned revision embedded in the prompt. A provider error, timeout, max-token stop, or missing finish consumes the budget only when that worker produced no accepted revision. Both prompt files are read for each new worker, so prompt edits do not require a Web restart.
+
+At each multiple of `turnContinuation.reminderIntervalNodes` reached by one root turn, its dynamic runtime context gives the model a short first-person `<assistant-self-check>` to stop, summarize the handoff, and call `continue_after_turn_compression`. This remains plugin context rather than a fabricated durable assistant message. The model may keep the current turn only when the whole task will finish in the next few actions; an in-progress atomic mutation is finished before handing off. The counter includes append-origin model-visible messages in the open turn and excludes replaceable runtime snapshots. The notice includes the current node count and estimated token size of the entire canonical context. Durable runtime snapshots remember which milestones were already shown, including across a restart. The successful durable native tool pair or Code Mode sub-dispatch records completed progress, current state, and exact next work, then concludes the turn. The plugin first lands and flushes normal completed-turn compression, then submits an automatic plugin-sourced follow-up as a separate ordinary turn. If compression has not succeeded, continuation does not start; cold-resume recovery can finish the missing compression and dispatch the still-pending request without duplicating an already inserted follow-up.
 
 The plugin exposes `read_memory_image` to the main conversation and both compression-worker types when the profile has an attachment store. Compression retains the content-addressed attachment id rather than a local path, and the tool accepts only ids that really occur in the current session or its active root parent. The original pixels are loaded only for the tool request and only when the active model declares image input.
 

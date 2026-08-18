@@ -6,6 +6,8 @@
     e2eInterruptAfterFirstMutation: true
     e2eDeferTurnCompressionUntilResume: true
     turnWorkerAttempts: 1
+    turnContinuation:
+      reminderIntervalNodes: 2
     previewChars: 120
     maxReadChars: 30000
 

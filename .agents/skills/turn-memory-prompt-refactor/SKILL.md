@@ -23,6 +23,7 @@ Treat these as stable requirements to reconstruct the prompt from, not as wordin
 - Choose granularity from the interaction's information structure. Do not target a fixed node count or collapse a turn to one assistant node by default.
 - Treat the preceding 4→2 example as a joint semantic K→M rewrite. Its role-specific outputs depend on interleaved, non-contiguous source nodes inside one continuous input span. Do not fake it with misleading per-node coverage or weaken the product requirement to fit a K→1 editor; redesign the editing contract when necessary.
 - Preserve recoverable media without paying its eager context cost forever. Host-rendered `<memory-image ... />` markers are durable lazy references to original image blocks: retain their exact reference identity through rewritten turn nodes and session checkpoints, keep useful visual conclusions in text, and use `read_memory_image` only when the pixels are actually needed again.
+- Keep human intent distinct from host control context. Runtime-context snapshots, long-turn handoff reminders, and automatic continuation wrappers are not human requests and should not survive as transcript scaffolding or be attributed to the user. Preserve the actual work, consequences, unresolved state, and intentional handoff under their true semantic roles.
 
 When the user clarifies another original prompt requirement, update this section so later refactors begin from product intent rather than inheriting the current prompt by accident.
 

@@ -326,3 +326,30 @@
 - DSH `0.1.0-rc.7` core 的 `ContentBlockMap` 仍只有 `text`、`reasoning`、`image`、`tool-call` 和 `tool-result`；对 rc.7 官方 base bundle 全部插件的声明扫描没有发现任何官方 module augmentation 增加其他 content block。provider SDK 内部的 audio、file、video、document 等 wire type 不属于 DSH durable message vocabulary。
 - `reasoning` 暂不投影进 turn/session compression source：当前真实 reasoning 噪音过大，直接保留会违背压缩目标。未改写的原始 turn 节点仍保持原 event；一旦节点被 turn replacement 改写或进入 session checkpoint，raw reasoning 不进入新 surface。值得延续的假设、试错结论、灵感和判断依据仍应由 worker 从可见交互中压缩为普通 assistant memory，但不为隐藏 reasoning 本身建立保真或 lazy-read 机制。
 - `tool-call`／`tool-result` 继续采用现有的部分语义投影与 host tool-pair validation，不承诺把 call id、error flag 和 provider replay metadata 复制进压缩文本。未来若官方或第三方扩展 `ContentBlockMap`，必须先明确该 block 的保留、lazy reference 或显式丢弃策略，不能因为结构里恰好存在 `content` 字段就假设已经支持。
+
+## D-013：长 turn 在压缩边界后自动续开
+
+状态：**已确认**
+
+### 约定
+
+- completed-turn compression 启用时，插件默认启用长 turn continuation。host 仅计数当前 root session 的 open turn 中 append-origin model-visible surface nodes；旧 turn、session checkpoint replacement 和 `@deepseek-ai/dsh-system-prompt` runtime snapshot 不计入该 turn 的工作量。默认提醒间隔为 30 nodes，可用 `turnContinuation.reminderIntervalNodes` 调整或以 `turnContinuation.enabled: false` 关闭。
+- open turn 每跨过一个间隔只提醒一次，即默认在 30、60、90……节点里程碑出现。host 从 durable runtime snapshot 的具名 section 恢复本 turn 已显示的最高里程碑，因此普通 step 和进程重启都不会重复同一级提醒；若一步跨过多个区间，只显示当前最高里程碑。提醒同时给出 open-turn 当前 node 数、整个 canonical context 的 token 估值和下一节点里程碑作为参考，但触发只取决于 open-turn node 数。
+- 里程碑到达时，插件通过一轮 dynamic runtime context 显示 `<turn-memory-continuation>`，而不是强制中断或在之后每轮持续占据上下文。其正文是简短的第一人称 `<assistant-self-check>`，直接要求模型停下来总结并调用公开工具 `continue_after_turn_compression({ handoff })`；它仍是明确标记来源的 plugin runtime context，不伪造 durable `assistant/message`。只有整个任务能在接下来少量动作内完成时才继续当前 turn。若一个不可拆分的 mutation 正在执行，模型只先完成该 mutation 再交接。handoff 简述已完成内容、当前状态和下一 turn 的准确工作。
+- 工具只允许 root conversation 在 open turn 且已达到阈值时调用。成功调用用 `concludeTurn()` 结束当前 turn；native mode 下配对的 durable `tool/call` 原始 handoff 参数和成功 `tool/result`，或 Code Mode 下成功的 `tool/code-dispatch`，共同构成权威 continuation request。普通文本承诺、自然停止或失败的工具调用都不产生自动续开请求。
+- `turn/end` 后仍执行普通 turn-memory fork 压缩。只有 replacement/no-op marker 已落地且 session 已 flush，host 才把一条 `source.kind=plugin` 的 user-role follow-up 投递给同一个 agent。该输入明确声明自己是自动 continuation、不是新的人类指令，并携带 handoff；`Agent.followup()` 保证它成为独立 ordinary turn，而不是当前 turn 的 steer 或额外 step。
+- continuation request 可通过 completed-turn recovery 路径跨进程恢复。dispatch 去重不依赖进程内 flag：append-only log 中同一 request id 的 `agent/inbox/spliced` insertion 或已 claim 的 `user/message` 都证明 follow-up 已投递。若 turn 压缩失败则不续开；没有 landing marker 的 request 会在后续 agent cold resume 重新进入压缩，成功后再投递。
+- runtime snapshot、长 turn 提醒和自动 continuation wrapper 是 host control context，不是 human intent。turn compression prompt 必须把这一边界纳入整体 transcript 规则：不逐字保留或伪装成用户要求；但当前工作为何尚未完成、已经得到的结论和 handoff 中真实的 unresolved state 仍按正确 assistant 角色压缩保留。
+
+### 可行性依据
+
+- DSH `SystemPrompt.context()` 在每次 request assembly 求值，并把具名 dynamic context sections 物化为 durable user-role snapshot；空文本不贡献 context，更新后的快照取代旧快照。插件可扫描 append-only 历史中的本 section marker 恢复已提醒里程碑，同时让提醒在下一轮 assembly 自动消失，不需要新增事件或追加 steer。
+- DSH `ToolRunContext.concludeTurn()` 把成功 tool result 标为当前 turn 的终止边界；`Agent.followup()` 则明确把输入排入 `next-turn` 并唤醒 driver，使“结束当前 turn”和“开启独立下一 turn”不需要伪造 `turn/start`／`user/message` 事件。
+- `tool/call`／`tool/result`、`tool/code-dispatch` 和 agent inbox mutation 都是 core 已知的 durable event。native pair 提供 call identity、turn、handoff 和成功事实；Code Mode dispatch 提供同一 open-turn 区间内的 sub-call identity、结构化参数与 `isError`。follow-up 的 message identity/source 在 inbox insertion 与 claim 后的 `user/message` 中保持一致，因此两端都能从 append-only log 恢复，且不需要新增 persistence vocabulary。
+- 当前 per-session compression pump 已由 coordinator 暴露为 turn-rewrite barrier。follow-up 在 landing、snapshot flush 和 pump 尾部才投递；下一 turn 即使同步 wake，其 pre-step pressure compaction 也会等当前 rewrite promise 退出，不会在未落地的 surface 上开始请求。
+
+### 已知边界
+
+- open-turn 与 entire-context token 数都是 token-meter 的 provider-neutral 估价，不是目标 provider 对整份 request 的精确计数；里程碑提醒是提前切分复杂工作 turn 的策略，不替代 context-overflow recovery。
+- 模型可以忽略提醒，因此本机制是协作式 handoff，不是 hard limit。强制在任意 tool/mutation 中间切断会破坏外部操作语义，当前不做。
+- request tool pair 与 follow-up inbox insertion 分别是 append-only durable facts，但不承诺跨多个进程同时驱动同一 session 时的分布式 exactly-once；沿用本项目单 active agent/session writer 的运行假设。

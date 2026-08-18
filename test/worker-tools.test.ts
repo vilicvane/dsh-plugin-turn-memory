@@ -22,10 +22,16 @@ describe('WorkerToolScope', () => {
     const observed = (options: any) => {
       const restrictions: any[] = [];
       const registrations: string[] = [];
+      let runtimeContextSuppressions = 0;
+      const sections: any[] = [];
       created!({
         agent: {
           options,
           ctx: {
+            systemPrompt: {
+              suppressRuntimeContext: () => { runtimeContextSuppressions += 1; },
+              section: (section: any) => sections.push(section),
+            },
             tools: {
               restrict: (filter: any) => restrictions.push(filter),
               register: (definition: any) => registrations.push(definition.name),
@@ -33,13 +39,25 @@ describe('WorkerToolScope', () => {
           },
         },
       });
-      return { restrictions, registrations };
+      return { restrictions, registrations, runtimeContextSuppressions, sections };
     };
 
-    assert.deepEqual(observed({}), { restrictions: [], registrations: [] });
+    assert.deepEqual(observed({}), {
+      restrictions: [],
+      registrations: [],
+      runtimeContextSuppressions: 0,
+      sections: [],
+    });
     assert.deepEqual(observed(scope.agentOptions()), {
       restrictions: [{ allow: [] }],
       registrations: ['internal_a', 'internal_b'],
+      runtimeContextSuppressions: 1,
+      sections: [{
+        name: 'turn-memory:worker',
+        order: 0,
+        text: 'You are an isolated turn-memory worker. Follow the complete task contract in the current user message.',
+        complete: true,
+      }],
     });
   });
 

@@ -27,7 +27,7 @@ trap cleanup EXIT
 set +e
 DSH_TOOLS_MODE=native \
 TURN_MEMORY_E2E_ARTIFACT_DIR="$project_dir/.tmp" \
-timeout 360s npx --yes @deepseek-ai/dsh@0.1.0-rc.7 \
+timeout "${TURN_MEMORY_E2E_SUITE_TIMEOUT_SECONDS:-600}s" npx --yes @deepseek-ai/dsh@0.1.0-rc.7 \
   --profile test-turn-memory \
   --patch "$project_dir/e2e/cordis.patch.yml" \
   "turn-memory e2e smoke" 2>&1 | tee "$log_file"

@@ -175,7 +175,7 @@ async function run(ctx: any): Promise<void> {
       'parent turn must use only the corrected target after the steer',
     );
 
-    const timeoutMs = Number(process.env.TURN_MEMORY_PROMPT_EVAL_TIMEOUT_MS ?? 300000);
+    const timeoutMs = Number(process.env.TURN_MEMORY_PROMPT_EVAL_TIMEOUT_MS ?? 420000);
     const compressed = await waitForCompression(agent.session, timeoutMs);
     assertPromptCompression(agent.session, compressed, 'live');
     await sessions.flush(agent.session);

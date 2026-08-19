@@ -10,13 +10,14 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 import { TURN_TOOL_NAMES } from '../index.ts';
 import { SESSION_TOOL_NAMES } from '../lib/session-compaction.ts';
 import { READ_MEMORY_IMAGE_TOOL_NAME } from '../lib/memory-images.ts';
+import { READ_SESSION_HISTORY_TOOL_NAME } from '../lib/session-history.ts';
 import {
   TURN_CONTINUATION_TOOL_NAME,
   continuationRequestForTurn,
 } from '../lib/turn-continuation.ts';
 
 const name = 'turn-memory-e2e-runner';
-const inject = ['agentDefaultModel', 'agents', 'sessionQuery', 'sessions', 'tools'];
+const inject = ['agentDefaultModel', 'agentPresets', 'agents', 'sessionQuery', 'sessions', 'tools'];
 
 const USER_SENTINEL = 'E2E-USER-GAMMA-194';
 const TOOL_SENTINEL = 'E2E-FIXTURE-ALPHA-771';
@@ -41,6 +42,7 @@ function compressionNodes(session: any): any[] {
 function assertInternalToolsHidden(session: any, phase: string): void {
   const visible = new Set((session.requestHeader()?.tools ?? []).map((tool: any) => tool.name));
   assert.ok(visible.has(READ_MEMORY_IMAGE_TOOL_NAME), phase + ': public lazy-memory image tool is missing');
+  assert.ok(visible.has(READ_SESSION_HISTORY_TOOL_NAME), phase + ': public append-only history fallback is missing');
   assert.ok(visible.has(TURN_CONTINUATION_TOOL_NAME), phase + ': public long-turn continuation tool is missing');
   for (const name of INTERNAL_TOOL_NAMES) {
     assert.ok(!visible.has(name), phase + ': internal worker tool leaked into the parent request header: ' + name);
@@ -82,11 +84,14 @@ function assertProjection(session: any, nodes: any[], phase: string): void {
   assert.equal(nodes[1].type, 'assistant/message', phase + ': second compressed node must be an assistant message');
   for (const node of nodes) {
     assert.equal(node.surfaceOp?.op, 'replace', phase + ': compressed nodes must be positional replacements');
-    assert.equal(node.sourceEventSeqs.length, node.data.source.originalNodes, phase + ': each output must cite the complete joint source range');
+    assert.equal(new Set(node.sourceEventSeqs).size, node.sourceEventSeqs.length,
+      phase + ': replacement source provenance must not contain duplicates');
+    assert.ok(node.sourceEventSeqs.length >= node.data.source.originalNodes,
+      phase + ': each output must cite the complete joint semantic source range and its landing coverage');
     assert.ok(node.data.source.originalNodes >= 4, phase + ': fixture turn should exercise a four-node-or-larger joint rewrite');
     assert.ok(node.data.source.mutations >= 2, phase + ': generated ids should have been edited again');
     assert.equal(node.data.source.workerAttempts, 2,
-      phase + ': accepted progress should reset a one-attempt budget and allow a second fork');
+      phase + ': accepted progress should reset a one-attempt budget and allow a fresh-spawn recovery worker');
     assert.ok(!textOf(node).includes(DRAFT_SENTINEL), phase + ': draft-pass sentinel leaked into final compression');
   }
   assert.ok(textOf(nodes[0]).includes(USER_SENTINEL), phase + ': initial user sentinel missing from compressed user node');
@@ -108,12 +113,17 @@ async function run(ctx: any): Promise<void> {
   const sessionQuery = ctx.get('sessionQuery');
   const sessions = ctx.get('sessions');
   const defaultModel = ctx.get('agentDefaultModel');
-  if (agents === undefined || sessionQuery === undefined || sessions === undefined || defaultModel === undefined) {
+  const agentPresets = ctx.get('agentPresets');
+  if (agents === undefined || sessionQuery === undefined || sessions === undefined || defaultModel === undefined
+    || agentPresets === undefined) {
     throw new Error('required DSH services are missing');
   }
   const selection = defaultModel.currentSelection();
+  const workerProviders: string[] = [];
+  const disposeLifecycle = ctx.on('subagent/start', (info: any) => workerProviders.push(String(info.provider)));
   let fixtureCalls = 0;
-  const setup = (agentCtx: any) => {
+  const setup = async (agentCtx: any) => {
+    await agentPresets.mount(agentCtx, 'minimal');
     installModelSelection(agentCtx, {
       current: { ...selection },
       assembled: undefined,
@@ -172,6 +182,8 @@ async function run(ctx: any): Promise<void> {
     await recoveryHandle.agent.whenIdle();
     assertInternalToolsHidden(recoveryHandle.agent.session, 'recovered parent');
     const compressed = await waitForCompression(recoveryHandle.agent.session, timeoutMs);
+    assert.deepEqual(workerProviders, ['fork', 'spawn'],
+      'turn recovery must begin with one parent fork and continue accepted progress in a fresh spawn');
     assertProjection(recoveryHandle.agent.session, compressed, 'recovered');
     await sessions.flush(recoveryHandle.agent.session);
     const expectedCompressionSeqs = compressed.map((node) => node.seq);
@@ -229,6 +241,8 @@ async function run(ctx: any): Promise<void> {
       setup,
     });
     const continuationCompressed = await waitForCompression(continuationRecoveryHandle.agent.session, timeoutMs);
+    assert.deepEqual(workerProviders, ['fork', 'spawn', 'fork', 'spawn'],
+      'each turn job must begin with one fork and use a fresh spawn for its recovery worker');
     assertProjection(continuationRecoveryHandle.agent.session, continuationCompressed, 'continuation recovery');
     const continued = await waitForContinuation(continuationRecoveryHandle.agent.session, timeoutMs);
     assert.match(textOf(continued.user), /not new human input/,
@@ -254,6 +268,7 @@ async function run(ctx: any): Promise<void> {
     console.log('E2E_SURFACE_PATH=' + surfacePath);
     console.log('E2E_RESULT=PASS');
   } finally {
+    disposeLifecycle();
     if (continuationRecoveryHandle !== undefined) await continuationRecoveryHandle.dispose();
     if (continuationLiveHandle !== undefined) await continuationLiveHandle.dispose();
     if (coldHandle !== undefined) await coldHandle.dispose();

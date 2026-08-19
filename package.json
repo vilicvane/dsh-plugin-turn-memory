@@ -15,6 +15,7 @@
     ".": "./index.ts",
     "./e2e-runner": "./e2e/runner.ts",
     "./prompt-eval-runner": "./e2e/prompt-eval-runner.ts",
+    "./prompt-matrix-runner": "./e2e/prompt-matrix-runner.ts",
     "./session-compaction-e2e-runner": "./e2e/session-compaction-runner.ts",
     "./package.json": "./package.json"
   },
@@ -38,6 +39,8 @@
     "check": "pnpm test && pnpm typecheck",
     "e2e": "bash scripts/e2e-smoke.sh",
     "e2e:prompt": "bash scripts/e2e-prompt.sh",
+    "e2e:prompt:repeat": "node scripts/repeat-prompt-eval.mjs",
+    "e2e:prompt:matrix": "bash scripts/e2e-prompt-matrix.sh",
     "e2e:session": "bash scripts/e2e-session-compaction.sh"
   }
 }

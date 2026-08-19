@@ -3,7 +3,12 @@ export type TurnNodeKind = 'user' | 'assistant' | 'tool';
 export interface TurnNodeSeed {
   kind: TurnNodeKind;
   content: string;
+  /** Exact source text exposed only through bounded worker reads. */
+  exactContent?: string;
   sourceSeq: number;
+  /** Optional semantic provenance when the landing event is itself a replacement marker. */
+  sourceSeqs?: number[];
+  rewriteRequired?: 'raw-reasoning';
 }
 
 export interface TurnNodeOutput {
@@ -15,6 +20,8 @@ export interface TurnNodeSnapshot {
   id: string;
   kind: TurnNodeKind;
   content: string;
+  /** Exact source text for an unchanged node; generated nodes use content. */
+  exactContent?: string;
   /** Durable events that semantically contribute to this node. */
   sourceSeqs: number[];
   sourceIndexes: number[];
@@ -22,6 +29,7 @@ export interface TurnNodeSnapshot {
   landingSeqs: number[];
   landingIndexes: number[];
   changed: boolean;
+  rewriteRequired?: 'raw-reasoning';
 }
 
 export interface NodeRange {
@@ -34,6 +42,13 @@ export interface ReplaceResult {
   sourceIndexes: number[];
   sourceRanges: string;
   catalog: string;
+}
+
+/** Durable replacements cite both semantic evidence and every current landing event they shadow. */
+export function replacementEventSourceSeqs(
+  node: Pick<TurnNodeSnapshot, 'sourceSeqs' | 'landingSeqs'>,
+): number[] {
+  return unique([...node.sourceSeqs, ...node.landingSeqs]);
 }
 
 const oneLine = (value: string) => value.replace(/\s+/g, ' ').trim();
@@ -96,11 +111,13 @@ export class TurnNodeEditor {
       id: 'n' + (index + 1),
       kind: seed.kind,
       content: seed.content,
-      sourceSeqs: [seed.sourceSeq],
+      ...(seed.exactContent === undefined ? {} : { exactContent: seed.exactContent }),
+      sourceSeqs: [...(seed.sourceSeqs ?? [seed.sourceSeq])],
       sourceIndexes: [index + 1],
       landingSeqs: [seed.sourceSeq],
       landingIndexes: [index + 1],
       changed: false,
+      ...(seed.rewriteRequired === undefined ? {} : { rewriteRequired: seed.rewriteRequired }),
     }));
   }
 
@@ -116,6 +133,7 @@ export class TurnNodeEditor {
       'lands=' + renderIndexes(node.landingIndexes),
       'sources=' + renderIndexes(node.sourceIndexes),
       node.changed ? 'changed' : 'unchanged',
+      ...(node.rewriteRequired === undefined ? [] : ['rewrite-required=' + node.rewriteRequired]),
       'preview=' + JSON.stringify(preview(node.content, previewChars)),
     ].join(' | ')).join('\n');
   }
@@ -128,6 +146,7 @@ export class TurnNodeEditor {
       'lands=' + renderIndexes(node.landingIndexes),
       'sources=' + renderIndexes(node.sourceIndexes),
       node.changed ? 'changed' : 'unchanged',
+      ...(node.rewriteRequired === undefined ? [] : ['rewrite-required=' + node.rewriteRequired]),
     ].join(' ')).join('\n');
   }
 
@@ -174,8 +193,9 @@ export class TurnNodeEditor {
     };
   }
 
-  read(ranges: readonly NodeRange[], maxChars: number): string {
+  read(ranges: readonly NodeRange[], maxChars: number, offset = 0): string {
     if (ranges.length === 0) throw new Error('at least one node range is required');
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('turn node read offset must be a non-negative integer');
     const selected: TurnNodeSnapshot[] = [];
     const seen = new Set<string>();
     for (const range of ranges) {
@@ -190,14 +210,20 @@ export class TurnNodeEditor {
       }
     }
     const rendered = selected.map((node) => [
-      '<node id="' + node.id + '" kind="' + node.kind + '" lands="' + renderIndexes(node.landingIndexes) + '" sources="' + renderIndexes(node.sourceIndexes) + '">',
-      node.content,
+      '<node id="' + node.id + '" kind="' + node.kind + '" lands="' + renderIndexes(node.landingIndexes)
+        + '" sources="' + renderIndexes(node.sourceIndexes) + '"'
+        + (node.rewriteRequired === undefined ? '' : ' rewrite-required="' + node.rewriteRequired + '"') + '>',
+      node.exactContent ?? node.content,
       '</node>',
     ].join('\n')).join('\n\n');
-    if (rendered.length > maxChars) {
-      throw new Error('requested node content is ' + rendered.length + ' chars, above the ' + maxChars + '-char limit; request a smaller range');
+    if (offset >= rendered.length && rendered.length > 0) {
+      throw new Error('turn node read offset ' + offset + ' is outside the ' + rendered.length + '-character selection');
     }
-    return rendered;
+    const end = Math.min(rendered.length, offset + maxChars);
+    if (offset === 0 && end === rendered.length) return rendered;
+    return '<turn-node-excerpt chars="' + offset + '..' + end + '" total-chars="' + rendered.length + '">\n'
+      + rendered.slice(offset, end) + '\n</turn-node-excerpt>\n'
+      + (end < rendered.length ? 'Continue with the same ranges and offset=' + end + '.' : 'End of selected nodes.');
   }
 
   validateFinal(): void {
@@ -205,6 +231,9 @@ export class TurnNodeEditor {
     if (this.nodes.length > this.originalCount) throw new Error('final node count exceeds original node count');
     for (const node of this.nodes) {
       if (node.content.trim() === '') throw new Error('final node ' + node.id + ' has empty content');
+      if (node.rewriteRequired !== undefined) {
+        throw new Error('final node ' + node.id + ' still has rewrite-required=' + node.rewriteRequired);
+      }
     }
     this.assertPartition();
   }
@@ -225,7 +254,7 @@ export class TurnNodeEditor {
       if (node.landingIndexes.length === 0 || node.landingSeqs.length !== node.landingIndexes.length) {
         throw new Error('node ' + node.id + ' has invalid landing coverage');
       }
-      if (node.sourceIndexes.length === 0 || node.sourceSeqs.length !== node.sourceIndexes.length) {
+      if (node.sourceIndexes.length === 0 || node.sourceSeqs.length === 0) {
         throw new Error('node ' + node.id + ' has invalid semantic sources');
       }
       for (const index of node.landingIndexes) {

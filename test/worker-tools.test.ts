@@ -16,8 +16,12 @@ describe('WorkerToolScope', () => {
     };
     const definitions = [{ name: 'internal_a' }, { name: 'internal_b' }];
     const scope = new WorkerToolScope(ctx, definitions);
+    const startOptions = scope.startOptions();
 
     assert.deepEqual(globalRegistrations, []);
+    assert.equal(startOptions.persona,
+      'You are an isolated turn-memory worker. Follow the complete task contract in the current user message.');
+    assert.deepEqual(startOptions.agentOptions, scope.agentOptions());
 
     const observed = (options: any) => {
       const restrictions: any[] = [];
@@ -48,7 +52,7 @@ describe('WorkerToolScope', () => {
       runtimeContextSuppressions: 0,
       sections: [],
     });
-    assert.deepEqual(observed(scope.agentOptions()), {
+    assert.deepEqual(observed(startOptions.agentOptions), {
       restrictions: [{ allow: [] }],
       registrations: ['internal_a', 'internal_b'],
       runtimeContextSuppressions: 1,

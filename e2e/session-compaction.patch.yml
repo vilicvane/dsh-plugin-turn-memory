@@ -1,3 +1,10 @@
+- insert:
+    - id: agent-presets
+      name: '@deepseek-ai/dsh-agent-presets'
+      config:
+        default: minimal
+        includeUserRoot: false
+
 - id: compaction-basic
   disabled: true
 

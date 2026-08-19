@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 
 import type { TurnNodeEditor } from './editor.ts';
+import type { ThoughtHint } from './thought-hints.ts';
 
 export const DRAFT_SENTINEL = '__DRAFT_PASS__';
 export const E2E_USER_SENTINEL = 'E2E-USER-GAMMA-194';
@@ -14,11 +15,24 @@ export interface CompressionPromptOptions {
   e2eSmoke: boolean;
   workerNumber: number;
   acceptedMutations: number;
+  workerMode: 'fork' | 'fresh-spawn';
+  thoughtHints?: readonly ThoughtHint[];
 }
 
 const promptTemplateUrl = new URL('../prompts/turn-compression.md', import.meta.url);
 const conditionalPattern = /{{#if\s+([A-Za-z_][A-Za-z0-9_]*)}}\n?([\s\S]*?){{\/if}}(\n|$)/g;
 const valuePattern = /{{([A-Za-z_][A-Za-z0-9_]*)}}/g;
+
+function renderThoughtHints(editor: TurnNodeEditor, hints: readonly ThoughtHint[]): string {
+  const current = editor.snapshot();
+  const entries = hints.map((hint) => ({
+    currentNodeIds: current.filter((node) => node.sourceSeqs.includes(hint.assistantSeq)).map((node) => node.id),
+    reasoningBlock: hint.blockIndex,
+    originalChars: hint.chars,
+    hints: hint.text,
+  }));
+  return JSON.stringify(entries, null, 2).replaceAll('<', '\\u003c');
+}
 
 /** Render the deliberately small prompt-template language: scalar values and non-nested #if blocks. */
 export function renderPromptTemplate(template: string, values: Readonly<Record<string, TemplateValue>>): string {
@@ -41,14 +55,19 @@ export function buildCompressionPrompt(
   options: CompressionPromptOptions,
 ): string {
   const template = readFileSync(promptTemplateUrl, 'utf8');
+  const thoughtHints = options.thoughtHints ?? [];
   return renderPromptTemplate(template, {
     currentNodeCatalog: editor.richCatalog(options.previewChars),
     e2eSmoke: options.e2eSmoke,
     initialWorker: options.workerNumber === 1,
     resumedWorker: options.workerNumber > 1,
+    forkWorker: options.workerMode === 'fork',
+    freshWorker: options.workerMode === 'fresh-spawn',
     workerNumber: options.workerNumber,
     acceptedMutations: options.acceptedMutations,
     originalCount: editor.originalCount,
+    hasThoughtHints: thoughtHints.length > 0,
+    thoughtHints: renderThoughtHints(editor, thoughtHints),
     e2eUserSentinel: E2E_USER_SENTINEL,
     e2eToolSentinel: E2E_TOOL_SENTINEL,
     e2eFinalSentinel: E2E_FINAL_SENTINEL,

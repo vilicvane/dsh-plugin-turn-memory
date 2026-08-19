@@ -1,4 +1,11 @@
 # Overlay for the dedicated ~/.dsh/profiles/test-turn-memory profile.
+- insert:
+    - id: agent-presets
+      name: '@deepseek-ai/dsh-agent-presets'
+      config:
+        default: minimal
+        includeUserRoot: false
+
 - id: turn-memory
   config:
     enabled: true

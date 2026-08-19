@@ -29,6 +29,7 @@ import type { PricedNode, SessionSegment } from './session-segments.ts';
 import type { SourceNodeRange } from './session-segments.ts';
 import { WorkerToolScope } from './worker-tools.ts';
 import { assertMemoryImagesRetained } from './memory-images.ts';
+import { isUserConversationSession } from './session-kind.ts';
 
 export const SESSION_TOOL_NAMES = [
   'list_session_segments',
@@ -365,7 +366,7 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
     // This engine rewrites durable parent history. Compaction workers and other
     // child agents must fail/fallback normally instead of recursively compacting
     // their inherited session while producing the parent's checkpoint.
-    if (agent.session.header?.parentSession !== undefined) return null;
+    if (!isUserConversationSession(agent.session)) return null;
     await this.coordinator.waitForTurnRewrite(String(agent.session.id), signal);
     signal.throwIfAborted();
     const target = conversationTarget(agent);
@@ -626,6 +627,7 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
           let run: any;
           const timeoutSignal = AbortSignal.timeout(this.config.workerTimeoutMs);
           const workerSignal = signal === undefined ? timeoutSignal : AbortSignal.any([signal, timeoutSignal]);
+          const workerScope = this.workerTools.startOptions();
           try {
             run = await (this.ctx as any).subagents.start(provider, {
               label: 'session memory ' + segment.id + ' (' + workerMode + ')',
@@ -640,11 +642,12 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
               }) }],
               parent: job.agent,
               signal: workerSignal,
+              persona: workerScope.persona,
               agentOptions: {
                 provider: target.provider,
                 model: target.model,
                 maxTokens: this.config.workerMaxTokens,
-                ...this.workerTools.agentOptions(),
+                ...workerScope.agentOptions,
               },
             });
             const result = await run.result;

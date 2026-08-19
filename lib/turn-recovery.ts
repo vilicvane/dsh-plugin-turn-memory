@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
+import { reasoningBlockTexts } from './content.ts';
+
 /** Return the latest durable turn/end for each completed turn, oldest first. */
 export function completedTurnEnds(session: any): any[] {
   const byTurn = new Map<number, any>();
@@ -26,6 +28,24 @@ export function compressedTurnNumbers(session: any): Set<number> {
   return turns;
 }
 
+/**
+ * Return turns whose latest durable lifecycle marker says compression was
+ * queued but has not landed. This is the cold-recovery boundary: an old turn
+ * with no marker predates plugin observation and must not be backfilled merely
+ * because somebody later opens or forks that session.
+ */
+export function pendingTurnNumbers(session: any): Set<number> {
+  const latestPhase = new Map<number, 'pending' | 'compression'>();
+  for (const event of session?.events ?? []) {
+    const source = event?.data?.source;
+    if (source?.plugin !== 'turn-memory'
+      || (source.phase !== 'pending' && source.phase !== 'compression')
+      || !Number.isSafeInteger(source.turn)) continue;
+    latestPhase.set(source.turn, source.phase);
+  }
+  return new Set([...latestPhase].filter(([, phase]) => phase === 'pending').map(([turn]) => turn));
+}
+
 export function findCompletedTurnEnd(session: any, turn: number): any | undefined {
   let found: any | undefined;
   for (const event of session?.events ?? []) {
@@ -33,6 +53,27 @@ export function findCompletedTurnEnd(session: any, turn: number): any | undefine
     if (found === undefined || event.seq > found.seq) found = event;
   }
   return found;
+}
+
+/** Current-surface raw reasoning means an older completion marker no longer satisfies this implementation's contract. */
+export function turnHasUnrewrittenReasoning(session: any, turn: number): boolean {
+  for (const seq of session?.surface?.nodes ?? []) {
+    const event = session.events[seq];
+    if (event?.type !== 'assistant/message' || event.data?.turn !== turn) continue;
+    if (reasoningBlockTexts(event.data?.message?.content).length > 0) return true;
+  }
+  return false;
+}
+
+/** Select one turn's current surface, including a late turn-memory marker appended after turn/end. */
+export function turnSurfaceSeqs(session: any, turn: number, startSeq: number, endSeq: number): number[] {
+  return (session?.surface?.nodes ?? []).filter((seq: number) => {
+    if (seq <= startSeq) return false;
+    const source = session.events[seq]?.data?.source;
+    if (source?.plugin === 'compact') return false;
+    if (source?.plugin === 'turn-memory' && Number.isSafeInteger(source.turn)) return source.turn === turn;
+    return seq <= endSeq;
+  });
 }
 
 export function turnCompressionBypassReason(nodes: readonly { kind: string; content: string }[]): string | undefined {
@@ -43,14 +84,10 @@ export function turnCompressionBypassReason(nodes: readonly { kind: string; cont
   return undefined;
 }
 
-/**
- * Persist a successful semantic no-op without changing the visible transcript.
- * DSH has no third-party log-only event registry, so replace the turn's first
- * user node with an exact-content copy carrying the durable landing marker.
- */
-export function appendNoopCompressionMarker(session: any, original: any, marker: any): any {
+/** Persist lifecycle metadata as an exact-content user replacement. */
+export function appendTurnMarkerCopy(session: any, original: any, marker: any): any {
   if (original?.type !== 'user/message') {
-    throw new Error('turn-memory no-op marker requires an original user/message landing node');
+    throw new Error('turn-memory marker requires an original user/message landing node');
   }
   return session.append('user/message', {
     id: randomUUID(),

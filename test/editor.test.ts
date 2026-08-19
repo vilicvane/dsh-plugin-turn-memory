@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { TurnNodeEditor } from '../lib/editor.ts';
+import { TurnNodeEditor, replacementEventSourceSeqs } from '../lib/editor.ts';
 
 const editor = () => new TurnNodeEditor([
   { kind: 'user', content: 'initial request', sourceSeq: 10 },
@@ -11,6 +11,23 @@ const editor = () => new TurnNodeEditor([
 ]);
 
 describe('TurnNodeEditor', () => {
+  it('keeps replacement landing capacity separate from transitive semantic provenance', () => {
+    const editor = new TurnNodeEditor([
+      { kind: 'user', content: 'pending marker copy', sourceSeq: 20, sourceSeqs: [7] },
+      { kind: 'assistant', content: 'result', sourceSeq: 21 },
+    ]);
+    const result = editor.replace('n1', 'n2', [
+      { kind: 'user', content: 'corrected intent' },
+      { kind: 'assistant', content: 'compressed result' },
+    ]);
+    assert.deepEqual(result.created[0].landingSeqs, [20]);
+    assert.deepEqual(result.created[0].sourceSeqs, [7, 21]);
+    assert.deepEqual(replacementEventSourceSeqs(result.created[0]), [7, 21, 20]);
+    assert.deepEqual(result.created[1].landingSeqs, [21]);
+    assert.deepEqual(result.created[1].sourceSeqs, [7, 21]);
+    assert.deepEqual(replacementEventSourceSeqs(result.created[1]), [7, 21]);
+  });
+
   it('jointly compresses user-assistant-user-assistant into user-assistant', () => {
     const draft = editor();
     const result = draft.replace('n1', 'n4', [
@@ -65,7 +82,12 @@ describe('TurnNodeEditor', () => {
     assert.doesNotMatch(text, /id="n2"/);
     assert.match(text, /id="n3"/);
     assert.match(text, /id="n4"/);
-    assert.throws(() => draft.read([{ start: 'n1', end: 'n4' }], 20), /above the 20-char limit/);
+    const first = draft.read([{ start: 'n1', end: 'n4' }], 20);
+    assert.match(first, /<turn-node-excerpt chars="0\.\.20"/);
+    assert.match(first, /Continue with the same ranges and offset=20/);
+    const second = draft.read([{ start: 'n1', end: 'n4' }], 20, 20);
+    assert.match(second, /<turn-node-excerpt chars="20\.\.40"/);
+    assert.throws(() => draft.read([{ start: 'n1' }], 20, 1000), /outside the .*selection/);
   });
 
   it('returns rich initial metadata without exposing raw seqs as ids', () => {
@@ -96,6 +118,30 @@ describe('TurnNodeEditor', () => {
       () => draft.replace('n1', 'r1', [{ kind: 'tool', content: 'invalid merge' }]),
       /only as a one-to-one rewrite/,
     );
+  });
+
+  it('requires every original reasoning-bearing assistant node to be rewritten', () => {
+    const draft = new TurnNodeEditor([
+      { kind: 'user', content: 'request', sourceSeq: 10 },
+      {
+        kind: 'assistant',
+        content: '<raw-reasoning blocks="1" chars="80000" />',
+        exactContent: '<reasoning>Implementation detail only present in raw thought.</reasoning>\n<text>Visible answer.</text>',
+        sourceSeq: 11,
+        rewriteRequired: 'raw-reasoning',
+      },
+    ]);
+
+    assert.match(draft.richCatalog(), /n2 .*rewrite-required=raw-reasoning/);
+    const exact = draft.read([{ start: 'n2' }], 1000);
+    assert.match(exact, /rewrite-required="raw-reasoning"/);
+    assert.match(exact, /Implementation detail only present in raw thought/);
+    assert.doesNotMatch(exact, /raw-reasoning blocks/);
+    assert.throws(() => draft.validateFinal(), /still has rewrite-required=raw-reasoning/);
+
+    draft.replace('n2', undefined, [{ kind: 'assistant', content: 'Recovered conclusion and remaining uncertainty.' }]);
+    assert.doesNotThrow(() => draft.validateFinal());
+    assert.doesNotMatch(draft.structuralCatalog(), /rewrite-required/);
   });
 
 });

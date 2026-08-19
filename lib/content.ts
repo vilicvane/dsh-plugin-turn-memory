@@ -1,5 +1,50 @@
 import { collectMemoryImageAttachments, renderMemoryImageReference } from './memory-images.ts';
 
+export interface ReasoningStats {
+  blockCount: number;
+  totalChars: number;
+}
+
+/** Return raw reasoning block texts without mixing them into ordinary transcript text. */
+export function reasoningBlockTexts(value: unknown): string[] {
+  const blocks: string[] = [];
+  const visit = (item: unknown): void => {
+    if (item === null || item === undefined) return;
+    if (Array.isArray(item)) {
+      for (const child of item) visit(child);
+      return;
+    }
+    if (typeof item !== 'object') return;
+    const record = item as Record<string, unknown>;
+    if (record.type === 'reasoning' && typeof record.text === 'string') {
+      blocks.push(record.text);
+      return;
+    }
+    if (Object.hasOwn(record, 'content')) visit(record.content);
+  };
+  visit(value);
+  return blocks;
+}
+
+export function reasoningStats(value: unknown): ReasoningStats {
+  const blocks = reasoningBlockTexts(value);
+  return {
+    blockCount: blocks.length,
+    totalChars: blocks.reduce((sum, block) => sum + block.length, 0),
+  };
+}
+
+export function assistantCompressionSeed(value: unknown): { content: string; rewriteRequired?: 'raw-reasoning' } {
+  const visible = contentText(value);
+  const reasoning = reasoningStats(value);
+  return {
+    content: visible !== '' || reasoning.blockCount === 0
+      ? visible
+      : '<raw-reasoning blocks="' + reasoning.blockCount + '" chars="' + reasoning.totalChars + '" />',
+    ...(reasoning.blockCount === 0 ? {} : { rewriteRequired: 'raw-reasoning' as const }),
+  };
+}
+
 /** Flatten the text-bearing parts of one durable message event for catalogs and memory input. */
 export function contentText(value: unknown): string {
   const chunks: string[] = [];

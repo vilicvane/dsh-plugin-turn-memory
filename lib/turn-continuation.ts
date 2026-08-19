@@ -3,6 +3,7 @@ import { deriveEventMessage } from '@deepseek-ai/dsh-session';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
 import { measureSessionForCompaction } from './session-compaction.ts';
+import { isUserConversationSession } from './session-kind.ts';
 
 export const TURN_CONTINUATION_TOOL_NAME = 'continue_after_turn_compression';
 
@@ -23,7 +24,7 @@ export interface TurnContinuationRequest {
 }
 
 function isRootAgent(agent: any): boolean {
-  return agent?.session !== undefined && agent.session.header?.parentSession === undefined;
+  return isUserConversationSession(agent?.session);
 }
 
 export function openTurnNumber(session: any): number | null {

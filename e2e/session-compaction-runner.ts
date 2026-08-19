@@ -7,7 +7,7 @@ import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { foldSurface } from '@deepseek-ai/dsh-session';
 
 const name = 'turn-memory-session-compaction-e2e-runner';
-const inject = ['agentDefaultModel', 'agents', 'compaction', 'sessionQuery', 'sessions', 'tokenMeter'];
+const inject = ['agentDefaultModel', 'agentPresets', 'agents', 'compaction', 'sessionQuery', 'sessions', 'tokenMeter'];
 
 const ALPHA = 'SESSION-MEMORY-ALPHA-731';
 const BETA = 'SESSION-MEMORY-BETA-947';
@@ -82,14 +82,16 @@ async function run(ctx: any): Promise<void> {
   const sessionQuery = ctx.get('sessionQuery');
   const tokenMeter = ctx.get('tokenMeter');
   const defaultModel = ctx.get('agentDefaultModel');
+  const agentPresets = ctx.get('agentPresets');
   if (agents === undefined || compaction === undefined || sessions === undefined || sessionQuery === undefined
-    || tokenMeter === undefined || defaultModel === undefined) {
+    || tokenMeter === undefined || defaultModel === undefined || agentPresets === undefined) {
     throw new Error('session compaction e2e requires agent, compaction, persistence, query, token-meter, and default-model services');
   }
   const selection = defaultModel.currentSelection();
   const workerProviders: string[] = [];
   const disposeLifecycle = ctx.on('subagent/start', (info: any) => workerProviders.push(String(info.provider)));
-  const setup = (agentCtx: any): void => {
+  const setup = async (agentCtx: any): Promise<void> => {
+    await agentPresets.mount(agentCtx, 'minimal');
     installModelSelection(agentCtx, {
       current: { ...selection },
       assembled: undefined,

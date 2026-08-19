@@ -190,6 +190,8 @@ describe('turn continuation lifecycle', () => {
       agent: { session }, concludeTurn() {},
     }), /below first reminder milestone/);
     session.header.parentSession = 'parent';
+    session.header.origin = 'subagent';
+    session.header.delegationDepth = 1;
     await assert.rejects(tool.execute({ handoff: 'next' }, {
       agent: { session }, concludeTurn() {},
     }), /root conversation/);

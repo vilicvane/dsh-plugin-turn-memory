@@ -6,8 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
 import { MemoryCoordinator } from './lib/coordinator.ts';
-import { contentText } from './lib/content.ts';
-import { TurnNodeEditor } from './lib/editor.ts';
+import { assistantCompressionSeed, contentText } from './lib/content.ts';
+import { TurnNodeEditor, replacementEventSourceSeqs } from './lib/editor.ts';
 import {
   DRAFT_SENTINEL,
   E2E_FINAL_SENTINEL,
@@ -18,11 +18,14 @@ import {
 import { validateProjectedToolProtocol } from './lib/tool-protocol.ts';
 import { SessionMemoryCompactionEngine } from './lib/session-compaction.ts';
 import {
-  appendNoopCompressionMarker,
+  appendTurnMarkerCopy,
   completedTurnEnds,
   compressedTurnNumbers,
   findCompletedTurnEnd,
+  pendingTurnNumbers,
+  turnHasUnrewrittenReasoning,
   turnCompressionBypassReason,
+  turnSurfaceSeqs,
 } from './lib/turn-recovery.ts';
 import { WorkerToolScope } from './lib/worker-tools.ts';
 import {
@@ -30,8 +33,13 @@ import {
   createReadMemoryImageTool,
 } from './lib/memory-images.ts';
 import { TurnContinuationController } from './lib/turn-continuation.ts';
+import { ThoughtHintsController } from './lib/thought-hints.ts';
+import { isUserConversationSession } from './lib/session-kind.ts';
+import { createReadSessionHistoryTool, renderRawSessionContent } from './lib/session-history.ts';
 import type { SessionCompactionConfig } from './lib/session-compaction.ts';
+import type { SessionHistoryConfig } from './lib/session-history.ts';
 import type { TurnContinuationConfig } from './lib/turn-continuation.ts';
+import type { ThoughtHint, ThoughtHintsConfig } from './lib/thought-hints.ts';
 import type { NodeRange, TurnNodeOutput, TurnNodeSeed } from './lib/editor.ts';
 
 const name = 'turn-memory';
@@ -57,6 +65,8 @@ interface PluginConfig {
   maxReadChars?: number;
   surfaceDumpDir?: string;
   turnContinuation?: TurnContinuationConfig;
+  thoughtHints?: ThoughtHintsConfig;
+  sessionHistory?: SessionHistoryConfig;
   sessionCompaction?: SessionCompactionConfig;
 }
 
@@ -73,17 +83,44 @@ interface CompressionJob {
   mutationCount: number;
   finishConfirmed: boolean;
   workerNumber: number;
+  thoughtHints: ThoughtHint[];
 }
 
 function seedOf(event: any): TurnNodeSeed | undefined {
+  const markerSources = event?.data?.source?.plugin === 'turn-memory'
+    && event?.surfaceOp?.op === 'replace'
+    && Array.isArray(event.sourceEventSeqs)
+    && event.sourceEventSeqs.length > 0
+    ? [...event.sourceEventSeqs]
+    : undefined;
   if (event?.type === 'user/message') {
-    return { kind: 'user', content: contentText(event.data?.content), sourceSeq: event.seq };
+    return {
+      kind: 'user',
+      content: contentText(event.data?.content),
+      sourceSeq: event.seq,
+      ...(markerSources === undefined ? {} : { sourceSeqs: markerSources }),
+    };
   }
   if (event?.type === 'assistant/message') {
-    return { kind: 'assistant', content: contentText(event.data?.message?.content), sourceSeq: event.seq };
+    const seed = assistantCompressionSeed(event.data?.message?.content);
+    return {
+      kind: 'assistant',
+      content: seed.content,
+      ...(seed.rewriteRequired === undefined
+        ? {}
+        : { exactContent: renderRawSessionContent(event.data?.message?.content) }),
+      sourceSeq: event.seq,
+      ...(markerSources === undefined ? {} : { sourceSeqs: markerSources }),
+      ...(seed.rewriteRequired === undefined ? {} : { rewriteRequired: seed.rewriteRequired }),
+    };
   }
   if (event?.type === 'tool/result') {
-    return { kind: 'tool', content: contentText(event.data?.message?.content), sourceSeq: event.seq };
+    return {
+      kind: 'tool',
+      content: contentText(event.data?.message?.content),
+      sourceSeq: event.seq,
+      ...(markerSources === undefined ? {} : { sourceSeqs: markerSources }),
+    };
   }
   return undefined;
 }
@@ -94,13 +131,7 @@ function prepareJob(agent: any, event: any): CompressionJob | undefined {
   if (!Number.isSafeInteger(turn)) return undefined;
   const start = session.events.findLast((candidate: any) => candidate.type === 'turn/start' && candidate.data?.turn === turn);
   if (start === undefined) throw new Error('turn ' + turn + ' has a durable turn/end but no matching turn/start');
-  const targetSeqs = session.surface.nodes.filter((seq: number) => {
-    if (seq <= start.seq || seq > event.seq) return false;
-    const source = session.events[seq]?.data?.source;
-    if (source?.plugin === 'compact') return false;
-    if (source?.plugin === 'turn-memory' && Number.isSafeInteger(source.turn)) return source.turn === turn;
-    return true;
-  });
+  const targetSeqs = turnSurfaceSeqs(session, turn, start.seq, event.seq);
   if (targetSeqs.length === 0) return undefined;
   const firstIndex = session.surface.nodes.indexOf(targetSeqs[0]);
   if (firstIndex < 0 || targetSeqs.some((seq: number, index: number) => session.surface.nodes[firstIndex + index] !== seq)) {
@@ -122,6 +153,7 @@ function prepareJob(agent: any, event: any): CompressionJob | undefined {
     mutationCount: 0,
     finishConfirmed: false,
     workerNumber: 0,
+    thoughtHints: [],
   };
 }
 
@@ -195,7 +227,7 @@ function land(job: CompressionJob): void {
   };
   const nodes = job.editor.snapshot();
   if (nodes.every((node) => !node.changed)) {
-    appendNoopCompressionMarker(session, events[job.targetSeqs[0]], marker);
+    appendTurnMarkerCopy(session, events[job.targetSeqs[0]], marker);
   }
   for (const node of nodes) {
     if (!node.changed) continue;
@@ -203,7 +235,7 @@ function land(job: CompressionJob): void {
     const last = node.landingSeqs[node.landingSeqs.length - 1];
     const meta = {
       surfaceOp: { op: 'replace', start: first, end: last },
-      sourceEventSeqs: [...node.sourceSeqs],
+      sourceEventSeqs: replacementEventSourceSeqs(node),
     };
     if (node.kind === 'user') {
       session.append('user/message', {
@@ -258,6 +290,12 @@ function apply(ctx: any, config: PluginConfig = {}): void {
     return;
   }
   const coordinator = new MemoryCoordinator();
+  if (config.sessionHistory?.enabled !== false) {
+    ctx.tools.register(createReadSessionHistoryTool(config.sessionHistory));
+  }
+  const thoughtHints = config.turnCompression !== false && config.thoughtHints?.enabled === true
+    ? new ThoughtHintsController(ctx, config.thoughtHints)
+    : undefined;
   const readMemoryImageTool = createReadMemoryImageTool(ctx);
   ctx.inject(['attachments'], (imageCtx: any) => {
     imageCtx.tools.register(readMemoryImageTool);
@@ -319,7 +357,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
 
   addTurnTool(defineTool({
     name: 'read_turn_nodes',
-    description: 'Read exact content from the current host-owned working surface. A current r* node is accepted compressed work that may not appear in inherited parent context. Several ids or continuous ranges may be read in one call; shadowed ids are stale.',
+    description: 'Read exact content from the current host-owned working surface. Unchanged reasoning-bearing n* nodes include their original reasoning blocks; r* nodes contain accepted compressed work. Several ids or continuous ranges may be read together and long selections can be paged with offset; shadowed ids are stale.',
     parameters: {
       ranges: {
         type: 'array',
@@ -333,11 +371,12 @@ function apply(ctx: any, config: PluginConfig = {}): void {
           },
         },
       },
+      offset: { type: 'number', description: 'Zero-based character offset into the same rendered selection; defaults to 0.' },
     },
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
     isConcurrencySafe: () => true,
     async execute(args, exec) {
-      return jobFor(exec).editor.read(args.ranges as NodeRange[], maxReadChars);
+      return jobFor(exec).editor.read(args.ranges as NodeRange[], maxReadChars, args.offset ?? 0);
     },
   }));
 
@@ -432,10 +471,12 @@ function apply(ctx: any, config: PluginConfig = {}): void {
         job.childSessionId = undefined;
         job.finishConfirmed = false;
         const mutationsBefore = job.mutationCount;
+        const provider = job.workerNumber === 1 ? 'fork' : 'spawn';
+        const workerMode = provider === 'fork' ? 'fork' : 'fresh-spawn';
         let run: any;
         try {
-          run = await ctx.subagents.start('fork', {
-            label: 'turn-memory compression ' + job.turn + ' (worker ' + job.workerNumber + ')',
+          run = await ctx.subagents.start(provider, {
+            label: 'turn-memory compression ' + job.turn + ' (' + workerMode + ' worker ' + job.workerNumber + ')',
             prompt: [{
               type: 'text',
               text: buildCompressionPrompt(job.editor, {
@@ -443,18 +484,20 @@ function apply(ctx: any, config: PluginConfig = {}): void {
                 e2eSmoke,
                 workerNumber: job.workerNumber,
                 acceptedMutations: job.mutationCount,
+                workerMode,
+                thoughtHints: job.thoughtHints,
               }),
             }],
             parent: job.agent,
             signal: job.controller.signal,
-            agentOptions: turnWorkerTools.agentOptions(),
+            ...turnWorkerTools.startOptions(),
           });
           const result = await run.result;
           if (result.stopReason !== 'completed') {
-            throw new Error('compression fork ended with ' + JSON.stringify(result.stopReason));
+            throw new Error(provider + ' worker ended with ' + JSON.stringify(result.stopReason));
           }
           if (!job.finishConfirmed) {
-            throw new Error('compression fork completed without an authoritative finish_turn_compression result');
+            throw new Error(provider + ' worker completed without an authoritative finish_turn_compression result');
           }
           completed = true;
           break;
@@ -468,7 +511,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
             noProgressAttempts += 1;
           }
           const continuation = noProgressAttempts < turnNoProgressAttempts
-            ? '; starting a new fork from ' + job.mutationCount + ' accepted mutation(s)'
+            ? '; starting a fresh same-model worker from ' + job.mutationCount + ' accepted mutation(s)'
             : '';
           const progress = accepted > 0
             ? '; accepted progress reset consecutive no-progress attempts to 0/' + turnNoProgressAttempts
@@ -537,7 +580,9 @@ function apply(ctx: any, config: PluginConfig = {}): void {
       const sources = [...(turns!.get(nextTurn) ?? [])].join(', ');
       turns!.delete(nextTurn);
       if (turns!.size === 0) pendingTurns.delete(sessionId);
-      if (compressedTurnNumbers(agent.session).has(nextTurn)) {
+      if (compressedTurnNumbers(agent.session).has(nextTurn)
+        && !turnHasUnrewrittenReasoning(agent.session, nextTurn)) {
+        thoughtHints?.discardTurn(sessionId, nextTurn);
         ctx.logger.info('turn-memory: turn ' + nextTurn + ' is already compressed; removed duplicate queued work');
         await turnContinuation?.dispatchAfterCompression(agent, nextTurn);
         continue;
@@ -551,9 +596,15 @@ function apply(ctx: any, config: PluginConfig = {}): void {
       try {
         const job = prepareJob(agent, event);
         if (job === undefined) {
+          thoughtHints?.discardTurn(sessionId, nextTurn);
           ctx.logger.warn('turn-memory: turn ' + nextTurn + ' from ' + sources
             + ' has no eligible current surface range; it may already be shadowed by another rewrite');
           continue;
+        }
+        if (thoughtHints !== undefined) {
+          job.thoughtHints = await thoughtHints.collectForTurn(job.session, nextTurn, job.targetSeqs);
+          ctx.logger.info('turn-memory: turn ' + nextTurn + ' collected ' + job.thoughtHints.length
+            + ' long-thought hint(s) before compression');
         }
         const bypassReason = turnCompressionBypassReason(job.editor.snapshot());
         if (bypassReason !== undefined) {
@@ -599,42 +650,80 @@ function apply(ctx: any, config: PluginConfig = {}): void {
   };
 
   ctx.on('session/event', (session: any, event: any) => {
-    if (event.type !== 'turn/end' || session.header?.parentSession !== undefined) return;
-    const sessionId = String(session.id);
-    const turn = event.data?.turn;
-    if (e2eDeferTurnCompressionUntilResume) {
-      ctx.logger.info('turn-memory: e2e deferred live turn ' + String(turn) + ' until agent resume recovery');
-      return;
-    }
-    const added = enqueueTurn(sessionId, turn, 'live turn/end');
-    if (added && jobs.has(sessionId)) {
-      ctx.logger.info('turn-memory: queued turn ' + String(turn) + ' behind the active compression for session ' + sessionId);
-    }
-    if (ctx.agents.get(sessionId) === undefined) {
-      ctx.logger.warn('turn-memory: queued turn ' + String(turn) + ' from turn/end, but session ' + sessionId
-        + ' has no active agent; recovery will retry it on agent creation');
-    }
-    queueMicrotask(() => ensurePump(sessionId));
+    thoughtHints?.observe(session, event);
+    if (event.type !== 'turn/end' || !isUserConversationSession(session)) return;
+    // Session.append() cannot re-enter the session/event publication boundary.
+    // Defer both the durable marker and the queue so job preparation can only
+    // observe the post-marker surface.
+    queueMicrotask(() => {
+      if (disposed) return;
+      try {
+        const sessionId = String(session.id);
+        const turn = event.data?.turn;
+        if (Number.isSafeInteger(turn)
+          && !compressedTurnNumbers(session).has(turn)
+          && !pendingTurnNumbers(session).has(turn)) {
+          const start = session.events.findLast((candidate: any) => candidate.type === 'turn/start' && candidate.data?.turn === turn);
+          const targetSeqs = start === undefined ? [] : turnSurfaceSeqs(session, turn, start.seq, event.seq);
+          const user = targetSeqs.map((seq: number) => session.events[seq]).find((candidate: any) => candidate?.type === 'user/message');
+          if (user === undefined) {
+            ctx.logger.warn('turn-memory: turn ' + String(turn) + ' has no user node for a durable pending marker; live processing remains available but cold recovery is not guaranteed');
+          } else {
+            appendTurnMarkerCopy(session, user, {
+              kind: 'plugin',
+              plugin: 'turn-memory',
+              phase: 'pending',
+              turn,
+            });
+            void ctx.sessions.flush(session).catch((error: unknown) => {
+              ctx.logger.warn('turn-memory: pending marker flush failed for turn ' + String(turn) + ': '
+                + (error instanceof Error ? error.message : String(error)));
+            });
+          }
+        }
+        if (e2eDeferTurnCompressionUntilResume) {
+          ctx.logger.info('turn-memory: e2e deferred live turn ' + String(turn) + ' until agent resume recovery');
+          return;
+        }
+        const added = enqueueTurn(sessionId, turn, 'live turn/end');
+        if (added && jobs.has(sessionId)) {
+          ctx.logger.info('turn-memory: queued turn ' + String(turn) + ' behind the active compression for session ' + sessionId);
+        }
+        if (ctx.agents.get(sessionId) === undefined) {
+          ctx.logger.warn('turn-memory: queued turn ' + String(turn) + ' from turn/end, but session ' + sessionId
+            + ' has no active agent; recovery will retry it on agent creation');
+        }
+        ensurePump(sessionId);
+      } catch (error) {
+        ctx.logger.warn('turn-memory: failed to observe completed turn: '
+          + (error instanceof Error ? error.message : String(error)));
+      }
+    });
   });
 
   ctx.on('agent/created', ({ agent }: any) => {
     const session = agent?.session;
-    if (session === undefined || session.header?.parentSession !== undefined) return;
+    if (!isUserConversationSession(session)) return;
     queueMicrotask(() => {
       if (disposed) return;
       const sessionId = String(session.id);
       const ends = completedTurnEnds(session);
       const compressed = compressedTurnNumbers(session);
+      const pending = pendingTurnNumbers(session);
       let queued = 0;
+      let staleReasoning = 0;
       for (const end of ends) {
-        if (compressed.has(end.data.turn)
-          && turnContinuation?.needsDispatchAfterCompression(session, end.data.turn) !== true) continue;
+        const stale = compressed.has(end.data.turn) && turnHasUnrewrittenReasoning(session, end.data.turn);
+        if (stale) staleReasoning += 1;
+        const continuationPending = turnContinuation?.needsDispatchAfterCompression(session, end.data.turn) === true;
+        if (!pending.has(end.data.turn) && !stale && !continuationPending) continue;
         if (enqueueTurn(sessionId, end.data.turn, 'agent recovery scan')) queued += 1;
       }
       if (ends.length > 0 || (pendingTurns.get(sessionId)?.size ?? 0) > 0) {
         const landed = ends.filter((end) => compressed.has(end.data.turn)).length;
         ctx.logger.info('turn-memory: recovery scan for session ' + sessionId + ': completed=' + ends.length
-          + ', compressed=' + landed + ', newlyQueued=' + queued
+          + ', compressedMarkers=' + landed + ', pendingMarkers=' + pending.size
+          + ', staleReasoning=' + staleReasoning + ', newlyQueued=' + queued
           + ', pending=' + (pendingTurns.get(sessionId)?.size ?? 0));
       }
       ensurePump(sessionId);
@@ -644,6 +733,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
   ctx.effect(() => () => {
     disposed = true;
     for (const job of jobs.values()) job.controller.abort();
+    thoughtHints?.dispose();
     jobs.clear();
     pendingTurns.clear();
     pumps.clear();

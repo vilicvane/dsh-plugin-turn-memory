@@ -45,4 +45,19 @@ export class WorkerToolScope {
   agentOptions(): { turnMemoryWorkerToolScope: string } {
     return { turnMemoryWorkerToolScope: this.marker };
   }
+
+  /**
+   * Options that must travel together on every worker start. The child-local
+   * persona shadows an inherited preset persona before this scope installs its
+   * own complete section, preventing two effective complete sections.
+   */
+  startOptions(): {
+    persona: string;
+    agentOptions: { turnMemoryWorkerToolScope: string };
+  } {
+    return {
+      persona: WORKER_SYSTEM_PROMPT,
+      agentOptions: this.agentOptions(),
+    };
+  }
 }

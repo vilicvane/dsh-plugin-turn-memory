@@ -199,30 +199,30 @@
 - segment token 数来自 token-meter 的 surface-node估价，不是 worker prompt 的精确 provider tokenizer 数；segment budget 和 read character cap 都需要保守配置。
 - 当前 working checkpoint 只在内存中可续跑。它支持更换 child 继续同一进程内 job，但不把半成品持久化为可跨进程恢复的 session 状态；进程突然停止后由未闭合 compaction marker 暴露失败，原 surface 仍未被替换。
 
-## D-007：turn compression 的新 fork 续跑
+## D-007：turn compression 的 fork 后 fresh-spawn 续跑
 
 状态：**已确认**
 
 ### 约定
 
 - turn compression 的 working surface 继续由 host 内的 `TurnNodeEditor` 持有。每次成功的 `replace_turn_nodes` 都立即成为该 job 已接受的内存状态；worker 自身是否随后正常结束，不回滚这些 mutation。
-- worker 未通过 `finish_turn_compression` 权威完成时，本次 worker 失败。插件先 dispose 当前 child，再从同一个 parent 启动全新的 fork，并把 editor 的最新完整目录放进新 prompt。`turnWorkerAttempts` 限制的是连续未产生 accepted replacement 的失败 worker 数，默认三个；任何一次成功的 `replace_turn_nodes` 都把该预算重置。只要持续产生 accepted progress，worker 总数不受这个值限制；连续无进展失败耗尽预算后才放弃整个 job，父 surface 始终保持原样。
-- 不继续使用已经失败的 child：context overflow 的直接成因可能正是其累积的 reasoning／tool history。新 fork 清空这段 worker-local 历史，同时仍从 parent 继承原 completed turn 的语义背景。
-- current catalog 是编辑结构的唯一事实源。`n*` 表示尚未被该 job 改写的 original node；`r*` 表示本 worker 或更早 worker 已成功写入 host editor 的 replacement，不是临时草稿。parent fork seed 仍是原 transcript，不含 `r*` 的完整新正文；恢复 worker 必须按当前 ids 继续，并在 preview 不足时用 `read_turn_nodes` 读取精确内容。
+- worker 未通过 `finish_turn_compression` 权威完成时，本次 worker 失败。插件先 dispose 当前 child；每个 job 只有第一个 worker 从 parent `fork`，后续 worker 均以同一 provider／model fresh `spawn`，并从 editor 的最新完整目录与读取工具继续。`turnWorkerAttempts` 限制的是连续未产生 accepted replacement 的失败 worker 数，默认三个；任何一次成功的 `replace_turn_nodes` 都把该预算重置。只要持续产生 accepted progress，worker 总数不受这个值限制；连续无进展失败耗尽预算后才放弃整个 job，父 surface 始终保持原样。
+- 不继续使用已经失败的 child：context overflow 的直接成因可能正是 parent seed 或 worker 累积的 reasoning／tool history。首个 fork 保留 parent 的完整语义 cache；fresh spawn 同时去掉 parent seed 与前一 worker 的局部历史，使“第一次请求已被 parent context 撑爆”也有可执行的恢复路径。
+- current catalog 是编辑结构的唯一事实源。`n*` 表示尚未被该 job 改写的 original node；`r*` 表示本 worker或更早 worker 已成功写入 host editor 的 replacement，不是临时草稿。fork seed 仍是原 transcript，不含 `r*` 的完整新正文；fresh spawn 完全不继承 transcript。因此 `read_turn_nodes` 对 unchanged `n*` 返回原 block 顺序和 raw reasoning，对 `r*` 返回 accepted content；超长选择按稳定字符 `offset` 分页，恢复 worker 必须按当前 ids 读取后继续，不能从原始布局重建。
 - 每个 worker 只允许其当前 child 调用工具。切换 worker 前清空 child binding；前一个 run quiesce 后才绑定新 child，因此旧 worker 不能用 stale ids 与恢复 worker 并发修改 editor。
 - 任意非 authoritative completion 都按有无 accepted progress 更新连续无进展预算，包括 provider error、context overflow 映射后的 `error`、max-tokens、基础设施异常，以及 child 正常停止但漏掉 finish。有 replacement 就重置预算并续跑；没有 replacement 就消耗一次预算。父 job 的 cancellation 直接终止，不启动恢复 worker。
-- landing provenance 记录实际使用的 worker 总数。真实 E2E 把连续无进展预算设为一，在首个 worker 完成一次 replacement 后强制其无 finish 结束；该进展重置预算，因而第二个 fork 仍能识别已接受的 `r*`、继续二次改写、finish、落地并通过冷加载。
+- landing provenance 记录实际使用的 worker 总数。真实 E2E 把连续无进展预算设为一，在首个 fork 完成一次 replacement 后强制其无 finish 结束；该进展重置预算，因而第二个 fresh spawn 仍能识别已接受的 `r*`、继续二次改写、finish、落地并通过冷加载。E2E 同时断言 provider 顺序为 `fork, spawn`。
 
 ### 可行性依据
 
 - `SubagentRun.result` 只把 child 失败归一为非 `completed` stop reason，provider 的 `CONTEXT_WINDOW_EXCEEDED` 细节仍保存在 child log；续跑协议无需依赖易变的错误文本，因为任何未 finish 的 attempt 都不能提交，而 editor 是否已有进度可由 host 直接观察。
-- one-shot `dispose()` 会等待 child resource quiescence，随后再次 `start('fork', { parent })` 会创建新的 child session。`TurnNodeEditor`、opaque id 计数器、semantic sources 与 landing partition 都位于插件 job，不随 child dispose 丢失。
-- replacement 工具返回当前目录，prompt 又在每个 worker 启动时嵌入同一 editor 的 rich catalog；恢复 worker 因此能从最新结构开始，不需要 replay 前一个 worker 的隐藏 reasoning 或工具调用。
+- one-shot `dispose()` 会等待 child resource quiescence，随后 `start('spawn', { parent })` 创建零 parent context 的新 child；DSH 的 child route resolution 在未覆盖时继承 parent provider、model 和 maxTokens。`TurnNodeEditor`、opaque id 计数器、semantic sources 与 landing partition 都位于插件 job，不随 child dispose 丢失。
+- replacement 工具返回当前目录，prompt 又在每个 worker 启动时嵌入同一 editor 的 rich catalog；原节点的 exact content 由 host 保留并通过有界分页读取，恢复 worker因此能从最新结构开始，不需要 replay 前一个 worker 的隐藏 reasoning 或工具调用。
 
 ### 已知边界
 
 - 续跑状态只存在于当前进程的 job 内；Web 进程突然终止后不会恢复半成品，但父 surface 仍未被替换。
-- 如果 parent seed 加初始 prompt 在第一次模型请求前就已超过 context window，且没有任何工具 mutation 可以成为续跑进度，重复 fork 不会缩小输入；连续无进展预算会让 job 有界失败。该场景需要另行设计不继承完整 parent 的 source-range／fresh-spawn 路径。
+- fresh spawn 仍可能在单个 worker 内主动读取过多原文后再次 overflow；失败后会从同一 host editor 重新启动，读取上限与 prompt 应帮助它按节点／offset 分批处理，但不承诺任意单节点一定能被目标模型一次完整容纳。
 
 ## D-008：completed turn 的重启恢复与串行回补
 
@@ -324,7 +324,7 @@
 状态：**已确认**
 
 - DSH `0.1.0-rc.7` core 的 `ContentBlockMap` 仍只有 `text`、`reasoning`、`image`、`tool-call` 和 `tool-result`；对 rc.7 官方 base bundle 全部插件的声明扫描没有发现任何官方 module augmentation 增加其他 content block。provider SDK 内部的 audio、file、video、document 等 wire type 不属于 DSH durable message vocabulary。
-- `reasoning` 暂不投影进 turn/session compression source：当前真实 reasoning 噪音过大，直接保留会违背压缩目标。未改写的原始 turn 节点仍保持原 event；一旦节点被 turn replacement 改写或进入 session checkpoint，raw reasoning 不进入新 surface。值得延续的假设、试错结论、灵感和判断依据仍应由 worker 从可见交互中压缩为普通 assistant memory，但不为隐藏 reasoning 本身建立保真或 lazy-read 机制。
+- `reasoning` 不直接投影进压缩后 surface：原始逐步思考噪音过大，一旦节点被 turn replacement 改写或进入 session checkpoint，raw reasoning 不进入新 surface。D-014 负责压缩前的 hints，D-016 要求把其中高重建成本的工作产物转写成 ordinary assistant memory，D-017 另提供只读 append-only source fallback；三者均不改变“raw reasoning 不常驻压缩 surface”的边界。
 - `tool-call`／`tool-result` 继续采用现有的部分语义投影与 host tool-pair validation，不承诺把 call id、error flag 和 provider replay metadata 复制进压缩文本。未来若官方或第三方扩展 `ContentBlockMap`，必须先明确该 block 的保留、lazy reference 或显式丢弃策略，不能因为结构里恰好存在 `content` 字段就假设已经支持。
 
 ## D-013：长 turn 在压缩边界后自动续开
@@ -353,3 +353,108 @@
 - open-turn 与 entire-context token 数都是 token-meter 的 provider-neutral 估价，不是目标 provider 对整份 request 的精确计数；里程碑提醒是提前切分复杂工作 turn 的策略，不替代 context-overflow recovery。
 - 模型可以忽略提醒，因此本机制是协作式 handoff，不是 hard limit。强制在任意 tool/mutation 中间切断会破坏外部操作语义，当前不做。
 - request tool pair 与 follow-up inbox insertion 分别是 append-only durable facts，但不承诺跨多个进程同时驱动同一 session 时的分布式 exactly-once；沿用本项目单 active agent/session writer 的运行假设。
+
+## D-014：长 reasoning block 的异步 thought hints
+
+状态：**已确认**
+
+### 约定
+
+- raw reasoning 在 completed-turn compression 开始前保持原样。短 reasoning block 不做单独预处理；长 reasoning block 一旦收到完整的 `assistant/chunk` `block-end`，host 就立即启动一个异步小模型 one-shot 请求产生 thought hints。同一 turn 可以有多个独立且并发的 hint 任务。
+- hint 请求只有两部分：置于前缀的固定 system prompt，以及作为唯一 user message 的该 reasoning block 原文。不附带 parent history、当前 user request、turn／step／block id、长度或其他动态前缀；关联身份由 host 在请求外维护。固定指令因而始终位于变化的 thought 之前，允许 provider 尽可能复用这一小段稳定前缀。
+- thought hints 是导航性的回忆索引，不是权威 summary、原文替代或必须保留的事实列表。它们应突出难重建的灵感、假设与不确定性、试错及排除项、发现、决定与理由、结论的证据与边界、未解分支，但不要变成逐步重述。
+- turn compression 在对应 `turn/end` 后等待该 turn 已启动的 hint 任务。主模型仍通过正常 parent `fork` 继承完整 completed turn，包括原始 reasoning blocks 及 provider replay metadata；hints 只作为额外的临时 prompt 输入。主模型自行决定从哪里提取细节，并应回看原始 reasoning 核对 hint 中的线索。
+- hint 生成失败、超时、返回空文本或在重启前丢失都不阻止 turn compression：原始 reasoning 仍是主模型的完整事实来源。进程恢复时，host 从 durable `assistant/message` reasoning blocks 重新识别长 block 并补跑缺失的 hints，不持久化中间 hints。
+- hints 流程不写 parent session，也不合成未闭合 turn 的 surface。canonical surface 在模型工作期间保持不变，最终仍只有普通 turn compression 的一次 N→M landing。
+- 任何含 reasoning block 的原 assistant surface node 在最终 working surface 中都必须被 replacement 覆盖；不得以“已经很短”为由将该原节点 unchanged 落地。replacement 可以把有价值的 reasoning 语义压缩进普通 assistant text，但 raw reasoning 不进入压缩后 surface。本条取代 D-012 中“reasoning 完全不处理”的旧边界。
+
+### 可行性依据
+
+- DSH `StreamChunk` 的 `block-end` 携带已组装的完整 `reasoning` block，且 `session/event` 观察者在进程中可直接收到该事件，因而文本型 hint 不需要等待 `assistant/message`、`step/end` 或 `turn/end`。
+- `ctx.llm.stream()` 接受手工组装的 provider/model、system prompt 和 message 列表，可用小模型完成不带工具、不建 child session 的 one-shot 调用。这比 parent fork 更符合“只读一个 thought”的输入契约。
+- stock fork 只能 seed 到最近的 completed `turn/end`，不能继承未闭合当前 turn；而 reasoning replay metadata 又在 terminal `finish` chunk 才齐备。hints 不依赖 replay，直接使用 `block-end` 文本；最终主 worker 则等到真实 `turn/end` 后沿用标准 fork，两者分别使用各自可验证的完整边界。
+- durable assistant message 仍保留 reasoning content。因此 cold resume 可以在不依赖任何进程内状态的情况下重建同一组 hint 输入；中间产物不持久化也不会影响最终 surface 可回放性。
+
+### 已知边界
+
+- “长”的即时判定只能依据 block 文本长度或 provider-neutral 估算，不是该小模型 tokenizer 的精确 token 数。阈值、小模型路由、hint 输出上限与单次请求超时必须可配置。
+- 某些容错型 adapter 可能只发 delta 而不发 `block-end`。实时路径在这种情况下无法提前启动，但 `turn/end` 后可从已组装的 durable assistant reasoning block 补跑。
+- hints 减少的是主 worker 寻找重要线索的语义负担，不是 parent fork 的输入长度。主模型仍继承 raw reasoning，provider 是否命中内部 prompt／KV cache 不属于插件可承诺的正确性边界。
+- 并发 hints 会增加本地或远程 provider 的瞬时负载。首版允许 provider 自行排队，不额外设计持久化工作队列或全局并发调度。
+
+## D-015：用户 lineage fork 与旧 reasoning no-op 的恢复
+
+状态：**已确认**
+
+### 约定
+
+- “用户会话”按 durable origin 语义判断，而不是按是否存在 `parentSession` 判断。`origin="subagent"` 或正 delegation depth 的内部 agent 不运行 turn memory；用户从 UI 建立的 lineage fork 虽有 `parentSession`，但没有 subagent origin 且 `delegationDepth=0`，应与普通用户会话一样运行 thought hints、turn compression、turn continuation 与 session compaction。
+- durable turn-memory completion marker 通常提供幂等性；但若该 turn 的**当前 surface**仍包含 assistant reasoning block，则 marker 来自旧的 reasoning-unaware no-op，不再满足 D-014 的 landing invariant。恢复扫描必须把它视为 stale completion 并重新压缩，而不是永久跳过。
+- 重新处理旧 no-op 时，旧 marker 是 turn/end 之后追加、但仍占据该 turn 当前 surface 位置的 user replacement。turn selection 应按 `source.plugin=turn-memory` 与 `source.turn` 将它纳入目标；主 fork 仍只继承 completed-turn prefix 中的原始 user/assistant evidence，host editor 则以当前 marker content 和 raw-reasoning assistant node 完成一次新的 N→M landing。
+- 新 landing 后当前 surface 不再含 reasoning，旧 marker 即使仍存在于 append-only log 中也不会再次触发迁移；判定因此保持幂等。真正没有 assistant reasoning/text 的失败 turn 仍保留合法 no-op marker，不会被重复处理。
+- live `turn/end` 在启动异步 worker 前，以首个 user node 的等内容 replacement 留下 `phase="pending"` durable marker；成功 landing 的较新 `phase="compression"` marker关闭该状态。cold recovery 只处理 pending、上述 stale reasoning 迁移项，或已有 continuation request 的 turn。
+- pending marker 成为 current landing node 后，editor 必须把 marker seq 用于 positional landing，并把 marker 的 `sourceEventSeqs` 展开为 semantic provenance。最终 replacement 的 durable `sourceEventSeqs` 取 semantic sources 与本节点 landing seqs 的并集：前者保留原 human provenance，后者满足 surface replacement 对所有被遮蔽 current events 的 coverage。只保留任一侧都会分别丢失原 user identity 或导致 landing validation 失败。
+- marker-free completed turn 不能区分“插件尚未安装”与“旧实现未观察到”，因此不做推测性 backfill。首次安装后打开或 fork 一份旧会话不会批量压缩历史；这项 activation boundary 比恢复无法证明曾被插件接管的 turn 更重要。
+
+## D-016：以继续实现所需的重建成本衡量 reasoning 压缩
+
+状态：**已确认**
+
+### 约定
+
+- turn compression 的优化目标是减少后续重复工作，不是追求最短文本或固定压缩率。raw reasoning 可能是在尚未写文件、尚未产生 final text 时唯一形成的工作产物；worker 必须把已经稳定的高重建成本内容转写为 ordinary assistant memory。
+- 需要按实际内容保留的 operational payload 包括架构与文件／模块职责、接口与类型、schema／state machine／data flow、算法与公式、坐标与参数、关键命令、invariant、edge case、failure mode、兼容约束、验证／测试方案、被排除的替代方案及理由，以及准确的后续实现状态。不是要求复制全部代码或逐步思考；重复 self-talk、机械草拟和可由结论加必要证据代替的推导仍应压缩。
+- 主 worker 的最终自检是：raw turn 从普通 context 消失后，下一位有能力的 agent 能否在不重复实质调查、设计或推导的情况下继续。若只能知道“要实现某模块”而不知道 reasoning 已确定的做法，则属于过度压缩。
+- thought-hints prompt 与主 compression prompt 必须共同表达这一目标。hints 仍只是可能不完整的导航索引；主 worker 不能把 hint 当成完整 preservation checklist，hint 缺失也不能降低上述 landing 目标。
+
+### 可行性依据
+
+- parent fork 已继承完整 completed turn reasoning；`rewrite-required=raw-reasoning` 又强制对应 assistant 节点在落地前转成 ordinary text。`TurnNodeEditor` 和 landing validation 限制节点数、角色、provenance、tool pairing 与图片 ref，但没有设置 replacement 字符上限，因此保留更多必要实现细节不需要修改 surface 机制。
+- 真实 85,603 字 reasoning 恢复样本中，收到 hints 的 worker 只留下约千字高层方案，未收到 hints 的 lineage fork 只留下数百字纲要；原文中的模块 API、阶段函数、参数、边界与验证计划大量消失。两者证明当前 wording 会把 implementation-ready state 错当成可丢弃的机械细节，同时证明 hints 只能改善定位，不能代替主 worker 的完整保真职责。
+
+### 已知边界
+
+- “足够继续”是语义质量目标，host 无法仅凭字符数或 schema 完整验证。prompt regression、真实 surface 检查和 source fallback 用于发现与缓解失败，不承诺每个模型调用都达到相同压缩质量。
+- 本条不要求保留 raw chain-of-thought，也不设最低输出长度。安全的压缩比例取决于该 turn 实际形成的不可替代工作，而非 reasoning 原文长度。
+
+## D-017：当前 session append-only 原 turn 的按需读取兜底
+
+状态：**已确认**
+
+### 约定
+
+- 插件默认公开一个只读 `read_session_history` 工具。调用时不传 `turn` 会分页列出当前 calling agent session 最近完成的 turn、可见文本／reasoning 规模和是否已有 turn-memory landing；传 `turn=<n>` 则读取该 turn 在原 `turn/start..turn/end` 区间内的 user／assistant／tool-result 节点，并按原 block 顺序显式呈现 reasoning。
+- 工具只读取 calling agent 自己的 append-only session events，不接受任意 session id，也不跨会话搜索。surface replacement 或 session checkpoint 只遮蔽旧节点，不删除原事件，因此 current／shadowed 状态仅作为说明，不影响读取权限。
+- 原 turn 不自动注入每次模型请求；只有压缩 memory 缺少完成当前任务所需的昂贵细节时才调用。单次结果受 `sessionHistory.maxReadChars` 限制，超长 turn 通过 `offset` 继续；调用结果是普通 tool interaction，不会把原节点永久恢复为 standing surface。
+- 该工具是主会话的普通 memory capability，不属于 D-009 的 compression editor。turn/session worker 仍使用各自更精确的 inherited source 或 assigned source，不额外把此 fallback 加入隔离 worker scope。
+
+### 可行性依据
+
+- DSH session object 在 active agent scope 内保留完整 append-only `events` 和 folded `surface`。每个 completed turn 由 durable `turn/start`、`turn/end` 定界，assistant durable message 仍含原 reasoning blocks；读取不依赖 persistence backend 私有路径、Zstd 解压或 `sessionQuery` 只能看到的 current surface。
+- 工具 schema 不暴露 session selector，execution 又从 `exec.agent.session` 取得唯一数据源，因此多个并行 session 共享插件实例时不会互读。字符窗口使 reasoning-only 大节点也能有界返回，同时允许本次 85k 样本在默认 160k cap 内一次恢复。
+
+### 已知边界
+
+- 这是事后取回机制，不会自动判断哪条压缩 memory 缺失，也不能替代 D-016 的正常保真目标。模型必须先从 catalog 选择 turn；一次读取会临时增加当前 turn 的上下文和计费。
+- 工具只投影 core 已支持的 user／assistant／tool-result 内容；它不是 raw event debugger，不返回 step lifecycle、provider replay metadata 或 host-only control events。
+
+## D-018：压缩 worker 的 prompt 与工具隔离
+
+状态：**已确认**
+
+### 约定
+
+- turn compression 与 session compaction 的内部 worker 只接收各自当前 user message 中的完整任务协议及插件为该 worker 挂载的私有工具。主运行时的 persona、其他插件的静态 guidance 和本次 child 新组装的 dynamic runtime context 不参与 worker 请求。
+- 两类 worker 共用同一个 agent-scoped 隔离边界：每次 child start 必须携带 per-child persona，先 shadow 父 preset 继承的 `deployment:persona`；再以唯一 complete `turn-memory:worker` system-prompt section 排除其余全局静态 section，以 runtime-context suppressor 排除动态 context，并沿用私有工具 allow-none 后再注册的隔离方式。persona 与进程内 scope marker 必须由同一个启动选项 API 成对返回，避免调用点只传 marker 而重新引入多个 complete section。隔离精确绑定到目标 worker，不改变普通主 agent 或其他 subagent。
+- fork seed 中已经存在的 parent 历史消息不属于“child 新注入”。其中早先持久化的 runtime-context snapshot 仍作为待压缩原始 transcript 的一部分可见；压缩协议继续把这类 plugin scaffolding 与 human intent 区分，并在没有持续因果价值时移除。
+
+### 可行性依据
+
+- DSH 的 `agent/created` 同步发生在 child 首次 prompt 前，且 `agent.ctx` 提供 agent-scoped `systemPrompt.section()`、`suppressRuntimeContext()` 与 tool registry。`complete: true` 会在 assembly waterfall 后恢复为唯一 system section，runtime suppressor 会清空本次 assembly 的 contexts，因此无需让 turn-memory 知道 todo-stack 等其他插件的名字。
+- DSH 的 `SubagentStartRequest.persona` 会在 child scope 注册非 complete 的 `deployment:persona`，其作用域比 join 进来的 parent preset 更近，因而能 shadow 其中可能为 complete 的同名 section；随后 worker scope 的 `turn-memory:worker` 才是唯一 effective complete section。fork 与 spawn 的 in-process driver 都走同一套 child composition。
+- turn 与 session worker 已经通过同一个 `WorkerToolScope` marker 挂载私有工具；把 prompt boundary 放入该 scope 会自然覆盖 fork 与 fresh-spawn 两种路径，同时不会把压缩工具或隔离规则暴露给 parent。
+
+### 已知边界
+
+- 隔离不会也不应删除 fork 已继承的 parent 历史快照，否则会改变 canonical source；最终产物是否保留其中信息仍由压缩协议和 host validation 决定。
+- worker 的完整行为契约仍以实时读取的 Markdown task prompt 为唯一来源。isolated system section 只声明边界，不重复压缩策略，避免两份协议漂移。

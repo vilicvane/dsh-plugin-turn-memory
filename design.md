@@ -112,6 +112,7 @@
 - editor 可以在父 session 之外完成全部 K→M 规划，再将最终 landing partition 以 M 次同步 replacement append 落地；这仍满足 D-001 的物理 `M <= N` 约束，不需要 append-assisted 插入。
 - fork 已继承目标 `turn/end` 及其完整对话上下文，能够直接判断灵感、试错、纠正和结论之间的语义及因果关系；目录只承担已知内容到可编辑 opaque id 的映射。联合 K→M 允许把这些信息保留在重新组织后的 user／assistant 节点中，不要求为每段被保留的信息维持原始节点边界。
 - 新的真实 fork E2E 已完成一次 6→2 联合压缩：首轮生成 user／assistant 两个节点，第二轮使用返回的两个 `r*` id 再次联合改写；最终两个 durable event 均引用全部六个 semantic sources，landing slices 分别遮蔽前三和后三个原节点。实时 surface、完整 `foldSurface()`、`deriveMessages()`、session query 与冷加载结果一致。
+- worker catalog 和 node reads 不暴露 host-owned landing slice；只暴露每个当前节点仍可贡献的数值 `capacity`。连续选择范围的 capacity 相加并限制输出节点数，足够支持 worker 决定 K→M，而精确 landing partition 仅由 host 维护和校验。
 
 ### 已知边界
 

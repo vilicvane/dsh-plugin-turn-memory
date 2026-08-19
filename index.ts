@@ -382,7 +382,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
 
   addTurnTool(defineTool({
     name: 'replace_turn_nodes',
-    description: 'Jointly replace one current node or continuous current range with one or more ordered nodes. Select a range containing every current node whose information the outputs use; all outputs derive from that complete range. A tool output is allowed only as the sole output replacing exactly one current tool node. The host immediately accepts the outputs as new r* working nodes and returns the complete current structural catalog.',
+    description: 'Jointly replace one current node or continuous current range with one or more ordered nodes. Select a range containing every current node whose information the outputs use; all outputs derive from that complete range, and output count cannot exceed the selected nodes\' summed capacity. A tool output is allowed only as the sole output replacing exactly one current tool node. The host immediately accepts the outputs as new r* working nodes and returns the complete current structural catalog.',
     parameters: {
       start: { type: 'string', required: true, description: 'First current node id.' },
       end: { type: 'string', description: 'Last current node id, inclusive; omit for one node.' },

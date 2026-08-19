@@ -46,6 +46,10 @@ describe('buildCompressionPrompt', () => {
     assert.match(prompt, /Never attribute assistant actions, tool outcomes/);
     assert.match(prompt, /`n\*` is an unchanged original node/);
     assert.match(prompt, /`r\*` is an accepted replacement/);
+    assert.match(prompt, /`capacity=` is how many output nodes this node can still be split into/);
+    assert.match(prompt, /capacities add across a selected continuous range/);
+    assert.match(prompt, /n1 \| user .*capacity=1/);
+    assert.doesNotMatch(prompt, /lands=/);
     assert.match(prompt, /<memory-image ref="\.\.\."/);
     assert.match(prompt, /read_memory_image/);
     assert.match(prompt, /Host runtime snapshots, `<turn-memory-continuation>` reminders/);

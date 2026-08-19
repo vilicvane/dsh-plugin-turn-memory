@@ -31,7 +31,7 @@ This recovery worker is a fresh same-model spawn: it does not inherit the parent
 {{/if}}
 
 - `n*` is an unchanged original node. `r*` is an accepted replacement produced by this or an earlier worker.
-- `changed` and `unchanged` describe editor state. `lands=` is ordered original positional capacity; `sources=` is the original evidence available to that node.
+- `changed` and `unchanged` describe editor state. `capacity=` is how many output nodes this node can still be split into; capacities add across a selected continuous range. `sources=` is the original evidence available to that node.
 - `rewrite-required=raw-reasoning` marks an original assistant node containing reasoning. Its catalog text is only a placeholder for visible content. Inspect its exact reasoning—through the inherited turn or `read_turn_nodes`—and replace this node, alone or in a joint range, with ordinary assistant text that carries its continuation-critical work product.
 - A successful replacement creates new ids and makes every selected id stale. Any inherited parent transcript predates all `r*` wording.
 - Tool mutations change only the isolated host-owned editor. The parent session changes only after authoritative finish and host validation.

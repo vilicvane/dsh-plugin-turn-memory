@@ -130,7 +130,7 @@ export class TurnNodeEditor {
       node.id,
       node.kind,
       node.content.length + ' chars',
-      'lands=' + renderIndexes(node.landingIndexes),
+      'capacity=' + node.landingIndexes.length,
       'sources=' + renderIndexes(node.sourceIndexes),
       node.changed ? 'changed' : 'unchanged',
       ...(node.rewriteRequired === undefined ? [] : ['rewrite-required=' + node.rewriteRequired]),
@@ -143,7 +143,7 @@ export class TurnNodeEditor {
       (index + 1) + '.',
       node.id,
       node.kind,
-      'lands=' + renderIndexes(node.landingIndexes),
+      'capacity=' + node.landingIndexes.length,
       'sources=' + renderIndexes(node.sourceIndexes),
       node.changed ? 'changed' : 'unchanged',
       ...(node.rewriteRequired === undefined ? [] : ['rewrite-required=' + node.rewriteRequired]),
@@ -168,7 +168,7 @@ export class TurnNodeEditor {
       throw new Error('a tool output is valid only as a one-to-one rewrite of one current tool node');
     }
     if (outputs.length > landing.length) {
-      throw new Error('replacement has ' + outputs.length + ' outputs but the selected range owns only ' + landing.length + ' original landing positions');
+      throw new Error('replacement has ' + outputs.length + ' outputs but the selected range has capacity ' + landing.length);
     }
     const sourceSeqs = unique(removed.flatMap((node) => node.sourceSeqs));
     const sourceIndexes = unique(removed.flatMap((node) => node.sourceIndexes)).sort((left, right) => left - right);
@@ -210,7 +210,7 @@ export class TurnNodeEditor {
       }
     }
     const rendered = selected.map((node) => [
-      '<node id="' + node.id + '" kind="' + node.kind + '" lands="' + renderIndexes(node.landingIndexes)
+      '<node id="' + node.id + '" kind="' + node.kind + '" capacity="' + node.landingIndexes.length
         + '" sources="' + renderIndexes(node.sourceIndexes) + '"'
         + (node.rewriteRequired === undefined ? '' : ' rewrite-required="' + node.rewriteRequired + '"') + '>',
       node.exactContent ?? node.content,

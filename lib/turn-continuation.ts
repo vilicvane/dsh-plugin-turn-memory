@@ -9,7 +9,6 @@ export const TURN_CONTINUATION_TOOL_NAME = 'continue_after_turn_compression';
 
 const SYSTEM_PROMPT_PLUGIN = '@deepseek-ai/dsh-system-prompt';
 const CONTINUATION_CONTEXT_NAME = 'turn-memory:long-turn-continuation';
-const MAX_HANDOFF_CHARS = 2_000;
 
 export interface TurnContinuationConfig {
   enabled?: boolean;
@@ -136,7 +135,7 @@ export function continuationRequestForTurn(session: any, turn: number): TurnCont
 
 function requestFromArguments(requestId: string, turn: number, args: any): TurnContinuationRequest | undefined {
   const handoff = typeof args?.handoff === 'string' ? args.handoff.trim() : '';
-  if (handoff === '' || handoff.length > MAX_HANDOFF_CHARS) return undefined;
+  if (handoff === '') return undefined;
   return { version: 1, requestId, turn, handoff };
 }
 
@@ -255,9 +254,6 @@ export class TurnContinuationController {
         }
         const handoff = typeof args.handoff === 'string' ? args.handoff.trim() : '';
         if (handoff === '') throw new Error('turn continuation handoff must not be empty');
-        if (handoff.length > MAX_HANDOFF_CHARS) {
-          throw new Error('turn continuation handoff exceeds ' + MAX_HANDOFF_CHARS + ' characters');
-        }
         exec.concludeTurn();
         return 'continuation ' + String(exec.callId) + ' queued; this turn will end and the next turn will start after compression';
       },

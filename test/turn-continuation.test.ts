@@ -197,6 +197,58 @@ describe('turn continuation lifecycle', () => {
     }), /root conversation/);
   });
 
+  test('accepts and recovers detailed handoffs without an arbitrary length cap', async () => {
+    const tools = new Map<string, any>();
+    const ctx = {
+      tokenMeter: meter,
+      tools: { register: (tool: any) => tools.set(tool.name, tool) },
+      systemPrompt: { context() {} },
+      sessions: { flush: async () => {} },
+      logger: { info() {}, warn() {} },
+    };
+    new TurnContinuationController(ctx, { reminderIntervalNodes: 1 });
+    const session = fixtureSession();
+    session.append('turn/start', { turn: 4 });
+    session.append('user/message', message('begin'), 'append');
+    const handoff = 'Detailed continuation state. '.repeat(100);
+    assert.ok(handoff.length > 2_000);
+
+    let concluded = false;
+    const tool = tools.get(TURN_CONTINUATION_TOOL_NAME);
+    const result = await tool.execute({ handoff }, {
+      agent: { session },
+      callId: 'call-long-handoff',
+      concludeTurn: () => { concluded = true; },
+    });
+    assert.equal(concluded, true);
+
+    session.append('tool/call', {
+      turn: 4,
+      step: 1,
+      callId: 'call-long-handoff',
+      name: TURN_CONTINUATION_TOOL_NAME,
+      arguments: JSON.stringify({ handoff }),
+    });
+    session.append('tool/result', {
+      turn: 4,
+      step: 1,
+      message: {
+        id: 'result-long-handoff',
+        role: 'user',
+        source: { kind: 'tool', callId: 'call-long-handoff' },
+        content: [{
+          type: 'tool-result',
+          toolCallId: 'call-long-handoff',
+          content: [{ type: 'text', text: result }],
+          isError: false,
+        }],
+      },
+    });
+    session.append('turn/end', { turn: 4, reason: { kind: 'completed' } });
+
+    assert.equal(continuationRequestForTurn(session, 4)?.handoff, handoff.trim());
+  });
+
   test('recovers a successful Code Mode sub-dispatch as the same durable request', () => {
     const session = fixtureSession();
     session.append('turn/start', { turn: 3 });

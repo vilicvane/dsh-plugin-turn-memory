@@ -2,7 +2,15 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-profile_dir="${DSH_HOME:-/home/vilicvane/.dsh}/profiles/test-turn-memory"
+dsh_home="${DSH_HOME:-$HOME/.dsh}"
+profile_dir="$dsh_home/profiles/test-turn-memory"
+dsh_bin="${DSH_E2E_BIN:-$dsh_home/runtime/node_modules/.bin/dsh}"
+
+if [[ ! -x "$dsh_bin" ]]; then
+  echo "DSH runtime is missing: $dsh_bin" >&2
+  echo "Set DSH_E2E_BIN to an installed dsh executable." >&2
+  exit 2
+fi
 
 if [[ ! -f "$profile_dir/package.json" ]]; then
   echo "turn-memory e2e profile is missing: $profile_dir" >&2
@@ -26,7 +34,7 @@ trap cleanup EXIT
 set +e
 DSH_TOOLS_MODE=native \
 TURN_MEMORY_E2E_ARTIFACT_DIR="$project_dir/.tmp" \
-timeout 540s npx --yes @deepseek-ai/dsh@0.1.0-rc.7 \
+timeout 540s "$dsh_bin" \
   --profile test-turn-memory \
   --patch "$project_dir/e2e/prompt-eval.patch.yml" \
   "turn-memory production prompt evaluation" 2>&1 | tee "$log_file"

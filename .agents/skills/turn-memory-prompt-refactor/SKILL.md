@@ -1,6 +1,6 @@
 ---
 name: turn-memory-prompt-refactor
-description: Refactor the turn-memory fork subagent prompt as one coherent design. Use whenever changing, optimizing, debugging, or reviewing buildPrompt, node-catalog wording, compression-tool descriptions, completion instructions, or the E2E-only prompt protocol in this project.
+description: Refactor the turn-memory model-facing contract as one coherent design. Use whenever changing, optimizing, debugging, or reviewing buildPrompt, injected context, node-catalog wording, compression-tool descriptions or results, completion instructions, or the E2E-only prompt protocol in this project.
 ---
 
 # Turn Memory Prompt Refactor
@@ -45,6 +45,35 @@ Before editing:
    - how successful completion is signaled.
 
 Treat the Markdown prompt, template values and conditionals, initial catalog, tool affordances, tool results, host validation, and completion path as one protocol. A wording change in one part requires checking every other part for consistency.
+
+## Give every model-visible token a job
+
+Require every injected instruction, catalog field, tool description, parameter,
+and tool-result field to support a concrete model decision or action. For each
+item, name what the agent can do differently because it can see that item. If
+there is no answer, remove it from model context and keep it only in host logs,
+durable metadata, diagnostics, or tests.
+
+Do not expose host implementation metadata merely because it already exists or
+helps a human debug the protocol. When an internal fact has only an indirect
+model use, translate it into the smallest action-oriented affordance. For
+example, expose remaining split `capacity` if the worker must decide how many
+outputs it can create; do not expose an exact landing partition unless the
+worker must reason about those positions. Keep semantic provenance only when it
+helps the worker select a truthful edit range, interpret inherited rewrites, or
+audit information coverage.
+
+Apply the same standard to reminders and dynamic context. An injection must
+arrive when its requested action is possible, identify that action clearly,
+and provide information not already available more directly from current state
+or the triggering tool result. Avoid status narration, protocol trivia,
+host-owned validation rules the model cannot affect, and repeated context whose
+only effect is salience without a new decision.
+
+Host validation remains responsible for structural safety. Do not make the
+model study internal metadata to reproduce invariants the host can derive and
+enforce deterministically. Model-facing information should help produce a
+better semantic result, not turn the worker into an implementation debugger.
 
 ## Refactor the whole prompt
 

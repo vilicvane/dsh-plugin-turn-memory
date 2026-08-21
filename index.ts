@@ -15,7 +15,12 @@ import {
   E2E_USER_SENTINEL,
   buildCompressionPrompt,
 } from './lib/prompt.ts';
-import { validateProjectedToolProtocol } from './lib/tool-protocol.ts';
+import {
+  eventToolCallIds,
+  eventToolResultCallId,
+  validateProjectedToolProtocol,
+  withProjectedToolProtocolWarning,
+} from './lib/tool-protocol.ts';
 import { SessionMemoryCompactionEngine } from './lib/session-compaction.ts';
 import {
   appendTurnMarkerCopy,
@@ -103,6 +108,7 @@ function seedOf(event: any): TurnNodeSeed | undefined {
   }
   if (event?.type === 'assistant/message') {
     const seed = assistantCompressionSeed(event.data?.message?.content);
+    const toolCallIds = eventToolCallIds(event);
     return {
       kind: 'assistant',
       content: seed.content,
@@ -112,14 +118,17 @@ function seedOf(event: any): TurnNodeSeed | undefined {
       sourceSeq: event.seq,
       ...(markerSources === undefined ? {} : { sourceSeqs: markerSources }),
       ...(seed.rewriteRequired === undefined ? {} : { rewriteRequired: seed.rewriteRequired }),
+      ...(toolCallIds.length === 0 ? {} : { toolCallIds }),
     };
   }
   if (event?.type === 'tool/result') {
+    const toolResultCallId = eventToolResultCallId(event);
     return {
       kind: 'tool',
       content: contentText(event.data?.message?.content),
       sourceSeq: event.seq,
       ...(markerSources === undefined ? {} : { sourceSeqs: markerSources }),
+      ...(toolResultCallId === undefined ? {} : { toolResultCallId }),
     };
   }
   return undefined;
@@ -346,7 +355,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
 
   addTurnTool(defineTool({
     name: 'list_turn_nodes',
-    description: 'Return the complete rich catalog of the authoritative host-owned turn working surface. Current n* ids are unchanged original nodes; current r* ids are accepted rewrites produced by this or an earlier worker.',
+    description: 'Return the complete rich catalog of the authoritative host-owned turn working surface. Current n* ids are unchanged original nodes; current r* ids are accepted rewrites. tool-results= and tool-call= identify current structured protocol peers; missing means the draft must be repaired before finish.',
     parameters: {},
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
     isConcurrencySafe: () => true,
@@ -357,7 +366,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
 
   addTurnTool(defineTool({
     name: 'read_turn_nodes',
-    description: 'Read exact content from the current host-owned working surface. Unchanged reasoning-bearing n* nodes include their original reasoning blocks; r* nodes contain accepted compressed work. Several ids or continuous ranges may be read together and long selections can be paged with offset; shadowed ids are stale.',
+    description: 'Read exact content from the current host-owned working surface, including actionable tool-call/result peer node ids. Unchanged reasoning-bearing n* nodes include their original reasoning blocks; r* nodes contain accepted compressed work. Several ids or continuous ranges may be read together and long selections can be paged with offset; shadowed ids are stale.',
     parameters: {
       ranges: {
         type: 'array',
@@ -382,19 +391,19 @@ function apply(ctx: any, config: PluginConfig = {}): void {
 
   addTurnTool(defineTool({
     name: 'replace_turn_nodes',
-    description: 'Jointly replace one current node or continuous current range with one or more ordered nodes. Select a range containing every current node whose information the outputs use; all outputs derive from that complete range, and output count cannot exceed the selected nodes\' summed capacity. A tool output is allowed only as the sole output replacing exactly one current tool node. The host immediately accepts the outputs as new r* working nodes and returns the complete current structural catalog.',
+    description: 'Jointly replace one current node or continuous current range with one or more ordered nodes. Select every current node whose information the outputs use; output count cannot exceed the range\'s summed capacity. kind="tool" preserves one structured tool result and is allowed only as the sole output replacing exactly one current tool node; it remains valid only while the catalog names a retained tool-call peer. To compress tool work as prose, replace the continuous call/result interaction together with ordinary user/assistant nodes. The host accepts the draft and immediately reports any protocol mismatch with its repair range.',
     parameters: {
       start: { type: 'string', required: true, description: 'First current node id.' },
       end: { type: 'string', description: 'Last current node id, inclusive; omit for one node.' },
       nodes: {
         type: 'array',
         required: true,
-        description: 'Ordered replacement nodes jointly derived from the selected range.',
+        description: 'Non-empty ordered replacement nodes jointly derived from the selected range.',
         items: {
           type: 'object',
           additionalProperties: false,
           properties: {
-            kind: { type: 'string', required: true, enum: ['user', 'assistant', 'tool'], description: 'Semantic role. Tool is valid only when it is the sole output and the selected range is exactly one current tool node.' },
+            kind: { type: 'string', required: true, enum: ['user', 'assistant', 'tool'], description: 'Semantic role. "tool" means a retained structured result, not prose about tool work; it cannot create a structured call.' },
             content: { type: 'string', required: true, description: 'Complete content of this output node.' },
           },
         },
@@ -412,7 +421,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
       if (e2eInterruptAfterFirstMutation && job.workerNumber === 1 && job.mutationCount === 1) {
         exec.concludeTurn();
       }
-      return output;
+      return withProjectedToolProtocolWarning(output, job.editor.snapshot(), job.session.events);
     },
   }));
 

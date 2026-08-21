@@ -32,6 +32,7 @@ This recovery worker is a fresh same-model spawn: it does not inherit the parent
 
 - `n*` is an unchanged original node. `r*` is an accepted replacement produced by this or an earlier worker.
 - `changed` and `unchanged` describe editor state. `capacity=` is how many output nodes this node can still be split into; capacities add across a selected continuous range. `sources=` is the original evidence available to that node.
+- `tool-results=` on an assistant node and `tool-call=` on a tool node name their current structured protocol peers. `missing` means one side has been rewritten as plain transcript text and the draft cannot finish until the complete interaction is rewritten together.
 - `rewrite-required=raw-reasoning` marks an original assistant node containing reasoning. Its catalog text is only a placeholder for visible content. Inspect its exact reasoning—through the inherited turn or `read_turn_nodes`—and replace this node, alone or in a joint range, with ordinary assistant text that carries its continuation-critical work product.
 - A successful replacement creates new ids and makes every selected id stale. Any inherited parent transcript predates all `r*` wording.
 - Tool mutations change only the isolated host-owned editor. The parent session changes only after authoritative finish and host validation.
@@ -66,7 +67,7 @@ The entries below are temporary small-model recall indexes. They are neither aut
 - Keep a later human node separate when it records a genuine decision caused by an intermediate result or starts a genuinely different objective; do not rewrite that history as if it had been intended from the start.
 - Never attribute assistant actions, tool outcomes, discoveries, failures, host notices, or automatic continuation instructions to a consolidated user node. Corrected human intent and executed history are separate facts.
 - Original message and tool boundaries are evidence, not mandatory output structure. Merge adjacent working fragments when their split is mechanical. Retain a boundary when an intermediate result prompted a genuine decision, the objective actually changed, or a distinct unresolved branch remains useful; a typo correction that only reveals the original intent is not such a boundary.
-- Adjacent same-role semantic nodes are allowed. Raw tool nodes should remain only when exact protocol or output structure has continuing value; a retained tool result can only be rewritten one-to-one with a valid call/result pair.
+- Adjacent same-role semantic nodes are allowed. Normally compress a structured tool call and all of its results into ordinary assistant memory by jointly selecting the complete continuous interaction. Keep raw protocol only when its exact structure has continuing value: leave the assistant call node unchanged, and either leave each paired tool node unchanged or shorten one tool result through a one-to-one `tool` rewrite. A changed assistant node is plain text and cannot recreate a structured call.
 - Select every current node whose information an output uses. Inherited context supplies understanding, not provenance for unselected material.
 
 ## Preserve lazy image memory
@@ -81,7 +82,7 @@ A canonical `<memory-image ref="..." ... />` marker in node content represents a
 ## Edit, audit, and finish
 
 1. Inspect the current catalog and source turn. Before editing, identify the causal exchanges and the continuation-critical work products, especially any implementation state found only in reasoning. Use `read_turn_nodes` whenever a preview, inherited context, or current wording is insufficient; one read may cover several ids or continuous ranges, and a long selection can be paged with `offset`.
-2. Call `replace_turn_nodes` on one current node or continuous range. Emit ordered, complete `user`, `assistant`, or permitted one-to-one `tool` nodes. Select every current node that contributes information to the outputs. Generated nodes may be selected again for refinement; track the new ids returned by every mutation.
+2. Call `replace_turn_nodes` on one current node or continuous range. Emit ordered, complete `user`, `assistant`, or permitted one-to-one `tool` nodes. Select every current node that contributes information to the outputs. Generated nodes may be selected again for refinement; track the new ids returned by every mutation. If a result contains `protocol-warning`, use its current repair range before attempting finish; the mutation remains accepted as an editable draft.
 3. Audit the complete current surface for chronology, factual and role fidelity, uncertainty, meaningful trials, continuation-ready implementation detail, exact remaining work, `sources=` coverage, exact `<memory-image>` refs, stale host scaffolding, and valid tool pairing. Apply the rework test: if the next agent would need to repeat a substantial derivation or design step, the result is too compressed.
 4. Call `finish_turn_compression`. Plain text, `DONE`, or natural stopping commits nothing.
 

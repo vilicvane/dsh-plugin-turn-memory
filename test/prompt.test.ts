@@ -39,6 +39,9 @@ describe('buildCompressionPrompt', () => {
     assert.match(prompt, /typo correction that only reveals the original intent is not such a boundary/);
     assert.match(prompt, /Select every current node whose information an output uses/);
     assert.match(prompt, /Adjacent same-role semantic nodes are allowed/);
+    assert.match(prompt, /`tool-results=` on an assistant node and `tool-call=` on a tool node/);
+    assert.match(prompt, /A changed assistant node is plain text and cannot recreate a structured call/);
+    assert.match(prompt, /If a result contains `protocol-warning`, use its current repair range/);
     assert.match(prompt, /Inherited context supplies understanding, not provenance/);
     assert.match(prompt, /Audit the complete current surface/);
     assert.match(prompt, /Apply the rework test/);

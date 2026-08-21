@@ -120,6 +120,24 @@ describe('TurnNodeEditor', () => {
     );
   });
 
+  it('shows actionable structured tool peers and preserves result identity across one-to-one rewrites', () => {
+    const draft = new TurnNodeEditor([
+      { kind: 'assistant', content: 'call', sourceSeq: 10, toolCallIds: ['call-1'] },
+      { kind: 'tool', content: 'result', sourceSeq: 11, toolResultCallId: 'call-1' },
+      { kind: 'assistant', content: 'answer', sourceSeq: 12 },
+    ]);
+    assert.match(draft.richCatalog(), /n1 .*tool-results=n2/);
+    assert.match(draft.structuralCatalog(), /n2 tool .*tool-call=n1/);
+    assert.match(draft.read([{ start: 'n1', end: 'n2' }], 1000), /tool-results="n2"/);
+
+    draft.replace('n1', undefined, [{ kind: 'assistant', content: 'plain call account' }]);
+    assert.match(draft.structuralCatalog(), /n2 tool .*tool-call=missing/);
+
+    const result = draft.replace('n2', undefined, [{ kind: 'tool', content: 'short result' }]);
+    assert.equal(result.created[0].toolResultCallId, 'call-1');
+    assert.match(result.catalog, /r2 tool .*tool-call=missing/);
+  });
+
   it('requires every original reasoning-bearing assistant node to be rewritten', () => {
     const draft = new TurnNodeEditor([
       { kind: 'user', content: 'request', sourceSeq: 10 },

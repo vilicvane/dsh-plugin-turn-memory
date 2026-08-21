@@ -9,6 +9,10 @@ export interface TurnNodeSeed {
   /** Optional semantic provenance when the landing event is itself a replacement marker. */
   sourceSeqs?: number[];
   rewriteRequired?: 'raw-reasoning';
+  /** Structured calls retained only while this original assistant node remains unchanged. */
+  toolCallIds?: string[];
+  /** Structured result identity retained by an unchanged or one-to-one rewritten tool node. */
+  toolResultCallId?: string;
 }
 
 export interface TurnNodeOutput {
@@ -30,6 +34,8 @@ export interface TurnNodeSnapshot {
   landingIndexes: number[];
   changed: boolean;
   rewriteRequired?: 'raw-reasoning';
+  toolCallIds?: string[];
+  toolResultCallId?: string;
 }
 
 export interface NodeRange {
@@ -61,6 +67,7 @@ function preview(value: string, limit: number): string {
 function cloneNode(node: TurnNodeSnapshot): TurnNodeSnapshot {
   return {
     ...node,
+    ...(node.toolCallIds === undefined ? {} : { toolCallIds: [...node.toolCallIds] }),
     sourceSeqs: [...node.sourceSeqs],
     sourceIndexes: [...node.sourceIndexes],
     landingSeqs: [...node.landingSeqs],
@@ -98,6 +105,34 @@ function partition<T>(values: readonly T[], count: number): T[][] {
   });
 }
 
+/** Derive only the current-node relationships the worker can act on, never opaque call ids. */
+function protocolFieldMap(nodes: readonly TurnNodeSnapshot[]): Map<string, string[]> {
+  const callNodes = new Map<string, string>();
+  const resultNodes = new Map<string, string[]>();
+  for (const candidate of nodes) {
+    for (const callId of candidate.toolCallIds ?? []) callNodes.set(callId, candidate.id);
+    if (candidate.toolResultCallId !== undefined) {
+      const current = resultNodes.get(candidate.toolResultCallId) ?? [];
+      current.push(candidate.id);
+      resultNodes.set(candidate.toolResultCallId, current);
+    }
+  }
+  const fields = new Map<string, string[]>();
+  for (const node of nodes) {
+    const nodeFields: string[] = [];
+    if (node.toolCallIds !== undefined && node.toolCallIds.length > 0) {
+      nodeFields.push('tool-results=' + node.toolCallIds
+        .flatMap((callId) => resultNodes.get(callId) ?? ['missing'])
+        .join(','));
+    }
+    if (node.toolResultCallId !== undefined) {
+      nodeFields.push('tool-call=' + (callNodes.get(node.toolResultCallId) ?? 'missing'));
+    }
+    fields.set(node.id, nodeFields);
+  }
+  return fields;
+}
+
 /** Mutable, isolated working surface used by one compression fork. */
 export class TurnNodeEditor {
   readonly originalCount: number;
@@ -118,6 +153,8 @@ export class TurnNodeEditor {
       landingIndexes: [index + 1],
       changed: false,
       ...(seed.rewriteRequired === undefined ? {} : { rewriteRequired: seed.rewriteRequired }),
+      ...(seed.toolCallIds === undefined ? {} : { toolCallIds: [...seed.toolCallIds] }),
+      ...(seed.toolResultCallId === undefined ? {} : { toolResultCallId: seed.toolResultCallId }),
     }));
   }
 
@@ -126,6 +163,7 @@ export class TurnNodeEditor {
   }
 
   richCatalog(previewChars = 120): string {
+    const protocolFields = protocolFieldMap(this.nodes);
     return this.nodes.map((node) => [
       node.id,
       node.kind,
@@ -134,11 +172,13 @@ export class TurnNodeEditor {
       'sources=' + renderIndexes(node.sourceIndexes),
       node.changed ? 'changed' : 'unchanged',
       ...(node.rewriteRequired === undefined ? [] : ['rewrite-required=' + node.rewriteRequired]),
+      ...(protocolFields.get(node.id) ?? []),
       'preview=' + JSON.stringify(preview(node.content, previewChars)),
     ].join(' | ')).join('\n');
   }
 
   structuralCatalog(): string {
+    const protocolFields = protocolFieldMap(this.nodes);
     return this.nodes.map((node, index) => [
       (index + 1) + '.',
       node.id,
@@ -147,6 +187,7 @@ export class TurnNodeEditor {
       'sources=' + renderIndexes(node.sourceIndexes),
       node.changed ? 'changed' : 'unchanged',
       ...(node.rewriteRequired === undefined ? [] : ['rewrite-required=' + node.rewriteRequired]),
+      ...(protocolFields.get(node.id) ?? []),
     ].join(' ')).join('\n');
   }
 
@@ -182,6 +223,9 @@ export class TurnNodeEditor {
       landingSeqs: slices[index].map((item) => item.seq),
       landingIndexes: slices[index].map((item) => item.originalIndex),
       changed: true,
+      ...(output.kind === 'tool' && removed[0].toolResultCallId !== undefined
+        ? { toolResultCallId: removed[0].toolResultCallId }
+        : {}),
     }));
     this.nodes.splice(start, removed.length, ...created);
     this.assertPartition();
@@ -209,10 +253,15 @@ export class TurnNodeEditor {
         }
       }
     }
+    const protocolFields = protocolFieldMap(this.nodes);
     const rendered = selected.map((node) => [
       '<node id="' + node.id + '" kind="' + node.kind + '" capacity="' + node.landingIndexes.length
         + '" sources="' + renderIndexes(node.sourceIndexes) + '"'
-        + (node.rewriteRequired === undefined ? '' : ' rewrite-required="' + node.rewriteRequired + '"') + '>',
+        + (node.rewriteRequired === undefined ? '' : ' rewrite-required="' + node.rewriteRequired + '"')
+        + (protocolFields.get(node.id) ?? []).map((field) => {
+          const separator = field.indexOf('=');
+          return ' ' + field.slice(0, separator) + '="' + field.slice(separator + 1) + '"';
+        }).join('') + '>',
       node.exactContent ?? node.content,
       '</node>',
     ].join('\n')).join('\n\n');

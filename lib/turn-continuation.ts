@@ -73,6 +73,18 @@ function numericMarkerAttribute(text: string, name: string): number | undefined 
   return Number.isSafeInteger(value) ? value : undefined;
 }
 
+function announcedMilestone(text: string, turn: number): number | undefined {
+  const direct = /^Turn Memory continuation required — (\d+)-node milestone$/m.exec(text);
+  if (direct !== null) {
+    const value = Number(direct[1]);
+    return Number.isSafeInteger(value) ? value : undefined;
+  }
+  // Keep recognizing snapshots written before the model-facing XML wrappers
+  // were removed, so a restart does not repeat an already shown milestone.
+  if (numericMarkerAttribute(text, 'turn') !== turn) return undefined;
+  return numericMarkerAttribute(text, 'milestone-nodes');
+}
+
 export function latestAnnouncedMilestone(session: any, turn: number): number {
   const start = turnStartSeq(session, turn);
   if (start === undefined) return 0;
@@ -85,8 +97,7 @@ export function latestAnnouncedMilestone(session: any, turn: number): number {
       || !Array.isArray(event.data.source.sections)) continue;
     for (const section of event.data.source.sections) {
       if (section?.name !== CONTINUATION_CONTEXT_NAME || typeof section.text !== 'string') continue;
-      if (numericMarkerAttribute(section.text, 'turn') !== turn) continue;
-      const milestone = numericMarkerAttribute(section.text, 'milestone-nodes');
+      const milestone = announcedMilestone(section.text, turn);
       if (milestone !== undefined) latest = Math.max(latest, milestone);
     }
   }
@@ -165,24 +176,21 @@ export function buildTurnContinuationContext(options: {
   reminderIntervalNodes: number;
   estimatedContextTokens?: number;
 }): string {
-  const contextAttribute = options.estimatedContextTokens === undefined
-    ? ''
-    : ' context-estimated-tokens="' + options.estimatedContextTokens + '"';
+  const nextMilestone = options.milestoneNodes + options.reminderIntervalNodes;
+  const contextStatus = 'Current open turn: ' + options.openTurnNodes + ' nodes. '
+    + (options.estimatedContextTokens === undefined
+      ? ''
+      : 'Estimated full context: ' + options.estimatedContextTokens + ' tokens. ')
+    + 'Next reminder milestone: ' + nextMilestone + ' nodes.';
   return [
-    '<turn-memory-continuation turn="' + options.turn + '" milestone-nodes="' + options.milestoneNodes
-      + '" open-turn-nodes="' + options.openTurnNodes + '" reminder-interval-nodes="'
-      + options.reminderIntervalNodes + '"' + contextAttribute + '>',
-    'This turn has ' + options.openTurnNodes + ' nodes.'
-      + (options.estimatedContextTokens === undefined
-        ? ''
-        : ' The whole context is estimated at ' + options.estimatedContextTokens + ' tokens.'),
-    '<assistant-self-check>',
-    'I need to stop and summarize this turn now by calling `' + TURN_CONTINUATION_TOOL_NAME
-      + '` with what I finished, the current state, and the exact next work.',
-    'I should continue this turn only if the whole task will finish in the next few actions. If one atomic mutation is in progress, I will finish only that mutation first.',
-    'The host will then compress this turn and continue the work automatically in a new turn.',
-    '</assistant-self-check>',
-    '</turn-memory-continuation>',
+    'Turn Memory continuation required — ' + options.milestoneNodes + '-node milestone',
+    contextStatus,
+    'Stop this turn and hand off now.',
+    '- If an atomic mutation is already in progress, finish only that mutation first. Do not start another.',
+    '- Call `' + TURN_CONTINUATION_TOOL_NAME
+      + '` with completed work, current state, and the exact next work.',
+    '- Continue without handing off only when the whole task will finish in the next few actions.',
+    'After the call, the host will compress this turn and continue the work automatically in a new turn.',
   ].join('\n');
 }
 
@@ -191,10 +199,10 @@ export function buildTurnContinuationMessage(request: TurnContinuationRequest): 
     content: [{
       type: 'text',
       text: [
-        '<turn-memory-continuation from-turn="' + request.turn + '">',
-        'Automatic continuation after compression, not new human input.',
-        'Continue the unfinished work now from this handoff: ' + request.handoff,
-        '</turn-memory-continuation>',
+        'Turn Memory automatic continuation after compressed turn ' + request.turn,
+        'This is host control context, not new human input.',
+        'Resume the unfinished work now from the prior assistant handoff:',
+        request.handoff,
       ].join('\n'),
     }],
     source: {
@@ -224,12 +232,12 @@ export class TurnContinuationController {
     this.reminderIntervalNodes = reminderIntervalNodes;
     ctx.tools.register(defineTool({
       name: TURN_CONTINUATION_TOOL_NAME,
-      description: 'When the long-turn notice tells you to stop, summarize the handoff and end this turn. Work continues automatically after compression.',
+      description: 'Call when the active Turn Memory continuation notice requires a handoff. Record completed work, current state, and exact next work; this ends the current turn, then the host compresses it and continues automatically in a new turn.',
       parameters: {
         handoff: {
           type: 'string',
           required: true,
-          description: 'Concise completed progress, current state, and exact next work.',
+          description: 'Concise completed work, current state, unresolved dependencies, and exact next work for the next turn.',
         },
       },
       output: {
@@ -245,7 +253,7 @@ export class TurnContinuationController {
         const existing = continuationRequestForTurn(agent.session, turn);
         if (existing !== undefined) {
           exec.concludeTurn();
-          return 'turn ' + turn + ' already has continuation request ' + existing.requestId;
+          return 'Continuation is already queued for this turn; end the turn now.';
         }
         const openTurnNodes = countOpenTurnNodes(agent.session, turn);
         if (openTurnNodes < this.reminderIntervalNodes) {
@@ -255,7 +263,7 @@ export class TurnContinuationController {
         const handoff = typeof args.handoff === 'string' ? args.handoff.trim() : '';
         if (handoff === '') throw new Error('turn continuation handoff must not be empty');
         exec.concludeTurn();
-        return 'continuation ' + String(exec.callId) + ' queued; this turn will end and the next turn will start after compression';
+        return 'Continuation queued. This turn will end; after compression the host will start the next turn automatically.';
       },
     }));
     ctx.systemPrompt.context({

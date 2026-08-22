@@ -198,21 +198,38 @@ function assertImplementationDetail(session: any, compressed: any[], phase: stri
     .filter((node) => node.type !== 'user/message')
     .map(textOf)
     .join('\n');
-  const required = [
-    'lib/cobalt.ts',
-    'CobaltGate',
-    'idle -> checking -> ready | blocked',
-    'revision CAS',
-    '37s',
-    'one-shot',
-    'global mutable state',
-    'cold resume',
-    'test/cobalt.test.ts',
-    '250ms',
-    '500ms',
+  const required: Array<{ label: string; patterns: RegExp[] }> = [
+    { label: 'implementation target lib/cobalt.ts', patterns: [/lib\/cobalt\.ts/i] },
+    { label: 'CobaltGate interface', patterns: [/CobaltGate/i] },
+    {
+      label: 'idle -> checking -> ready | blocked state machine',
+      patterns: [/idle\s*(?:->|→)\s*checking\s*(?:->|→)\s*ready\s*\|\s*blocked/i],
+    },
+    {
+      label: 'revision compare-and-swap before commit',
+      patterns: [
+        /revision.{0,100}(?:\bCAS\b|compare[- ]and[- ]swap).{0,100}(?:before|之前|前).{0,40}commit/is,
+        /(?:\bCAS\b|compare[- ]and[- ]swap).{0,100}revision.{0,100}(?:before|之前|前).{0,40}commit/is,
+        /(?:commit|提交).{0,40}(?:before|之前|前).{0,100}revision.{0,100}(?:\bCAS\b|compare[- ]and[- ]swap)/is,
+      ],
+    },
+    { label: '37 second timeout', patterns: [/37\s*s(?:econds?)?/i, /37\s*秒/] },
+    { label: 'one-shot fallback', patterns: [/(?:one[- ]shot|一次性|单次).{0,40}fallback/is] },
+    {
+      label: 'rejected global mutable state because cold resume diverges',
+      patterns: [
+        /(?:global mutable state|全局可变状态).{0,180}(?:cold resume|冷恢复|冷启动恢复).{0,100}(?:diverg|分歧|分叉)/is,
+      ],
+    },
+    { label: 'validation target test/cobalt.test.ts', patterns: [/test\/cobalt\.test\.ts/i] },
+    { label: 'unresolved 250ms option', patterns: [/250\s*ms/i] },
+    { label: 'unresolved 500ms option', patterns: [/500\s*ms/i] },
   ];
-  for (const sentinel of required) {
-    assert.ok(assistant.includes(sentinel), `${phase}: compact implementation memory lost ${JSON.stringify(sentinel)}`);
+  for (const requirement of required) {
+    assert.ok(
+      requirement.patterns.some((pattern) => pattern.test(assistant)),
+      `${phase}: compact implementation memory lost ${requirement.label}`,
+    );
   }
   return fixture;
 }

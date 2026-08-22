@@ -62,6 +62,24 @@ describe('turn continuation measurement', () => {
     session.append('turn/end', { turn: 2, reason: { kind: 'completed' } });
     assert.equal(openTurnNumber(session), null);
   });
+
+  test('recognizes a pre-migration tagged milestone snapshot', () => {
+    const session = fixtureSession();
+    session.append('turn/start', { turn: 3 });
+    const notice = [
+      '<turn-memory-continuation turn="3" open-turn-nodes="34" milestone-nodes="32">',
+      '<assistant-self-check>I need to stop and hand off now.</assistant-self-check>',
+      '</turn-memory-continuation>',
+    ].join('\n');
+    session.append('user/message', message(notice, {
+      kind: 'plugin',
+      plugin: '@deepseek-ai/dsh-system-prompt',
+      form: 'snapshot',
+      sections: [{ name: 'turn-memory:long-turn-continuation', text: notice }],
+    }), 'append');
+
+    assert.equal(latestAnnouncedMilestone(session, 3), 32);
+  });
 });
 
 describe('turn continuation lifecycle', () => {
@@ -97,13 +115,15 @@ describe('turn continuation lifecycle', () => {
     };
 
     const notice = contexts[0].text({ agent });
-    assert.match(notice, /milestone-nodes="2"/);
-    assert.match(notice, /open-turn-nodes="2"/);
-    assert.match(notice, /context-estimated-tokens="111"/);
-    assert.match(notice, /<assistant-self-check>/);
-    assert.match(notice, /I need to stop and summarize this turn now/);
+    assert.match(notice, /Turn Memory continuation required — 2-node milestone/);
+    assert.match(notice, /Current open turn: 2 nodes/);
+    assert.match(notice, /Estimated full context: 111 tokens/);
+    assert.match(notice, /Next reminder milestone: 4 nodes/);
+    assert.match(notice, /Stop this turn and hand off now/);
+    assert.match(notice, /Call `continue_after_turn_compression`/);
     assert.match(notice, /whole task will finish in the next few actions/);
     assert.match(notice, new RegExp(TURN_CONTINUATION_TOOL_NAME));
+    assert.doesNotMatch(notice, /<turn-memory-continuation|<assistant-self-check>/);
     assert.ok(notice.length < 900, 'continuation notice should stay concise');
     session.append('user/message', message(notice, {
       kind: 'plugin',
@@ -120,8 +140,8 @@ describe('turn continuation lifecycle', () => {
       message: { id: 'a2', role: 'assistant', content: [{ type: 'text', text: 'next' }], source: { kind: 'model', provider: 'p', model: 'm' } },
     }, 'append');
     const secondNotice = contexts[0].text({ agent });
-    assert.match(secondNotice, /milestone-nodes="4"/);
-    assert.match(secondNotice, /I need to stop and summarize this turn now/);
+    assert.match(secondNotice, /Turn Memory continuation required — 4-node milestone/);
+    assert.match(secondNotice, /Stop this turn and hand off now/);
 
     let concluded = false;
     const tool = tools.get(TURN_CONTINUATION_TOOL_NAME);
@@ -164,7 +184,8 @@ describe('turn continuation lifecycle', () => {
     assert.equal(await controller.dispatchAfterCompression(agent, 1), true);
     assert.equal(delivered.length, 1);
     assert.match(delivered[0].content[0].text, /not new human input/);
-    assert.match(delivered[0].content[0].text, /Continue the unfinished work now/);
+    assert.match(delivered[0].content[0].text, /Resume the unfinished work now/);
+    assert.doesNotMatch(delivered[0].content[0].text, /<turn-memory-continuation/);
     assert.equal(continuationWasDelivered(session, request!.requestId), true);
     assert.equal(controller.needsDispatchAfterCompression(session, 1), false);
     assert.equal(await controller.dispatchAfterCompression(agent, 1), false);

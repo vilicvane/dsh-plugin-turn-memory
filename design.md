@@ -336,11 +336,11 @@
 
 - completed-turn compression 启用时，插件默认启用长 turn continuation。host 仅计数当前 root session 的 open turn 中 append-origin model-visible surface nodes；旧 turn、session checkpoint replacement 和 `@deepseek-ai/dsh-system-prompt` runtime snapshot 不计入该 turn 的工作量。默认提醒间隔为 30 nodes，可用 `turnContinuation.reminderIntervalNodes` 调整或以 `turnContinuation.enabled: false` 关闭。
 - open turn 每跨过一个间隔只提醒一次，即默认在 30、60、90……节点里程碑出现。host 从 durable runtime snapshot 的具名 section 恢复本 turn 已显示的最高里程碑，因此普通 step 和进程重启都不会重复同一级提醒；若一步跨过多个区间，只显示当前最高里程碑。提醒同时给出 open-turn 当前 node 数、整个 canonical context 的 token 估值和下一节点里程碑作为参考，但触发只取决于 open-turn node 数。
-- 里程碑到达时，插件通过一轮 dynamic runtime context 显示 `<turn-memory-continuation>`，而不是强制中断或在之后每轮持续占据上下文。其正文是简短的第一人称 `<assistant-self-check>`，直接要求模型停下来总结并调用公开工具 `continue_after_turn_compression({ handoff })`；它仍是明确标记来源的 plugin runtime context，不伪造 durable `assistant/message`。只有整个任务能在接下来少量动作内完成时才继续当前 turn。若一个不可拆分的 mutation 正在执行，模型只先完成该 mutation 再交接。handoff 简述已完成内容、当前状态和下一 turn 的准确工作。
+- 里程碑到达时，插件通过一轮 dynamic runtime context 显示普通文本的直接动作指令，而不是强制中断或在之后每轮持续占据上下文。提示不使用纯包装用途的 XML tag，明确要求模型停下来并调用公开工具 `continue_after_turn_compression({ handoff })`；它仍是具名来源的 plugin runtime context，不伪造 durable `assistant/message`。只有整个任务能在接下来少量动作内完成时才继续当前 turn。若一个不可拆分的 mutation 正在执行，模型只先完成该 mutation、且不开始新工作，再交接。handoff 简述已完成内容、当前状态、未解决依赖和下一 turn 的准确工作。
 - 工具只允许 root conversation 在 open turn 且已达到阈值时调用。成功调用用 `concludeTurn()` 结束当前 turn；native mode 下配对的 durable `tool/call` 原始 handoff 参数和成功 `tool/result`，或 Code Mode 下成功的 `tool/code-dispatch`，共同构成权威 continuation request。普通文本承诺、自然停止或失败的工具调用都不产生自动续开请求。
-- `turn/end` 后仍执行普通 turn-memory fork 压缩。只有 replacement/no-op marker 已落地且 session 已 flush，host 才把一条 `source.kind=plugin` 的 user-role follow-up 投递给同一个 agent。该输入明确声明自己是自动 continuation、不是新的人类指令，并携带 handoff；`Agent.followup()` 保证它成为独立 ordinary turn，而不是当前 turn 的 steer 或额外 step。
+- `turn/end` 后仍执行普通 turn-memory fork 压缩。只有 replacement/no-op marker 已落地且 session 已 flush，host 才把一条 `source.kind=plugin` 的 user-role follow-up 投递给同一个 agent。该输入以无 XML wrapper 的直接动作文本声明自己是自动 continuation、不是新的人类指令，并携带 handoff；`Agent.followup()` 保证它成为独立 ordinary turn，而不是当前 turn 的 steer 或额外 step。
 - continuation request 可通过 completed-turn recovery 路径跨进程恢复。dispatch 去重不依赖进程内 flag：append-only log 中同一 request id 的 `agent/inbox/spliced` insertion 或已 claim 的 `user/message` 都证明 follow-up 已投递。若 turn 压缩失败则不续开；没有 landing marker 的 request 会在后续 agent cold resume 重新进入压缩，成功后再投递。
-- runtime snapshot、长 turn 提醒和自动 continuation wrapper 是 host control context，不是 human intent。turn compression prompt 必须把这一边界纳入整体 transcript 规则：不逐字保留或伪装成用户要求；但当前工作为何尚未完成、已经得到的结论和 handoff 中真实的 unresolved state 仍按正确 assistant 角色压缩保留。
+- runtime snapshot、长 turn 提醒和自动 continuation follow-up 是 host control context，不是 human intent。turn compression prompt 必须把这一边界纳入整体 transcript 规则：不逐字保留或伪装成用户要求；但当前工作为何尚未完成、已经得到的结论和 handoff 中真实的 unresolved state 仍按正确 assistant 角色压缩保留。
 
 ### 可行性依据
 

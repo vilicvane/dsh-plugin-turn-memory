@@ -25,6 +25,13 @@ const FINAL_SENTINEL = 'PARENT-FINAL-BETA-332';
 const CONTINUATION_SENTINEL = 'CONTINUATION-DELTA-908';
 const DRAFT_SENTINEL = '__DRAFT_PASS__';
 const INTERNAL_TOOL_NAMES = [...TURN_TOOL_NAMES, ...SESSION_TOOL_NAMES];
+const CONTINUATION_CONTEXT_NAME = 'turn-memory:long-turn-continuation';
+const E2E_PARENT_TOOL_NAMES = new Set([
+  'turn_memory_e2e_fixture',
+  READ_MEMORY_IMAGE_TOOL_NAME,
+  READ_SESSION_HISTORY_TOOL_NAME,
+  TURN_CONTINUATION_TOOL_NAME,
+]);
 
 function textOf(event: any): string {
   return (event?.data?.message?.content ?? event?.data?.content ?? [])
@@ -123,7 +130,25 @@ async function run(ctx: any): Promise<void> {
   const disposeLifecycle = ctx.on('subagent/start', (info: any) => workerProviders.push(String(info.provider)));
   let fixtureCalls = 0;
   const setup = async (agentCtx: any) => {
-    await agentPresets.mount(agentCtx, 'minimal');
+    // rc.8's shipped minimal preset suppresses every runtime context, including
+    // the continuation notice this scenario exercises. Use a runtime-enabled
+    // shipped composition, then isolate the parent request to this fixture's
+    // persona, public tools, and the one context under test.
+    await agentPresets.mount(agentCtx, 'standard');
+    agentCtx.systemPrompt.section({
+      name: 'turn-memory:e2e-parent-persona',
+      order: 0,
+      complete: true,
+      text: 'You are a deterministic Turn Memory E2E agent. Follow the user request and active host runtime context exactly.',
+    });
+    agentCtx.on('system-prompt/assemble', async (_assembly: any, _context: any, next: () => Promise<any>) => {
+      const assembled = await next();
+      return {
+        ...assembled,
+        contexts: assembled.contexts.filter((entry: any) => entry.name === CONTINUATION_CONTEXT_NAME),
+        tools: assembled.tools.filter((tool: any) => E2E_PARENT_TOOL_NAMES.has(tool.name)),
+      };
+    });
     installModelSelection(agentCtx, {
       current: { ...selection },
       assembled: undefined,
@@ -219,9 +244,9 @@ async function run(ctx: any): Promise<void> {
       role: 'user',
       content: [{
         type: 'text',
-        text: USER_SENTINEL + ': Call turn_memory_e2e_fixture exactly once. Then call '
-          + TURN_CONTINUATION_TOOL_NAME + ' with this exact handoff: "' + FINAL_SENTINEL
-          + ': Reply with exactly ' + CONTINUATION_SENTINEL + ' and do no other work." Do not answer normally before calling it.',
+        text: USER_SENTINEL + ': Call turn_memory_e2e_fixture exactly once. After it returns, the remaining work is: '
+          + FINAL_SENTINEL + ': reply with exactly ' + CONTINUATION_SENTINEL
+          + ' and do no other work. Follow any active Turn Memory continuation instruction before completing that remaining work.',
       }],
       source: { kind: 'user' },
     });

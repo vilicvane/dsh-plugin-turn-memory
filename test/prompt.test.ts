@@ -55,7 +55,7 @@ describe('buildCompressionPrompt', () => {
     assert.doesNotMatch(prompt, /lands=/);
     assert.match(prompt, /<memory-image ref="\.\.\."/);
     assert.match(prompt, /read_memory_image/);
-    assert.match(prompt, /Host runtime snapshots, `<turn-memory-continuation>` reminders/);
+    assert.match(prompt, /Host runtime snapshots, Turn Memory continuation notices/);
     assert.match(prompt, /scaffolding rather than human requests/);
     assert.match(prompt, /intentional continuation should leave an assistant account/);
     assert.match(prompt, /No earlier worker has stopped/);

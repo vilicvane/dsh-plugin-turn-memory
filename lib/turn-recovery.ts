@@ -70,8 +70,14 @@ export function turnHasUnrewrittenReasoning(session: any, turn: number): boolean
 export function turnSurfaceSeqs(session: any, turn: number, startSeq: number, endSeq: number): number[] {
   return (session?.surface?.nodes ?? []).filter((seq: number) => {
     if (seq <= startSeq) return false;
-    const source = session.snapshotEvents()[seq]?.data?.source;
+    const event = session.snapshotEvents()[seq];
+    const source = event?.data?.source;
     if (source?.plugin === 'compact') return false;
+    // DSH 0.1.5 makes the durable host-owned system prompt surface-eligible. It is
+    // emitted after turn/start but sits at the surface head, is not part of the turn
+    // transcript, and may only be rewritten as an exact system/message replacement.
+    // Leaving it in the range would fail prepareJob's message-seed check.
+    if (event?.type === 'system/message') return false;
     if (source?.plugin === 'turn-memory' && Number.isSafeInteger(source.turn)) return source.turn === turn;
     return seq <= endSeq;
   });

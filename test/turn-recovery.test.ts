@@ -120,6 +120,32 @@ describe('turn recovery event scans', () => {
     assert.equal(turnHasUnrewrittenReasoning(session, 1), false);
   });
 
+  it('excludes the host-owned system prompt from a turn rewrite range', () => {
+    // DSH 0.1.5 ordering: turn/start precedes the system prompt append, so
+    // seq > startSeq alone would wrongly attribute the prompt to the turn.
+    const events: any[] = [];
+    events[4] = { seq: 4, type: 'turn/start', data: { turn: 1 } };
+    events[7] = {
+      seq: 7,
+      type: 'system/message',
+      data: { turn: 1, step: 1, message: { role: 'system', content: [] } },
+    };
+    events[8] = { seq: 8, type: 'user/message', data: { turn: 1, content: [{ type: 'text', text: 'request' }] } };
+    events[9] = {
+      seq: 9,
+      type: 'assistant/message',
+      data: { turn: 1, message: { content: [{ type: 'text', text: 'work' }] } },
+    };
+    events[16] = { seq: 16, type: 'tool/result', data: { message: { content: [] } } };
+    const session = {
+      surface: { nodes: [7, 8, 9, 16] },
+      snapshotEvents: () => events,
+      eventAt: (seq: number) => events[seq],
+    };
+
+    assert.deepEqual(turnSurfaceSeqs(session, 1, 4, 16), [8, 9, 16]);
+  });
+
   it('persists a semantic no-op as an idempotence marker without changing transcript text', () => {
     const session = Session.create('turn-recovery-noop' as any);
     const user = session.append('user/message', {

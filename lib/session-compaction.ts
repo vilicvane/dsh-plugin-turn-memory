@@ -11,10 +11,11 @@ import {
 } from '@deepseek-ai/dsh-compaction';
 import type { CompactionResult, CompactionTrigger } from '@deepseek-ai/dsh-compaction';
 import { CONTEXT_WINDOW_EXCEEDED_CODE, createUserMessage } from '@deepseek-ai/dsh-llm';
-import { deriveEventMessage } from '@deepseek-ai/dsh-session';
+import { SessionSeq, deriveEventMessage } from '@deepseek-ai/dsh-session';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
 import type { MemoryCoordinator } from './coordinator.ts';
+import { appendReplacing } from './surface-op.ts';
 import { buildSessionCompactionPrompt } from './session-prompt.ts';
 import { SessionMemoryEditor } from './session-editor.ts';
 import type { SessionMemoryOutput, SessionMemoryRange } from './session-editor.ts';
@@ -180,10 +181,17 @@ function replacementAssistantSeq(error: unknown, session: any): number | undefin
   const match = /token meter: assistant\/message at seq (\d+) has no matching step\/start event/.exec(errorText(error));
   if (match === null) return undefined;
   const seq = Number(match[1]);
-  const event = session.events[seq];
+  const event = session.snapshotEvents()[seq];
+  // DSH 0.1.5 forbids assistant/message from citing source events, so a
+  // compressed assistant landing is appended at the surface tail instead of
+  // replacing its source nodes. Accept both the legacy replace form and the
+  // append form; the phase check keeps the fallback scoped to compression
+  // markers (pending/continuation markers are user messages).
+  const landed = event?.surfaceOp === 'append' || event.surfaceOp?.op === 'replace';
   if (event?.type !== 'assistant/message'
-    || event.surfaceOp?.op !== 'replace'
-    || event.data?.source?.plugin !== 'turn-memory') return undefined;
+    || !landed
+    || event.data?.source?.plugin !== 'turn-memory'
+    || event.data?.source?.phase !== 'compression') return undefined;
   return seq;
 }
 
@@ -200,7 +208,7 @@ export function measureSessionForCompaction(meter: any, session: any): SessionMe
     const fallbackSeq = replacementAssistantSeq(error, session);
     if (fallbackSeq === undefined) throw error;
     const nodes = (session.surface.nodes as number[]).map((seq): PricedNode => {
-      const event = session.events[seq];
+      const event = session.snapshotEvents()[seq];
       const message = event === undefined ? null : deriveEventMessage(event);
       if (message === null) throw new Error('session compaction: surface seq ' + seq + ' has no model-visible message');
       return { seq, tokens: meter.estimateMessage(message) };
@@ -267,7 +275,7 @@ function inspectEntryState(events: readonly any[]): {
 }
 
 function assertNoActiveCompaction(session: any, stage: string): void {
-  const state = inspectEntryState(session.events);
+  const state = inspectEntryState(session.snapshotEvents());
   if (state.activeCompaction === undefined) return;
   if (state.latestEndSeedSeq !== undefined && state.latestEndSeedSeq > state.activeCompaction.seq) return;
   throw new ManualCompactionError('busy', stage + ': session compaction lock is already active');
@@ -283,9 +291,9 @@ function belongsToOpenTurn(event: any, openTurn: number, openTurnStart: number):
 }
 
 function completedPrefixLength(session: any): number {
-  const state = inspectEntryState(session.events);
+  const state = inspectEntryState(session.snapshotEvents());
   if (state.openTurn === null || state.openTurnStart === undefined) return session.surface.nodes.length;
-  const firstCurrent = session.surface.nodes.findIndex((seq: number) => belongsToOpenTurn(session.events[seq], state.openTurn!, state.openTurnStart!));
+  const firstCurrent = session.surface.nodes.findIndex((seq: number) => belongsToOpenTurn(session.snapshotEvents()[seq], state.openTurn!, state.openTurnStart!));
   return firstCurrent < 0 ? session.surface.nodes.length : firstCurrent;
 }
 
@@ -310,13 +318,13 @@ export function selectSessionCompactionRange(
   let endExclusive = Math.min(keepFrom, selectable);
   const unitKeys = sessionSurfaceUnitKeys(session, surface);
   while (endExclusive > 0) {
-    const balanced = toolPairingBalancedAfter(session, surface[endExclusive - 1]);
+    const balanced = toolPairingBalancedAfter(session, SessionSeq(surface[endExclusive - 1]));
     const unitBoundary = endExclusive === surface.length || unitKeys[endExclusive - 1] !== unitKeys[endExclusive];
     if (balanced && unitBoundary) break;
     endExclusive -= 1;
   }
   if (endExclusive <= 0) return null;
-  if (!toolPairingBalancedBefore(session, surface[0])) throw new Error('session compaction: surface head is not tool-pairing balanced');
+  if (!toolPairingBalancedBefore(session, SessionSeq(surface[0]))) throw new Error('session compaction: surface head is not tool-pairing balanced');
   return { start: surface[0], end: surface[endExclusive - 1] };
 }
 
@@ -327,8 +335,8 @@ function validateSurfaceRegion(session: any, start: number, end: number): Surfac
   if (startIndex < 0) throw new Error('session compactRegion: start seq ' + start + ' not found in surface');
   if (endIndex < 0) throw new Error('session compactRegion: end seq ' + end + ' not found in surface');
   if (startIndex > endIndex) throw new Error('session compactRegion: reversed surface range');
-  if (!toolPairingBalancedBefore(session, start)) throw new Error('session compactRegion: start boundary splits a tool pair');
-  if (!toolPairingBalancedAfter(session, end)) throw new Error('session compactRegion: end boundary splits a tool pair');
+  if (!toolPairingBalancedBefore(session, SessionSeq(start))) throw new Error('session compactRegion: start boundary splits a tool pair');
+  if (!toolPairingBalancedAfter(session, SessionSeq(end))) throw new Error('session compactRegion: end boundary splits a tool pair');
   const unitKeys = sessionSurfaceUnitKeys(session, nodes);
   if (startIndex > 0 && unitKeys[startIndex - 1] === unitKeys[startIndex]) {
     throw new Error('session compactRegion: start boundary splits a completed turn');
@@ -697,7 +705,7 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
     signal?.throwIfAborted();
     const session = agent.session;
     const selection = validateSurfaceRegion(session, start, end);
-    const entry = inspectEntryState(session.events);
+    const entry = inspectEntryState(session.snapshotEvents());
     assertNoActiveCompaction(session, 'session compaction');
     let owner: number | null;
     if (options.owner === null) {
@@ -754,7 +762,7 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
       }
       const checkpointText = job.editor.renderCheckpoint();
       assertMemoryImagesRetained(
-        selection.shadowedSeqs.map((seq) => session.events[seq]?.data),
+        selection.shadowedSeqs.map((seq) => session.snapshotEvents()[seq]?.data),
         checkpointText,
         'session compaction',
       );
@@ -771,17 +779,14 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
         compactionId,
         ...(options.sourceCommandId === undefined ? {} : { sourceCommandId: options.sourceCommandId }),
         summary,
-        shadowedRange: { start, end },
-        shadowedSeqs: [...selection.shadowedSeqs],
+        shadowedRange: { start: SessionSeq(start), end: SessionSeq(end) },
+        shadowedSeqs: selection.shadowedSeqs.map(SessionSeq),
         shadowedTokenCount,
         provider: target.provider,
         model: target.model,
         maxTokens: this.config.workerMaxTokens,
       });
-      session.append('user/message', checkpointMessage, {
-        surfaceOp: { op: 'replace', start, end },
-        sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...selection.shadowedSeqs],
-      });
+      appendReplacing(session, 'user/message', checkpointMessage, start, end, [startEvent.seq, summaryEvent.seq, ...selection.shadowedSeqs]);
       const endEvent = session.append('compaction/end', lifecycle);
       closed = true;
       result = {
@@ -791,8 +796,8 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
         summarySeq: summaryEvent.seq,
         endSeq: endEvent.seq,
         summary,
-        shadowedRange: { start, end },
-        shadowedSeqs: [...selection.shadowedSeqs],
+        shadowedRange: { start: SessionSeq(start), end: SessionSeq(end) },
+        shadowedSeqs: selection.shadowedSeqs.map(SessionSeq),
         shadowedTokenCount,
       };
     } catch (error) {

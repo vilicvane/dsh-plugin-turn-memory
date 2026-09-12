@@ -63,7 +63,7 @@ function textOf(event: any): string {
 
 function compressionNodes(session: any): any[] {
   return session.surface.nodes
-    .map((seq: number) => session.events[seq])
+    .map((seq: number) => session.snapshotEvents()[seq])
     .filter((event: any) => event?.data?.source?.plugin === 'turn-memory'
       && event.data.source.phase === 'compression');
 }
@@ -79,13 +79,13 @@ async function waitForCompression(session: any, timeoutMs: number): Promise<any[
 }
 
 function fixtureTurn(session: any): FixtureTurn {
-  const end = session.events.findLast((event: any) => event?.type === 'turn/end');
+  const end = session.snapshotEvents().findLast((event: any) => event?.type === 'turn/end');
   if (end === undefined) throw new Error('fixture session has no completed turn');
-  const start = session.events.findLast((event: any) => event?.type === 'turn/start'
+  const start = session.snapshotEvents().findLast((event: any) => event?.type === 'turn/start'
     && event.data?.turn === end.data?.turn);
   if (start === undefined) throw new Error('fixture completed turn has no start');
   const surfaceTypes = new Set(['user/message', 'assistant/message', 'tool/result']);
-  const original = session.events.filter((event: any) => event?.seq > start.seq
+  const original = session.snapshotEvents().filter((event: any) => event?.seq > start.seq
     && event.seq <= end.seq
     && surfaceTypes.has(event.type)
     && event.surfaceOp === 'append');
@@ -95,7 +95,7 @@ function fixtureTurn(session: any): FixtureTurn {
     .map((event: any) => event.seq);
   const originalSet = new Set(originalSeqs);
   const currentNodes = session.surface.nodes
-    .map((seq: number) => session.events[seq])
+    .map((seq: number) => session.snapshotEvents()[seq])
     .filter((event: any) => originalSet.has(event.seq)
       || (event?.data?.source?.plugin === 'turn-memory' && event.data.source.turn === end.data.turn));
   return { originalSeqs, originalUserSeqs, currentNodes };
@@ -108,7 +108,7 @@ function assertCommonCompression(
   minimumOriginalNodes: number,
 ): FixtureTurn {
   assert.deepEqual(
-    foldSurface(session.events).nodes,
+    foldSurface(session.snapshotEvents()).nodes,
     [...session.surface.nodes],
     `${phase}: live surface must equal full fold replay`,
   );
@@ -124,8 +124,12 @@ function assertCommonCompression(
   assert.equal(fixture.currentNodes.at(0)?.type, 'user/message', `${phase}: compact surface must start with user`);
   assert.equal(fixture.currentNodes.at(-1)?.type, 'assistant/message', `${phase}: compact surface must end with assistant`);
   assert.ok(fixture.currentNodes.every((node) => textOf(node).trim().length > 0), `${phase}: compact surface has an empty node`);
+  // 0.1.5 forbids assistant/message as a surface replacement target, so the compressed
+  // turn lands as a whole-range user replacement followed by appended outputs.
+  assert.equal(compressed[0]?.surfaceOp?.op, 'replace', `${phase}: compressed range must start with a positional replacement`);
+  assert.equal(compressed.at(-1)?.surfaceOp, 'append', `${phase}: assistant output must be appended, not replaced`);
+  assert.equal(compressed.at(-1)?.sourceEventSeqs, undefined, `${phase}: append-origin assistant output must not cite source events`);
   for (const node of compressed) {
-    assert.equal(node.surfaceOp?.op, 'replace', `${phase}: compressed nodes must be replacements`);
     assert.equal(
       node.data.source.originalNodes,
       fixture.originalSeqs.length,
@@ -425,7 +429,7 @@ async function runScenario(
 
     const snapshot = await sessionQuery.readSurface(sessionId);
     const expectedSurfaceEvents = coldHandle.agent.session.surface.nodes
-      .map((seq: number) => coldHandle.agent.session.events[seq]);
+      .map((seq: number) => coldHandle.agent.session.snapshotEvents()[seq]);
     assert.deepEqual(snapshot.events, expectedSurfaceEvents, 'sessionQuery surface must equal cold live surface');
     const artifactDir = resolve(process.env.TURN_MEMORY_E2E_ARTIFACT_DIR ?? '.tmp');
     surfacePath = resolve(artifactDir, `prompt-matrix-surface-${sessionId}.json`);

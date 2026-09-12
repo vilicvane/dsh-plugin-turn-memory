@@ -40,8 +40,8 @@ function resolveConfig(config: SessionHistoryConfig = {}): ResolvedSessionHistor
 function completedTurnSpans(session: any): CompletedTurnSpan[] {
   const spans: CompletedTurnSpan[] = [];
   let open: { turn: number; startIndex: number } | undefined;
-  for (let index = 0; index < (session.events?.length ?? 0); index += 1) {
-    const event = session.events[index];
+  for (let index = 0; index < (session.snapshotEvents()?.length ?? 0); index += 1) {
+    const event = session.snapshotEvents()[index];
     if (event?.type === 'turn/start' && Number.isSafeInteger(event.data?.turn)) {
       open = { turn: event.data.turn, startIndex: index };
       continue;
@@ -55,7 +55,7 @@ function completedTurnSpans(session: any): CompletedTurnSpan[] {
 }
 
 function spanEvents(session: any, span: CompletedTurnSpan): any[] {
-  return session.events.slice(span.startIndex + 1, span.endIndex)
+  return session.snapshotEvents().slice(span.startIndex + 1, span.endIndex)
     .filter((event: any) => eventMemoryKind(event) !== undefined);
 }
 
@@ -122,7 +122,7 @@ export function renderRawSessionContent(value: unknown): string {
 
 function compressedTurnNumbers(session: any): Set<number> {
   const turns = new Set<number>();
-  for (const event of session.events as readonly any[]) {
+  for (const event of session.snapshotEvents() as readonly any[]) {
     const source = event?.data?.source;
     if (source?.plugin === 'turn-memory' && source.phase === 'compression' && Number.isSafeInteger(source.turn)) {
       turns.add(source.turn);

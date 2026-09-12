@@ -44,12 +44,14 @@ describe('lazy memory images', () => {
     const rootSession = {
       id: 'root-session',
       header: {},
+      snapshotEvents(): readonly any[] { return this.events; }, eventAt(seq: number): any { return this.events[seq]; },
       events: [{ type: 'user/message', data: { content: [{ type: 'image', attachment: image }] } }],
       requestHeader: () => ({ config: { provider: 'fixture', model: 'vision' } }),
     };
     const childSession = {
       id: 'child-session',
       header: { parentSession: 'root-session' },
+      snapshotEvents(): readonly any[] { return this.events; }, eventAt(seq: number): any { return this.events[seq]; },
       events: [],
       requestHeader: () => ({ config: { provider: 'fixture', model: 'vision' } }),
     };

@@ -128,7 +128,7 @@ function candidateSessions(ctx: any, exec: any): any[] {
 
 function referencedAttachment(ctx: any, exec: any, ref: string): MemoryImageAttachmentRef | undefined {
   for (const session of candidateSessions(ctx, exec)) {
-    for (const event of session.events as readonly any[]) {
+    for (const event of session.snapshotEvents() as readonly any[]) {
       const found = collectMemoryImageAttachments(event?.data).find((candidate) => candidate.attachmentId === ref);
       if (found !== undefined) return found;
     }

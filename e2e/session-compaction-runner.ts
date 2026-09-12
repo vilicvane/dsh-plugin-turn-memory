@@ -29,12 +29,20 @@ async function completedTurn(agent: any, text: string): Promise<void> {
 }
 
 function appendPostTurnAssistantReplacement(session: any): number {
-  const originalSeq = session.surface.nodes.find((seq: number) => session.events[seq]?.type === 'assistant/message');
-  assert.notEqual(originalSeq, undefined, 'compatibility fixture needs an assistant surface node');
-  const original = session.events[originalSeq!];
+  // DSH 0.1.5 forbids assistant/message from citing source events and from
+  // being the landing node of a surface replace, so the fixture appends a copy
+  // of the last assistant node instead. Copying the *last* assistant keeps the
+  // marker in the same surface unit as the retained tail turn (`data.source.turn`
+  // drives the unit key), so manual compaction still stops before that turn.
+  const lastAssistantSeq = [...session.surface.nodes].reverse()
+    .find((seq: number) => session.snapshotEvents()[seq]?.type === 'assistant/message');
+  assert.notEqual(lastAssistantSeq, undefined, 'compatibility fixture needs an assistant surface node');
+  const original = session.snapshotEvents()[lastAssistantSeq!];
   const replacement = session.append('assistant/message', {
-    ...original.data,
+    turn: original.data.turn,
+    step: original.data.step,
     message: { ...original.data.message, id: randomUUID() },
+    stream: Array.isArray(original.data.stream) ? [...original.data.stream] : [],
     source: {
       kind: 'plugin',
       plugin: 'turn-memory',
@@ -44,19 +52,16 @@ function appendPostTurnAssistantReplacement(session: any): number {
       originalNodes: 1,
       mutations: 1,
     },
-  }, {
-    surfaceOp: { op: 'replace', start: originalSeq, end: originalSeq },
-    sourceEventSeqs: [originalSeq],
-  });
+  }, { surfaceOp: 'append' });
   return replacement.seq;
 }
 
 function assertCompacted(session: any, result: any, phase: string): any {
-  assert.deepEqual(foldSurface(session.events).nodes, [...session.surface.nodes], phase + ': live surface differs from replay fold');
-  const start = session.events[result.startSeq];
-  const summary = session.events[result.summarySeq];
-  const replacement = session.events[result.summarySeq + 1];
-  const end = session.events[result.endSeq];
+  assert.deepEqual(foldSurface(session.snapshotEvents()).nodes, [...session.surface.nodes], phase + ': live surface differs from replay fold');
+  const start = session.snapshotEvents()[result.startSeq];
+  const summary = session.snapshotEvents()[result.summarySeq];
+  const replacement = session.snapshotEvents()[result.summarySeq + 1];
+  const end = session.snapshotEvents()[result.endSeq];
   assert.equal(start.type, 'compaction/start', phase + ': missing start marker');
   assert.equal(summary.type, 'compaction/summary', phase + ': missing summary event');
   assert.equal(replacement.type, 'user/message', phase + ': summary must be immediately followed by checkpoint replacement');
@@ -141,11 +146,11 @@ async function run(ctx: any): Promise<void> {
       setup,
     });
     await coldHandle.agent.whenIdle();
-    const coldReplacement = coldHandle.agent.session.events[replacement.seq];
+    const coldReplacement = coldHandle.agent.session.snapshotEvents()[replacement.seq];
     assert.equal(coldReplacement?.data?.source?.compactionId, result.compactionId, 'cold load lost checkpoint identity');
     assertCompacted(coldHandle.agent.session, result, 'cold');
     const snapshot = await sessionQuery.readSurface(sessionId);
-    const expected = coldHandle.agent.session.surface.nodes.map((seq: number) => coldHandle.agent.session.events[seq]);
+    const expected = coldHandle.agent.session.surface.nodes.map((seq: number) => coldHandle.agent.session.snapshotEvents()[seq]);
     assert.deepEqual(snapshot.events, expected, 'sessionQuery surface differs from cold live surface');
     const artifactDir = resolve(process.env.TURN_MEMORY_E2E_ARTIFACT_DIR ?? '.tmp');
     const surfacePath = resolve(artifactDir, 'session-compaction-surface-' + sessionId + '.json');
@@ -169,7 +174,7 @@ function apply(ctx: any): void {
     () => exit(0),
     (error) => {
       console.error('SESSION_COMPACTION_E2E_RESULT=FAIL');
-      console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+      console.error(error);
       exit(1);
     },
   );

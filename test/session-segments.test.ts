@@ -20,7 +20,7 @@ describe('session segmentation', () => {
       event('assistant/message', 6, { turn: 2, message: { content: [{ type: 'text', text: 'second answer' }] } }),
       event('turn/end', 7, { turn: 2 }),
     ];
-    const session = { events };
+    const session = { events, snapshotEvents: () => events, eventAt: (seq: number) => events[seq] };
     const segments = buildSessionSegments(session, [
       { seq: 1, tokens: 7 },
       { seq: 2, tokens: 7 },
@@ -56,7 +56,7 @@ describe('session segmentation', () => {
       message: { content: [{ type: 'text', text: 'compressed assistant' }] },
       source: { kind: 'plugin', plugin: 'turn-memory', turn: 1 },
     });
-    const segments = buildSessionSegments({ events }, [{ seq: 3, tokens: 2 }, { seq: 4, tokens: 2 }], 100);
+    const segments = buildSessionSegments({ events, snapshotEvents: () => events, eventAt: (seq: number) => events[seq] }, [{ seq: 3, tokens: 2 }, { seq: 4, tokens: 2 }], 100);
     assert.deepEqual(segments[0].turns, [1]);
     assert.deepEqual(segments[0].seqs, [3, 4]);
   });
@@ -73,7 +73,7 @@ describe('session segmentation', () => {
       content: [{ type: 'text', text: 'late rewrite of turn one' }],
       source: { kind: 'plugin', plugin: 'turn-memory', turn: 1 },
     });
-    const session = { events, surface: { nodes: [6, 5], replaceGeneration: 1 } };
+    const session = { events, snapshotEvents: () => events, eventAt: (seq: number) => events[seq], surface: { nodes: [6, 5], replaceGeneration: 1 } };
     const range = selectSessionCompactionRange(session, { nodes: [{ seq: 6, tokens: 5 }, { seq: 5, tokens: 2 }] }, 0);
     assert.deepEqual(range, { start: 6, end: 6 });
   });
@@ -89,7 +89,7 @@ describe('session segmentation', () => {
       event('assistant/message', 6, { turn: 2, message: { content: [{ type: 'text', text: 'a2' }] } }),
       event('turn/end', 7, { turn: 2 }),
     ];
-    const session = { events, surface: { nodes: [1, 2, 5, 6], replaceGeneration: 0 } };
+    const session = { events, snapshotEvents: () => events, eventAt: (seq: number) => events[seq], surface: { nodes: [1, 2, 5, 6], replaceGeneration: 0 } };
     const range = selectSessionCompactionRange(session, { nodes: [
       { seq: 1, tokens: 2 }, { seq: 2, tokens: 2 }, { seq: 5, tokens: 2 }, { seq: 6, tokens: 2 },
     ] }, 0);

@@ -29,6 +29,7 @@ function fixture(
 ) {
   const calls: any[] = [];
   const logs: string[] = [];
+  const listeners = new Map<string, Array<(payload: any) => void>>();
   const ctx = {
     llm: {
       stream(options: any) {
@@ -40,6 +41,11 @@ function fixture(
       info(value: string) { logs.push('info ' + value); },
       warn(value: string) { logs.push('warn ' + value); },
     },
+    on(event: string, handler: (payload: any) => void) {
+      const handlers = listeners.get(event) ?? [];
+      handlers.push(handler);
+      listeners.set(event, handlers);
+    },
   };
   const controller = new ThoughtHintsController(ctx, {
     provider: 'local-test',
@@ -48,32 +54,52 @@ function fixture(
     maxTokens: 123,
     ...overrides,
   });
-  return { calls, controller, logs };
-}
-
-function blockEnd(turn: number, step: number, seq: number, index: number, text: string): any {
-  return {
-    seq,
-    type: 'assistant/chunk',
-    data: {
-      turn,
-      step,
-      chunk: { type: 'block-end', index, block: { type: 'reasoning', text } },
-    },
+  const emit = (event: string, payload: any): void => {
+    for (const handler of listeners.get(event) ?? []) handler(payload);
   };
+  return { calls, controller, logs, emit };
 }
 
-function assistantMessage(turn: number, step: number, seq: number, sourceEventSeqs: number[], thoughts: string[]): any {
+/**
+ * Replays a live model attempt the way 0.1.5 dispatches it: one `start` frame
+ * (carrying the turn/step) followed by `block-end` reasoning chunks. Replaces
+ * the pre-0.1.5 durable `assistant/chunk` events, which no longer exist.
+ */
+function emitStream(
+  emit: (event: string, payload: any) => void,
+  session: any,
+  turn: number,
+  step: number,
+  blocks: Array<{ index: number; text: string }>,
+  attemptId = 'attempt-1',
+): void {
+  emit('agent/assistant-stream', { agent: { session }, frame: { type: 'start', attemptId, revision: 1, turn, step } });
+  for (const block of blocks) {
+    emit('agent/assistant-stream', {
+      agent: { session },
+      frame: {
+        type: 'chunk',
+        attemptId,
+        revision: 1,
+        index: block.index,
+        time: 0,
+        chunk: { type: 'block-end', index: block.index, block: { type: 'reasoning', text: block.text } },
+      },
+    });
+  }
+}
+
+function assistantMessage(turn: number, step: number, seq: number, thoughts: string[]): any {
   return {
     seq,
     type: 'assistant/message',
-    sourceEventSeqs,
     data: {
       turn,
       step,
       message: {
         content: thoughts.map((text) => ({ type: 'reasoning', text })),
       },
+      stream: thoughts.map((text, index) => ({ type: 'reasoning-chunks', time0: 0, index, dt: [], texts: [text] })),
     },
   };
 }
@@ -89,13 +115,11 @@ describe('ThoughtHintsController', () => {
   });
 
   it('starts at block-end and sends only the fixed system prompt plus one raw-thought user message', async () => {
-    const { calls, controller } = fixture();
-    const session: any = { id: 's1', header: {}, events: [] };
-    const end = blockEnd(1, 1, 1, 0, 'long thought');
-    session.events[1] = end;
-    session.events[2] = assistantMessage(1, 1, 2, [1], ['long thought']);
+    const { calls, controller, emit } = fixture();
+    const session: any = { id: 's1', header: {}, events: [], snapshotEvents(): readonly any[] { return this.events; }, eventAt(seq: number): any { return this.events[seq]; } };
+    session.events[2] = assistantMessage(1, 1, 2, ['long thought']);
 
-    controller.observe(session, end);
+    emitStream(emit, session, 1, 1, [{ index: 0, text: 'long thought' }]);
     assert.equal(calls.length, 1, 'request starts before turn collection');
     assert.equal(calls[0].system, prompt);
     assert.equal(calls[0].provider, 'local-test');
@@ -117,19 +141,15 @@ describe('ThoughtHintsController', () => {
   });
 
   it('starts several long blocks independently and ignores short thoughts', async () => {
-    const { calls, controller } = fixture();
-    const session: any = { id: 's2', header: {}, events: [] };
-    const first = blockEnd(3, 4, 1, 0, 'first long thought');
-    const short = blockEnd(3, 4, 2, 1, 'no');
-    const second = blockEnd(3, 4, 3, 2, 'second long thought');
-    session.events[1] = first;
-    session.events[2] = short;
-    session.events[3] = second;
-    session.events[4] = assistantMessage(3, 4, 4, [1, 2, 3], ['first long thought', 'no', 'second long thought']);
+    const { calls, controller, emit } = fixture();
+    const session: any = { id: 's2', header: {}, events: [], snapshotEvents(): readonly any[] { return this.events; }, eventAt(seq: number): any { return this.events[seq]; } };
+    session.events[4] = assistantMessage(3, 4, 4, ['first long thought', 'no', 'second long thought']);
 
-    controller.observe(session, first);
-    controller.observe(session, short);
-    controller.observe(session, second);
+    emitStream(emit, session, 3, 4, [
+      { index: 0, text: 'first long thought' },
+      { index: 1, text: 'no' },
+      { index: 2, text: 'second long thought' },
+    ]);
     assert.equal(calls.length, 2, 'both eligible requests launch without waiting for turn/end');
 
     const hints = await controller.collectForTurn(session, 3, [4]);
@@ -140,8 +160,8 @@ describe('ThoughtHintsController', () => {
 
   it('regenerates missing hints from durable assistant reasoning during recovery', async () => {
     const { calls, controller } = fixture();
-    const session: any = { id: 'cold', header: {}, events: [] };
-    session.events[1] = assistantMessage(8, 2, 1, [], ['durable long thought']);
+    const session: any = { id: 'cold', header: {}, events: [], snapshotEvents(): readonly any[] { return this.events; }, eventAt(seq: number): any { return this.events[seq]; } };
+    session.events[1] = assistantMessage(8, 2, 1, ['durable long thought']);
 
     assert.equal(calls.length, 0);
     const hints = await controller.collectForTurn(session, 8, [1]);
@@ -156,22 +176,18 @@ describe('ThoughtHintsController', () => {
   });
 
   it('drops failed or empty hint calls without blocking successful hints', async () => {
-    const { controller, logs } = fixture((raw) => {
+    const { controller, logs, emit } = fixture((raw) => {
       if (raw.startsWith('bad')) return failure('offline');
       if (raw.startsWith('empty')) return success('   ');
       return success('kept hint');
     });
-    const session: any = { id: 'degrade', header: {}, events: [] };
-    const bad = blockEnd(5, 1, 1, 0, 'bad long thought');
-    const empty = blockEnd(5, 1, 2, 1, 'empty long thought');
-    const good = blockEnd(5, 1, 3, 2, 'good long thought');
-    session.events[1] = bad;
-    session.events[2] = empty;
-    session.events[3] = good;
-    session.events[4] = assistantMessage(5, 1, 4, [1, 2, 3], ['bad long thought', 'empty long thought', 'good long thought']);
-    controller.observe(session, bad);
-    controller.observe(session, empty);
-    controller.observe(session, good);
+    const session: any = { id: 'degrade', header: {}, events: [], snapshotEvents(): readonly any[] { return this.events; }, eventAt(seq: number): any { return this.events[seq]; } };
+    session.events[4] = assistantMessage(5, 1, 4, ['bad long thought', 'empty long thought', 'good long thought']);
+    emitStream(emit, session, 5, 1, [
+      { index: 0, text: 'bad long thought' },
+      { index: 1, text: 'empty long thought' },
+      { index: 2, text: 'good long thought' },
+    ]);
 
     assert.deepEqual(await controller.collectForTurn(session, 5, [4]), [{
       assistantSeq: 4,
@@ -189,12 +205,10 @@ describe('ThoughtHintsController', () => {
         options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
       });
     })();
-    const { controller, logs } = fixture(stuck, { timeoutMs: 10 });
-    const session: any = { id: 'timeout', header: {}, events: [] };
-    const end = blockEnd(9, 1, 1, 0, 'stuck long thought');
-    session.events[1] = end;
-    session.events[2] = assistantMessage(9, 1, 2, [1], ['stuck long thought']);
-    controller.observe(session, end);
+    const { controller, logs, emit } = fixture(stuck, { timeoutMs: 10 });
+    const session: any = { id: 'timeout', header: {}, events: [], snapshotEvents(): readonly any[] { return this.events; }, eventAt(seq: number): any { return this.events[seq]; } };
+    session.events[2] = assistantMessage(9, 1, 2, ['stuck long thought']);
+    emitStream(emit, session, 9, 1, [{ index: 0, text: 'stuck long thought' }]);
 
     assert.deepEqual(await controller.collectForTurn(session, 9, [2]), []);
     assert.ok(logs.some((line) => line.includes('raw reasoning remains available')));

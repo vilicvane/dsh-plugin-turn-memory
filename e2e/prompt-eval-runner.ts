@@ -33,7 +33,7 @@ function textOf(event: any): string {
 
 function compressionNodes(session: any): any[] {
   return session.surface.nodes
-    .map((seq: number) => session.events[seq])
+    .map((seq: number) => session.snapshotEvents()[seq])
     .filter((event: any) => event?.data?.source?.plugin === 'turn-memory' && event.data.source.phase === 'compression');
 }
 
@@ -48,12 +48,12 @@ async function waitForCompression(session: any, timeoutMs: number): Promise<any[
 }
 
 function fixtureTurn(session: any): { originalSeqs: number[]; originalUserSeqs: number[]; currentNodes: any[] } {
-  const end = session.events.findLast((event: any) => event?.type === 'turn/end');
+  const end = session.snapshotEvents().findLast((event: any) => event?.type === 'turn/end');
   if (end === undefined) throw new Error('fixture session has no completed turn');
-  const start = session.events.findLast((event: any) => event?.type === 'turn/start' && event.data?.turn === end.data?.turn);
+  const start = session.snapshotEvents().findLast((event: any) => event?.type === 'turn/start' && event.data?.turn === end.data?.turn);
   if (start === undefined) throw new Error('fixture completed turn has no start');
   const surfaceTypes = new Set(['user/message', 'assistant/message', 'tool/result']);
-  const original = session.events.filter((event: any) => event?.seq > start.seq
+  const original = session.snapshotEvents().filter((event: any) => event?.seq > start.seq
     && event.seq <= end.seq
     && surfaceTypes.has(event.type)
     && event.surfaceOp === 'append');
@@ -63,14 +63,14 @@ function fixtureTurn(session: any): { originalSeqs: number[]; originalUserSeqs: 
     .map((event: any) => event.seq);
   const originalSet = new Set(originalSeqs);
   const currentNodes = session.surface.nodes
-    .map((seq: number) => session.events[seq])
+    .map((seq: number) => session.snapshotEvents()[seq])
     .filter((event: any) => originalSet.has(event.seq)
       || (event?.data?.source?.plugin === 'turn-memory' && event.data.source.turn === end.data.turn));
   return { originalSeqs, originalUserSeqs, currentNodes };
 }
 
 function assertPromptCompression(session: any, nodes: any[], phase: string): void {
-  assert.deepEqual(foldSurface(session.events).nodes, [...session.surface.nodes], phase + ': live surface must equal full fold replay');
+  assert.deepEqual(foldSurface(session.snapshotEvents()).nodes, [...session.surface.nodes], phase + ': live surface must equal full fold replay');
   const fixture = fixtureTurn(session);
   assert.ok(fixture.originalSeqs.length >= 6, phase + ': fixture did not produce a substantial multi-step turn');
   assert.equal(fixture.originalUserSeqs.length, 2, phase + ': fixture must contain the initial request and one steer');
@@ -83,8 +83,12 @@ function assertPromptCompression(session: any, nodes: any[], phase: string): voi
     assert.ok(userNodes[0].sourceEventSeqs.includes(sourceSeq), phase + ': corrected user intent provenance omitted user source ' + sourceSeq);
   }
 
+  // 0.1.5 forbids assistant/message as a surface replacement target, so the compressed
+  // turn lands as a whole-range user replacement followed by appended outputs.
+  assert.equal(nodes[0].surfaceOp?.op, 'replace', phase + ': compressed range must start with a positional replacement');
+  assert.equal(nodes.at(-1)?.surfaceOp, 'append', phase + ': assistant output must be appended, not replaced');
+  assert.equal(nodes.at(-1)?.sourceEventSeqs, undefined, phase + ': append-origin assistant output must not cite source events');
   for (const node of nodes) {
-    assert.equal(node.surfaceOp?.op, 'replace', phase + ': compressed nodes must be replacements');
     assert.equal(node.data.source.originalNodes, fixture.originalSeqs.length, phase + ': replacement marker has the wrong original node count');
   }
 
@@ -197,7 +201,7 @@ async function run(ctx: any): Promise<void> {
 
     const snapshot = await sessionQuery.readSurface(sessionId);
     const expectedSurfaceEvents = coldHandle.agent.session.surface.nodes
-      .map((seq: number) => coldHandle.agent.session.events[seq]);
+      .map((seq: number) => coldHandle.agent.session.snapshotEvents()[seq]);
     assert.deepEqual(snapshot.events, expectedSurfaceEvents, 'sessionQuery surface must equal the cold live surface');
     const artifactDir = resolve(process.env.TURN_MEMORY_E2E_ARTIFACT_DIR ?? '.tmp');
     const surfacePath = resolve(artifactDir, 'prompt-eval-surface-' + sessionId + '.json');

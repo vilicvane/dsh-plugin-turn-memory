@@ -42,7 +42,7 @@ function textOf(event: any): string {
 
 function compressionNodes(session: any): any[] {
   return session.surface.nodes
-    .map((seq: number) => session.events[seq])
+    .map((seq: number) => session.snapshotEvents()[seq])
     .filter((event: any) => event?.data?.source?.plugin === 'turn-memory' && event.data.source.phase === 'compression');
 }
 
@@ -69,11 +69,11 @@ async function waitForCompression(session: any, timeoutMs: number): Promise<any[
 async function waitForContinuation(session: any, timeoutMs: number): Promise<{ user: any; assistant: any }> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const user = session.events.find((event: any) =>
+    const user = session.snapshotEvents().find((event: any) =>
       event?.type === 'user/message'
       && event.data?.source?.plugin === 'turn-memory'
       && event.data.source.phase === 'continuation');
-    const assistant = user === undefined ? undefined : session.events.find((event: any) =>
+    const assistant = user === undefined ? undefined : session.snapshotEvents().find((event: any) =>
       event?.type === 'assistant/message'
       && event.seq > user.seq
       && textOf(event).includes(CONTINUATION_SENTINEL));
@@ -84,17 +84,22 @@ async function waitForContinuation(session: any, timeoutMs: number): Promise<{ u
 }
 
 function assertProjection(session: any, nodes: any[], phase: string): void {
-  const folded = foldSurface(session.events);
+  const folded = foldSurface(session.snapshotEvents());
   assert.deepEqual(folded.nodes, [...session.surface.nodes], phase + ': live surface must equal full fold replay');
   assert.equal(compressionNodes(session).length, 2, phase + ': expected exactly one compressed user-assistant exchange on surface');
   assert.equal(nodes[0].type, 'user/message', phase + ': first compressed node must be a user message');
   assert.equal(nodes[1].type, 'assistant/message', phase + ': second compressed node must be an assistant message');
+  // 0.1.5 forbids assistant/message as a surface replacement target, so the compressed
+  // turn lands as a whole-range user replacement followed by appended outputs.
+  assert.equal(nodes[0].surfaceOp?.op, 'replace', phase + ': compressed range must start with a positional replacement');
+  assert.equal(new Set(nodes[0].sourceEventSeqs).size, nodes[0].sourceEventSeqs.length,
+    phase + ': replacement source provenance must not contain duplicates');
+  assert.ok(nodes[0].sourceEventSeqs.length >= nodes[0].data.source.originalNodes,
+    phase + ': the head output must cite the complete joint semantic source range and its landing coverage');
+  assert.equal(nodes[1].surfaceOp, 'append', phase + ': the assistant output must be appended, not replaced');
+  assert.equal(nodes[1].sourceEventSeqs, undefined,
+    phase + ': append-origin assistant output must not cite source events (0.1.5 embeds its stream instead)');
   for (const node of nodes) {
-    assert.equal(node.surfaceOp?.op, 'replace', phase + ': compressed nodes must be positional replacements');
-    assert.equal(new Set(node.sourceEventSeqs).size, node.sourceEventSeqs.length,
-      phase + ': replacement source provenance must not contain duplicates');
-    assert.ok(node.sourceEventSeqs.length >= node.data.source.originalNodes,
-      phase + ': each output must cite the complete joint semantic source range and its landing coverage');
     assert.ok(node.data.source.originalNodes >= 4, phase + ': fixture turn should exercise a four-node-or-larger joint rewrite');
     assert.ok(node.data.source.mutations >= 2, phase + ': generated ids should have been edited again');
     assert.equal(node.data.source.workerAttempts, 2,
@@ -228,7 +233,7 @@ async function run(ctx: any): Promise<void> {
     await sessions.flush(coldHandle.agent.session);
     const snapshot = await sessionQuery.readSurface(sessionId);
     const expectedSurfaceEvents = coldHandle.agent.session.surface.nodes
-      .map((seq: number) => coldHandle.agent.session.events[seq]);
+      .map((seq: number) => coldHandle.agent.session.snapshotEvents()[seq]);
     assert.deepEqual(snapshot.events, expectedSurfaceEvents, 'sessionQuery surface must equal the cold live surface');
     const artifactDir = resolve(process.env.TURN_MEMORY_E2E_ARTIFACT_DIR ?? '.tmp');
 

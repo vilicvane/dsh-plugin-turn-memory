@@ -25,7 +25,7 @@ function fixtureSession(): any {
     if (surfaceOp === 'append') surface.nodes.push(event.seq);
     return event;
   };
-  return { events, surface, header: {}, append };
+  return { events, snapshotEvents: () => events, eventAt: (seq: number) => events[seq], surface, header: {}, append };
 }
 
 const meter = {
@@ -53,7 +53,7 @@ describe('turn continuation measurement', () => {
     }, 'append');
     const replacement = session.append('user/message', message('old-checkpoint', {
       kind: 'plugin', plugin: 'compact', form: 'notice', summary: 'checkpoint',
-    }), { op: 'replace', start: 0, end: 0 });
+    }), { op: 'replace', startSeq: 0, endSeq: 0 });
     session.surface.nodes.unshift(replacement.seq);
 
     assert.equal(openTurnNumber(session), 2);

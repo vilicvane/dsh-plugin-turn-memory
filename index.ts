@@ -8,6 +8,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 import { MemoryCoordinator } from './lib/coordinator.ts';
 import { assistantCompressionSeed, contentText } from './lib/content.ts';
 import { TurnNodeEditor, replacementEventSourceSeqs } from './lib/editor.ts';
+import { appendReplacing } from './lib/surface-op.ts';
 import {
   DRAFT_SENTINEL,
   E2E_FINAL_SENTINEL,
@@ -45,7 +46,7 @@ import type { SessionCompactionConfig } from './lib/session-compaction.ts';
 import type { SessionHistoryConfig } from './lib/session-history.ts';
 import type { TurnContinuationConfig } from './lib/turn-continuation.ts';
 import type { ThoughtHint, ThoughtHintsConfig } from './lib/thought-hints.ts';
-import type { NodeRange, TurnNodeOutput, TurnNodeSeed } from './lib/editor.ts';
+import type { NodeRange, TurnNodeOutput, TurnNodeSeed, TurnNodeSnapshot } from './lib/editor.ts';
 
 const name = 'turn-memory';
 const inject = ['agents', 'llm', 'sessionQuery', 'sessions', 'subagents', 'systemPrompt', 'tokenMeter', 'tools'];
@@ -138,7 +139,7 @@ function prepareJob(agent: any, event: any): CompressionJob | undefined {
   const session = agent.session;
   const turn = event.data?.turn;
   if (!Number.isSafeInteger(turn)) return undefined;
-  const start = session.events.findLast((candidate: any) => candidate.type === 'turn/start' && candidate.data?.turn === turn);
+  const start = session.snapshotEvents().findLast((candidate: any) => candidate.type === 'turn/start' && candidate.data?.turn === turn);
   if (start === undefined) throw new Error('turn ' + turn + ' has a durable turn/end but no matching turn/start');
   const targetSeqs = turnSurfaceSeqs(session, turn, start.seq, event.seq);
   if (targetSeqs.length === 0) return undefined;
@@ -146,7 +147,7 @@ function prepareJob(agent: any, event: any): CompressionJob | undefined {
   if (firstIndex < 0 || targetSeqs.some((seq: number, index: number) => session.surface.nodes[firstIndex + index] !== seq)) {
     throw new Error('turn ' + turn + ' target is not a contiguous current surface range');
   }
-  const seeds = targetSeqs.map((seq: number) => seedOf(session.events[seq]));
+  const seeds = targetSeqs.map((seq: number) => seedOf(session.snapshotEvents()[seq]));
   if (seeds.some((seed: TurnNodeSeed | undefined) => seed === undefined)) {
     throw new Error('turn ' + turn + ' target contains a non-message surface node');
   }
@@ -185,7 +186,7 @@ function validateLanding(job: CompressionJob, e2eSmoke: boolean): void {
       throw new Error('e2e smoke draft sentinel still exists; refine the generated nodes before finishing');
     }
   }
-  const events = job.session.events;
+  const events = job.session.snapshotEvents();
   assertMemoryImagesRetained(
     job.targetSeqs.map((seq) => events[seq]?.data),
     nodes.map((node) => node.content).join('\n'),
@@ -212,7 +213,7 @@ function land(job: CompressionJob): void {
   if (firstIndex < 0 || job.targetSeqs.some((seq, index) => current[firstIndex + index] !== seq)) {
     throw new Error('target surface changed before landing');
   }
-  const events = session.events;
+  const events = session.snapshotEvents();
   const originalModelSource = job.targetSeqs.map((seq) => events[seq])
     .find((event) => event?.type === 'assistant/message' && event.data?.message?.source?.kind === 'model')
     ?.data?.message?.source;
@@ -237,60 +238,138 @@ function land(job: CompressionJob): void {
   const nodes = job.editor.snapshot();
   if (nodes.every((node) => !node.changed)) {
     appendTurnMarkerCopy(session, events[job.targetSeqs[0]], marker);
+    return;
   }
-  for (const node of nodes) {
-    if (!node.changed) continue;
-    const first = node.landingSeqs[0];
-    const last = node.landingSeqs[node.landingSeqs.length - 1];
-    const meta = {
-      surfaceOp: { op: 'replace', start: first, end: last },
-      sourceEventSeqs: replacementEventSourceSeqs(node),
-    };
-    if (node.kind === 'user') {
-      session.append('user/message', {
+  const startSeq = job.targetSeqs[0];
+  const endSeq = job.targetSeqs[job.targetSeqs.length - 1];
+  const safeStepOf = (node: TurnNodeSnapshot): number => {
+    for (let index = node.sourceSeqs.length - 1; index >= 0; index -= 1) {
+      const candidate = events[node.sourceSeqs[index]]?.data?.step;
+      if (Number.isSafeInteger(candidate)) return candidate;
+    }
+    return Number.isSafeInteger(fallbackStep) ? (fallbackStep as number) : 0;
+  };
+  const onlyEditableKinds = nodes.filter((node) => node.changed)
+    .every((node) => node.kind === 'user' || node.kind === 'tool');
+  if (onlyEditableKinds) {
+    for (const node of nodes) {
+      if (!node.changed) continue;
+      const first = node.landingSeqs[0];
+      const last = node.landingSeqs[node.landingSeqs.length - 1];
+      const provenance = replacementEventSourceSeqs(node);
+      if (node.kind === 'user') {
+        appendReplacing(session, 'user/message', {
+          id: randomUUID(),
+          role: 'user',
+          content: [{ type: 'text', text: node.content }],
+          source: marker,
+        }, first, last, provenance);
+        continue;
+      }
+      const original = events[first];
+      const wrapper = original.data.message.content[0];
+      appendReplacing(session, 'tool/result', {
+        ...original.data,
+        message: {
+          ...original.data.message,
+          content: [{ ...wrapper, content: [{ type: 'text', text: node.content }] }],
+        },
+      }, first, last, provenance);
+    }
+    return;
+  }
+  const atTail = firstIndex + job.targetSeqs.length === current.length;
+  const tailLandable = atTail
+    && nodes[0].kind === 'user'
+    && nodes[nodes.length - 1].kind === 'assistant'
+    && originalModelSource !== undefined;
+  if (tailLandable) {
+    const head = nodes[0];
+    const headLanding = events[head.landingSeqs[0]];
+    appendReplacing(session, 'user/message', head.changed
+      ? {
         id: randomUUID(),
         role: 'user',
-        content: [{ type: 'text', text: node.content }],
+        content: [{ type: 'text', text: head.content }],
         source: marker,
-      }, meta);
-      continue;
-    }
-    if (node.kind === 'assistant') {
-      let step = fallbackStep;
-      for (let index = node.sourceSeqs.length - 1; index >= 0; index -= 1) {
-        const candidate = events[node.sourceSeqs[index]]?.data?.step;
-        if (typeof candidate === 'number') {
-          step = candidate;
-          break;
-        }
       }
-      session.append('assistant/message', {
-        turn: job.turn,
-        step,
-        message: {
+      : { ...headLanding.data, id: randomUUID(), source: marker },
+    startSeq, endSeq, [...new Set([...replacementEventSourceSeqs(head), ...job.targetSeqs])]);
+    for (const node of nodes.slice(1)) {
+      const landing = events[node.landingSeqs[0]];
+      if (!node.changed) {
+        if (node.kind === 'user') {
+          session.append('user/message', {
+            ...landing.data,
+            id: randomUUID(),
+            source: marker,
+          }, { surfaceOp: 'append' });
+          continue;
+        }
+        if (node.kind === 'assistant') {
+          session.append('assistant/message', {
+            turn: landing.data.turn,
+            step: landing.data.step,
+            message: { ...landing.data.message, id: randomUUID() },
+            source: marker,
+            stream: Array.isArray(landing.data.stream) ? [...landing.data.stream] : [],
+          }, { surfaceOp: 'append' });
+          continue;
+        }
+        session.append('tool/result', {
+          ...landing.data,
+          message: { ...landing.data.message, id: randomUUID() },
+        }, { surfaceOp: 'append' });
+        continue;
+      }
+      if (node.kind === 'user') {
+        session.append('user/message', {
           id: randomUUID(),
-          role: 'assistant',
-          source: {
-            kind: 'model',
-            provider: originalModelSource.provider,
-            model: originalModelSource.model,
-          },
+          role: 'user',
           content: [{ type: 'text', text: node.content }],
+          source: marker,
+        }, { surfaceOp: 'append' });
+        continue;
+      }
+      if (node.kind === 'assistant') {
+        session.append('assistant/message', {
+          turn: job.turn,
+          step: safeStepOf(node),
+          message: {
+            id: randomUUID(),
+            role: 'assistant',
+            source: {
+              kind: 'model',
+              provider: originalModelSource.provider,
+              model: originalModelSource.model,
+            },
+            content: [{ type: 'text', text: node.content }],
+          },
+          source: marker,
+          stream: [],
+        }, { surfaceOp: 'append' });
+        continue;
+      }
+      const wrapper = landing.data.message.content[0];
+      session.append('tool/result', {
+        ...landing.data,
+        message: {
+          ...landing.data.message,
+          content: [{ ...wrapper, content: [{ type: 'text', text: node.content }] }],
         },
-        source: marker,
-      }, meta);
-      continue;
+      }, { surfaceOp: 'append' });
     }
-    const original = events[first];
-    const wrapper = original.data.message.content[0];
-    session.append('tool/result', {
-      ...original.data,
-      message: {
-        ...original.data.message,
-        content: [{ ...wrapper, content: [{ type: 'text', text: node.content }] }],
-      },
-    }, meta);
+    return;
   }
+  const checkpoint = nodes
+    .map((node) => (node.kind === 'tool' ? 'Tool result' : node.kind === 'assistant' ? 'Assistant' : 'User') + ': ' + node.content)
+    .join('\n\n');
+  appendReplacing(session, 'user/message', {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text: checkpoint }],
+    source: marker,
+  }, startSeq, endSeq, [...new Set([...nodes.flatMap((node) => node.sourceSeqs), ...job.targetSeqs])]);
 }
 
 function apply(ctx: any, config: PluginConfig = {}): void {
@@ -421,7 +500,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
       if (e2eInterruptAfterFirstMutation && job.workerNumber === 1 && job.mutationCount === 1) {
         exec.concludeTurn();
       }
-      return withProjectedToolProtocolWarning(output, job.editor.snapshot(), job.session.events);
+      return withProjectedToolProtocolWarning(output, job.editor.snapshot(), job.session.snapshotEvents());
     },
   }));
 
@@ -659,7 +738,6 @@ function apply(ctx: any, config: PluginConfig = {}): void {
   };
 
   ctx.on('session/event', (session: any, event: any) => {
-    thoughtHints?.observe(session, event);
     if (event.type !== 'turn/end' || !isUserConversationSession(session)) return;
     // Session.append() cannot re-enter the session/event publication boundary.
     // Defer both the durable marker and the queue so job preparation can only
@@ -672,9 +750,9 @@ function apply(ctx: any, config: PluginConfig = {}): void {
         if (Number.isSafeInteger(turn)
           && !compressedTurnNumbers(session).has(turn)
           && !pendingTurnNumbers(session).has(turn)) {
-          const start = session.events.findLast((candidate: any) => candidate.type === 'turn/start' && candidate.data?.turn === turn);
+          const start = session.snapshotEvents().findLast((candidate: any) => candidate.type === 'turn/start' && candidate.data?.turn === turn);
           const targetSeqs = start === undefined ? [] : turnSurfaceSeqs(session, turn, start.seq, event.seq);
-          const user = targetSeqs.map((seq: number) => session.events[seq]).find((candidate: any) => candidate?.type === 'user/message');
+          const user = targetSeqs.map((seq: number) => session.snapshotEvents()[seq]).find((candidate: any) => candidate?.type === 'user/message');
           if (user === undefined) {
             ctx.logger.warn('turn-memory: turn ' + String(turn) + ' has no user node for a durable pending marker; live processing remains available but cold recovery is not guaranteed');
           } else {

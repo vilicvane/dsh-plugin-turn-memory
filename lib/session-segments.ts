@@ -32,7 +32,7 @@ function preview(value: string, limit: number): string {
 function eventTurns(session: any): Map<number, number> {
   const turns = new Map<number, number>();
   let openTurn: number | undefined;
-  for (const event of session.events as any[]) {
+  for (const event of session.snapshotEvents() as any[]) {
     if (event?.type === 'turn/start' && Number.isSafeInteger(event.data?.turn)) openTurn = event.data.turn;
     const isCompactionCheckpoint = event?.data?.source?.plugin === 'compact';
     const markerTurn = event?.data?.source?.plugin === 'turn-memory' && Number.isSafeInteger(event.data.source.turn)
@@ -83,7 +83,7 @@ export function buildSessionSegments(
   const turnBySeq = eventTurns(session);
   const units: TurnUnit[] = [];
   for (const priced of pricedNodes) {
-    const event = session.events[priced.seq];
+    const event = session.snapshotEvents()[priced.seq];
     if (event === undefined || event.seq !== priced.seq) throw new Error('session compaction: surface seq ' + priced.seq + ' has no matching event');
     if (eventMemoryKind(event) === undefined) throw new Error('session compaction: surface seq ' + priced.seq + ' is not a message node');
     const turn = turnBySeq.get(priced.seq);
@@ -114,8 +114,8 @@ export function buildSessionSegments(
   return groups.map((group, index) => {
     const seqs = group.flatMap((unit) => unit.seqs);
     const turns = [...new Set(group.flatMap((unit) => unit.turns))];
-    const firstText = eventContentText(session.events[seqs[0]]);
-    const lastText = eventContentText(session.events[seqs[seqs.length - 1]]);
+    const firstText = eventContentText(session.snapshotEvents()[seqs[0]]);
+    const lastText = eventContentText(session.snapshotEvents()[seqs[seqs.length - 1]]);
     return {
       id: 's' + (index + 1),
       index: index + 1,
@@ -146,7 +146,7 @@ export function renderSegmentCatalog(
 export function renderSegmentSource(session: any, segment: SessionSegment): string {
   const turnBySeq = eventTurns(session);
   return segment.seqs.map((seq, index) => {
-    const event = session.events[seq];
+    const event = session.snapshotEvents()[seq];
     const kind = eventMemoryKind(event);
     const turn = turnBySeq.get(seq);
     return [
@@ -160,7 +160,7 @@ export function renderSegmentSource(session: any, segment: SessionSegment): stri
 export function renderSegmentNodeDirectory(session: any, segment: SessionSegment, previewChars = 120): string {
   const turnBySeq = eventTurns(session);
   return segment.seqs.map((seq, index) => {
-    const event = session.events[seq];
+    const event = session.snapshotEvents()[seq];
     const text = eventContentText(event);
     const turn = turnBySeq.get(seq);
     return [
@@ -210,7 +210,7 @@ export function readSessionSourceNodes(
   }
   const turnBySeq = eventTurns(session);
   const rendered = selected.map((node) => {
-    const event = session.events[node.seq];
+    const event = session.snapshotEvents()[node.seq];
     const turn = turnBySeq.get(node.seq);
     return [
       '<source-node id="' + node.id + '" kind="' + eventMemoryKind(event) + '" origin="' + eventOrigin(event) + '"' + (turn === undefined ? '' : ' turn="' + turn + '"') + '>',

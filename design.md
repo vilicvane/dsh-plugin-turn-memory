@@ -459,3 +459,37 @@
 
 - 隔离不会也不应删除 fork 已继承的 parent 历史快照，否则会改变 canonical source；最终产物是否保留其中信息仍由压缩协议和 host validation 决定。
 - worker 的完整行为契约仍以实时读取的 Markdown task prompt 为唯一来源。isolated system section 只声明边界，不重复压缩策略，避免两份协议漂移。
+
+## D-019：面向 DSH 0.1.5 surface 契约的压缩落地形态
+
+状态：**已确认**
+
+### 约定
+
+- 目标运行时 DSH 0.1.5 起，surface 落地必须遵守以下契约：
+  - `assistant/message` 不得携带 `sourceEventSeqs`：其模型流内嵌在 `data.stream`，冷加载要求 `stream` 是数组（空数组合法）。
+  - replacement 的 `surfaceOp` 必须是 `{ op: 'replace', startSeq, endSeq }`（旧 `{ start, end }` 已不再接受），且该 replacement 的 `sourceEventSeqs` 必须完整覆盖本次遮蔽的全部当前节点；任何类型的 `sourceEventSeqs` 都不得为空。
+  - 由于 `assistant/message` 的 `sourceEventSeqs` 恒为空集，它不能成为 replacement 的落点；append 又只能追加到 surface 末尾。因此压缩产物中的 assistant 节点只有在目标区间仍位于 surface 尾部时才可产生。
+- `land()` 在 `editor.validateFinal()` 通过后，按目标区间与产物形态选择四种落地方式：
+  1. 全部节点未改动：沿用 `appendTurnMarkerCopy`，把该 turn 的首个 user 节点一对一替换为 marker copy。
+  2. 只有 user／tool 节点被改动：逐节点一对一 replacement（字段名 `startSeq`／`endSeq`），保持原位置；tool 节点只改写 result content。
+  3. 目标区间位于 surface 尾部、产物首 user 末 assistant、且能继承原 model source：先用一次 replacement 以首个产物节点遮蔽整个目标区间，再在同一同步代码段内按序 append 其余产物节点。append 的 `assistant/message` 使用 `stream: []`（改写产物没有可复用的模型流），继承原 provider／model，并携带 marker source 以便恢复扫描识别。
+  4. 其余情况（目标后面已有节点，或无法继承 model source）：把整个目标区间替换为单个 `user/message` checkpoint，各产物按 `User: `／`Assistant: `／`Tool result: ` 前缀顺序拼接。
+- 因此 D-003“压缩产物以 user 开始、以 assistant 结束”只在方式 3 成立；方式 4 是明确降级：产物是单个 user checkpoint，丢失 assistant 角色与结构化 tool 节点。D-003 的 landing-slice 分区不变量对 append-origin 节点不成立，因为它们没有遮蔽任何原节点。
+- 方式 3 中未改动的节点必须按原事件数据重建（保留原 message content、tool call、stream 等），只有改动节点落为纯文本。`lib/tool-protocol.ts` 的既有语义是：未改动节点与 tool 节点保留其原始结构化事件，改动节点落为纯文本；若把未改动的 assistant 也重写为纯文本，会让其对应的结构化 tool/result 变成 missing-call。
+- 实时 reasoning 观测（D-014）改接 `agent/assistant-stream`：以 start 帧的 `attemptId` 记忆 `turn`／`step`，在后续 chunk 帧中按 block-end reasoning 且文本长度达到 `minimumChars` 触发 thought hint；durable 恢复改用 `assistant/message.data.stream` 的 `reasoning-chunks` 记录取真实 block index 与文本，旧 `sourceEventSeqs` 读取仅作兼容分支保留。
+- session compaction 的 token-meter fallback 必须同时接受 append 形态：`replacementAssistantSeq` 对 `data.source.plugin === 'turn-memory'`、`phase === 'compression'` 的 assistant 落地节点，接受 `surfaceOp === 'append'` 或 `surfaceOp.op === 'replace'`。
+
+### 可行性依据
+
+- 0.1.5 的 `dsh-session` 在 provenance 校验中直接拒绝 assistant/message 的 `sourceEventSeqs`，并在 replacement 路径用被遮蔽节点校验来源覆盖集；assistant 的来源集恒为空，因而必然失败。本地探针确认：以 replacement 落 assistant（带或不带 `sourceEventSeqs`）都抛错，而 append 带 `stream: []` 可冷加载并正确投影 `deriveMessages()`。
+- `assistant/message` 的冷加载形状检查要求 `turn`／`step` 为非负安全整数且 `data.stream` 是数组；本地探针确认缺 `stream` 会在 seed 校验期抛错。
+- append 只能追加到 surface 尾部，append-origin 节点没有遮蔽范围；本地探针确认“整段 replace → user，再 append assistant”与“整段 replace → user，再 append tool/result，再 append assistant”都能冷加载回放。
+- 上游 `token-meter` 在 `step/end` 之后清空 `stepStart`，遇到 assistant/message 即抛 `assistant/message at seq N has no matching step/start event`；post-turn append 的 assistant 必然触发。`measureSessionForCompaction` 已有基于 canonical surface 重新计价的 fallback，只需把 append 形态纳入识别条件。
+
+### 已知边界
+
+- 方式 4 丢失 assistant 角色与结构化 tool 节点，human transcript 会把 checkpoint 呈现为普通 user message。
+- 方式 3 的 append-origin assistant 不是模型真实输出，也不位于开放 turn／step 中；若加载 session relational invariant，它会被判为不合法。当前生产与冒烟组合都未加载该 invariant companion。
+- 方式 3 只在目标区间位于 surface 尾部时可用；历史 turn 的冷恢复（按 turn 升序回补）通常不满足，因此会落到方式 4。若要避免这一降级，需要在后续设计中单独解决。
+

@@ -77,29 +77,50 @@ export class ThoughtHintsController {
   private readonly config: ResolvedThoughtHintsConfig;
   private readonly controller = new AbortController();
   private readonly tasks = new Map<string, HintTask>();
+  private readonly attemptPositions = new Map<string, { sessionId: string; turn: number; step: number }>();
 
   constructor(ctx: any, config: ThoughtHintsConfig) {
     this.ctx = ctx;
     this.config = resolveConfig(config);
     this.minimumChars = this.config.minimumChars;
+    ctx.on('agent/assistant-stream', ({ agent, frame }: any) => this.observeFrame(agent, frame));
   }
 
-  observe(session: any, event: any): void {
-    if (!isUserConversationSession(session) || event?.type !== 'assistant/chunk') return;
-    const turn = event.data?.turn;
-    const step = event.data?.step;
-    const chunk = event.data?.chunk;
-    if (!Number.isSafeInteger(turn) || !Number.isSafeInteger(step)
-      || chunk?.type !== 'block-end' || chunk.block?.type !== 'reasoning'
-      || typeof chunk.block.text !== 'string' || chunk.block.text.length < this.minimumChars) return;
-    this.ensureTask(String(session.id), turn, step, chunk.index, chunk.block.text);
+  /**
+   * Live reasoning arrives through the process-local `agent/assistant-stream`
+   * dispatch on 0.1.5 (durable `assistant/chunk` events no longer exist).
+   * Chunk frames carry no turn/step, so they are remembered per attempt.
+   */
+  private observeFrame(agent: any, frame: any): void {
+    const attemptId = frame?.attemptId;
+    if (typeof attemptId !== 'string') return;
+    if (frame.type === 'end') {
+      this.attemptPositions.delete(attemptId);
+      return;
+    }
+    if (frame.type === 'start') {
+      const session = agent?.session;
+      const turn = frame.turn;
+      const step = frame.step;
+      if (!isUserConversationSession(session) || !Number.isSafeInteger(turn) || !Number.isSafeInteger(step)) return;
+      this.attemptPositions.set(attemptId, { sessionId: String(session.id), turn, step });
+      return;
+    }
+    if (frame.type !== 'chunk') return;
+    const position = this.attemptPositions.get(attemptId);
+    if (position === undefined) return;
+    const chunk = frame.chunk;
+    if (chunk?.type !== 'block-end' || chunk.block?.type !== 'reasoning'
+      || typeof chunk.block.text !== 'string' || chunk.block.text.length < this.minimumChars
+      || !Number.isSafeInteger(chunk.index)) return;
+    this.ensureTask(position.sessionId, position.turn, position.step, chunk.index, chunk.block.text);
   }
 
   async collectForTurn(session: any, turn: number, surfaceSeqs: readonly number[]): Promise<ThoughtHint[]> {
     const sessionId = String(session.id);
     const requested: Array<{ assistantSeq: number; blockIndex: number; chars: number; task: HintTask }> = [];
     for (const seq of surfaceSeqs) {
-      const event = session.events[seq];
+      const event = session.snapshotEvents()[seq];
       if (event?.type !== 'assistant/message' || event.data?.turn !== turn) continue;
       const step = event.data?.step;
       if (!Number.isSafeInteger(step)) continue;
@@ -149,8 +170,21 @@ export class ThoughtHintsController {
 
   private reasoningBlockEnds(session: any, messageEvent: any, turn: number, step: number): Array<{ index: number; text: string }> {
     const result: Array<{ index: number; text: string }> = [];
+    const stream = messageEvent.data?.stream;
+    if (Array.isArray(stream)) {
+      // 0.1.5 embeds the exact timed stream on the assistant message; reasoning
+      // records carry the real block index and the joined text.
+      for (const record of stream) {
+        if (record?.type !== 'reasoning-chunks' || !Number.isSafeInteger(record.index)
+          || !Array.isArray(record.texts)) continue;
+        const text = record.texts.filter((part: unknown) => typeof part === 'string').join('');
+        if (text !== '') result.push({ index: record.index, text });
+      }
+      return result;
+    }
+    // Legacy durable form (pre-0.1.5) cited block-end chunks by source event seq.
     for (const seq of messageEvent.sourceEventSeqs ?? []) {
-      const source = session.events[seq];
+      const source = session.snapshotEvents()[seq];
       const chunk = source?.data?.chunk;
       if (source?.type !== 'assistant/chunk' || source.data?.turn !== turn || source.data?.step !== step
         || chunk?.type !== 'block-end' || chunk.block?.type !== 'reasoning'

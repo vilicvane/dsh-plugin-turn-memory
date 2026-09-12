@@ -34,6 +34,7 @@ describe('turn recovery event scans', () => {
 
   it('deduplicates completed turns by their latest end and preserves event order', () => {
     const session = {
+      snapshotEvents(): readonly any[] { return this.events; }, eventAt(seq: number): any { return this.events[seq]; },
       events: [
         undefined,
         { seq: 1, type: 'turn/end', data: { turn: 2 } },
@@ -51,6 +52,7 @@ describe('turn recovery event scans', () => {
   it('recognizes durable turn-memory landings outside the current surface', () => {
     const session = {
       surface: { nodes: [4] },
+      snapshotEvents(): readonly any[] { return this.events; }, eventAt(seq: number): any { return this.events[seq]; },
       events: [
         undefined,
         { seq: 1, type: 'turn/end', data: { turn: 1 } },
@@ -73,6 +75,7 @@ describe('turn recovery event scans', () => {
 
   it('recovers only explicitly pending turns instead of backfilling pre-plugin history', () => {
     const session = {
+      snapshotEvents(): readonly any[] { return this.events; }, eventAt(seq: number): any { return this.events[seq]; },
       events: [
         undefined,
         { seq: 1, type: 'turn/end', data: { turn: 1 } },
@@ -84,13 +87,14 @@ describe('turn recovery event scans', () => {
     };
 
     assert.deepEqual([...pendingTurnNumbers(session)], [2]);
-    assert.equal(pendingTurnNumbers({ events: session.events.slice(0, 2) }).size, 0,
+    assert.equal(pendingTurnNumbers({ snapshotEvents: () => session.events.slice(0, 2) }).size, 0,
       'an old completed turn with no plugin marker is outside the recovery boundary');
   });
 
   it('detects legacy reasoning no-ops and includes their late marker in the rewrite range', () => {
     const session = {
       surface: { nodes: [5, 3, 6] },
+      snapshotEvents(): readonly any[] { return this.events; }, eventAt(seq: number): any { return this.events[seq]; },
       events: [
         undefined,
         { seq: 1, type: 'turn/start', data: { turn: 1 } },
@@ -133,20 +137,21 @@ describe('turn recovery event scans', () => {
         source: { kind: 'model', provider: 'test', model: 'test' },
         content: [{ type: 'text', text: '无需再压缩。' }],
       },
-    }, { surfaceOp: 'append', sourceEventSeqs: [] });
+      stream: [],
+    }, { surfaceOp: 'append' });
     const marker = { kind: 'plugin', plugin: 'turn-memory', phase: 'compression', turn: 1, mutations: 0 };
 
     const landed = appendTurnMarkerCopy(session, user, marker);
 
     assert.deepEqual(session.surface.nodes, [landed.seq, assistant.seq]);
-    assert.deepEqual(foldSurface(session.events).nodes, [landed.seq, assistant.seq]);
+    assert.deepEqual(foldSurface(session.snapshotEvents()).nodes, [landed.seq, assistant.seq]);
     assert.deepEqual(session.deriveMessages().map((message) => message.content[0]), [
       { type: 'text', text: '已经很短' },
       { type: 'text', text: '无需再压缩。' },
     ]);
     assert.deepEqual([...compressedTurnNumbers(session)], [1]);
 
-    const cold = Session.create('turn-recovery-noop-cold' as any, session.events);
+    const cold = Session.create('turn-recovery-noop-cold' as any, session.snapshotEvents());
     assert.deepEqual(cold.surface.nodes, [landed.seq, assistant.seq]);
     assert.deepEqual(cold.deriveMessages().map((message) => message.content[0]), session.deriveMessages().map((message) => message.content[0]));
     assert.deepEqual([...compressedTurnNumbers(cold)], [1]);

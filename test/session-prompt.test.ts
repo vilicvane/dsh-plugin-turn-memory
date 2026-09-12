@@ -12,7 +12,7 @@ function fixture(): { session: any; editor: SessionMemoryEditor; segments: Retur
     { type: 'assistant/message', seq: 2, data: { turn: 1, message: { content: [{ type: 'text', text: 'failed route taught epsilon' }] } } },
     { type: 'turn/end', seq: 3, data: { turn: 1 } },
   ];
-  const session = { events };
+  const session = { events, snapshotEvents: () => events, eventAt: (seq: number) => events[seq] };
   const segments = buildSessionSegments(session, [{ seq: 1, tokens: 3 }, { seq: 2, tokens: 4 }], 100);
   return { session, editor: new SessionMemoryEditor(1), segments };
 }

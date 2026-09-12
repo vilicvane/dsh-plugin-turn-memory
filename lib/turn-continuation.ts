@@ -27,8 +27,8 @@ function isRootAgent(agent: any): boolean {
 }
 
 export function openTurnNumber(session: any): number | null {
-  for (let index = session.events.length - 1; index >= 0; index -= 1) {
-    const event = session.events[index];
+  for (let index = session.snapshotEvents().length - 1; index >= 0; index -= 1) {
+    const event = session.snapshotEvents()[index];
     if (event?.type === 'turn/end') return null;
     if (event?.type === 'turn/start') {
       return Number.isSafeInteger(event.data?.turn) ? event.data.turn : null;
@@ -38,7 +38,7 @@ export function openTurnNumber(session: any): number | null {
 }
 
 function turnStartSeq(session: any, turn: number): number | undefined {
-  return session.events.findLast((event: any) =>
+  return session.snapshotEvents().findLast((event: any) =>
     event?.type === 'turn/start' && event.data?.turn === turn)?.seq;
 }
 
@@ -55,7 +55,7 @@ export function countOpenTurnNodes(session: any, turn: number): number {
   let nodes = 0;
   for (const seq of session.surface.nodes as number[]) {
     if (seq <= start) continue;
-    const event = session.events[seq];
+    const event = session.snapshotEvents()[seq];
     if (event?.surfaceOp !== 'append' || isRuntimeContextSnapshot(event)) continue;
     if (deriveEventMessage(event) !== null) nodes += 1;
   }
@@ -89,7 +89,7 @@ export function latestAnnouncedMilestone(session: any, turn: number): number {
   const start = turnStartSeq(session, turn);
   if (start === undefined) return 0;
   let latest = 0;
-  for (const event of session.events as any[]) {
+  for (const event of session.snapshotEvents() as any[]) {
     if (event?.seq <= start
       || event?.type !== 'user/message'
       || event.data?.source?.kind !== 'plugin'
@@ -107,10 +107,10 @@ export function latestAnnouncedMilestone(session: any, turn: number): number {
 export function continuationRequestForTurn(session: any, turn: number): TurnContinuationRequest | undefined {
   const start = turnStartSeq(session, turn);
   if (start === undefined) return undefined;
-  const end = session.events.findLast((event: any) =>
+  const end = session.snapshotEvents().findLast((event: any) =>
     event?.type === 'turn/end' && event.data?.turn === turn)?.seq ?? Number.POSITIVE_INFINITY;
   const successful = new Set<string>();
-  for (const event of session.events as any[]) {
+  for (const event of session.snapshotEvents() as any[]) {
     const block = event?.data?.message?.content?.[0];
     if (event?.type === 'tool/result'
       && event.data?.turn === turn
@@ -119,8 +119,8 @@ export function continuationRequestForTurn(session: any, turn: number): TurnCont
       && block?.type === 'tool-result'
       && block.isError !== true) successful.add(event.data.message.source.callId);
   }
-  for (let index = session.events.length - 1; index >= 0; index -= 1) {
-    const event = session.events[index];
+  for (let index = session.snapshotEvents().length - 1; index >= 0; index -= 1) {
+    const event = session.snapshotEvents()[index];
     if (event?.seq <= start || event?.seq >= end) continue;
     if (event.type === 'tool/code-dispatch'
       && event.data?.name === TURN_CONTINUATION_TOOL_NAME
@@ -160,7 +160,7 @@ function isContinuationMessage(message: any, requestId: string): boolean {
 
 /** Inbox insertion and claimed user/message both prove that a request was already delivered. */
 export function continuationWasDelivered(session: any, requestId: string): boolean {
-  for (const event of session.events as any[]) {
+  for (const event of session.snapshotEvents() as any[]) {
     if (event?.type === 'user/message' && isContinuationMessage(event.data, requestId)) return true;
     if (event?.type === 'agent/inbox/spliced'
       && Array.isArray(event.data?.inserted)

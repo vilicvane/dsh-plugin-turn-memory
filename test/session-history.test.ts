@@ -46,7 +46,7 @@ function fixture(): any {
       },
     },
   ];
-  return { id: 'session-fixture', header: {}, events, surface: { nodes: [2, 6] } };
+  return { id: 'session-fixture', header: {}, events, snapshotEvents: () => events, eventAt: (seq: number) => events[seq], surface: { nodes: [2, 6] } };
 }
 
 describe('append-only session history fallback', () => {

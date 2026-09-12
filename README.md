@@ -1,5 +1,8 @@
 # dsh-plugin-turn-memory
 
+Targets DSH `0.1.5-rc.2`, using `Session.snapshotEvents()` for history reads
+and validated `SessionSeq` values for compaction ranges.
+
 The active implementation is being rebuilt from the researched agreements in
 [`design.md`](./design.md). The previous implementation is retained under
 `obsolete/` for investigation only.

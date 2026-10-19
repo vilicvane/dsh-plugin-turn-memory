@@ -7,22 +7,20 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 
 import { MemoryCoordinator } from './lib/coordinator.ts';
 import { assistantCompressionSeed, contentText } from './lib/content.ts';
-import { TurnNodeEditor, replacementEventSourceSeqs } from './lib/editor.ts';
-import { appendReplacing } from './lib/surface-op.ts';
-import {
-  DRAFT_SENTINEL,
-  E2E_FINAL_SENTINEL,
-  E2E_TOOL_SENTINEL,
-  E2E_USER_SENTINEL,
-  buildCompressionPrompt,
-} from './lib/prompt.ts';
+import { TurnNodeEditor } from './lib/editor.ts';
+import { buildCompressionPrompt } from './lib/prompt.ts';
 import {
   eventToolCallIds,
   eventToolResultCallId,
-  validateProjectedToolProtocol,
   withProjectedToolProtocolWarning,
 } from './lib/tool-protocol.ts';
 import { SessionMemoryCompactionEngine } from './lib/session-compaction.ts';
+import { startWorker } from './lib/subagent-activation.ts';
+import { land, validateLanding } from './lib/landing.ts';
+import {
+  isTurnMemorySource,
+  pendingTurnSource,
+} from './lib/message-source.ts';
 import {
   appendTurnMarkerCopy,
   completedTurnEnds,
@@ -34,10 +32,7 @@ import {
   turnSurfaceSeqs,
 } from './lib/turn-recovery.ts';
 import { WorkerToolScope } from './lib/worker-tools.ts';
-import {
-  assertMemoryImagesRetained,
-  createReadMemoryImageTool,
-} from './lib/memory-images.ts';
+import { createReadMemoryImageTool } from './lib/memory-images.ts';
 import { TurnContinuationController } from './lib/turn-continuation.ts';
 import { ThoughtHintsController } from './lib/thought-hints.ts';
 import { isUserConversationSession } from './lib/session-kind.ts';
@@ -46,7 +41,7 @@ import type { SessionCompactionConfig } from './lib/session-compaction.ts';
 import type { SessionHistoryConfig } from './lib/session-history.ts';
 import type { TurnContinuationConfig } from './lib/turn-continuation.ts';
 import type { ThoughtHint, ThoughtHintsConfig } from './lib/thought-hints.ts';
-import type { NodeRange, TurnNodeOutput, TurnNodeSeed, TurnNodeSnapshot } from './lib/editor.ts';
+import type { NodeRange, TurnNodeOutput, TurnNodeSeed } from './lib/editor.ts';
 
 const name = 'turn-memory';
 const inject = ['agents', 'llm', 'sessionQuery', 'sessions', 'subagents', 'systemPrompt', 'tokenMeter', 'tools'];
@@ -93,7 +88,7 @@ interface CompressionJob {
 }
 
 function seedOf(event: any): TurnNodeSeed | undefined {
-  const markerSources = event?.data?.source?.plugin === 'turn-memory'
+  const markerSources = isTurnMemorySource(event?.data?.source)
     && event?.surfaceOp?.op === 'replace'
     && Array.isArray(event.sourceEventSeqs)
     && event.sourceEventSeqs.length > 0
@@ -165,211 +160,6 @@ function prepareJob(agent: any, event: any): CompressionJob | undefined {
     workerNumber: 0,
     thoughtHints: [],
   };
-}
-
-function validateLanding(job: CompressionJob, e2eSmoke: boolean): void {
-  job.editor.validateFinal();
-  const nodes = job.editor.snapshot();
-  if (nodes[0].kind !== 'user' || nodes[nodes.length - 1].kind !== 'assistant') {
-    throw new Error('compressed turn must start with a user node and end with an assistant node');
-  }
-  if (e2eSmoke) {
-    if (job.mutationCount < 2) throw new Error('e2e smoke requires at least two successful replacements');
-    if (nodes.length !== 2 || nodes[0].kind !== 'user' || nodes[1].kind !== 'assistant') {
-      throw new Error('e2e smoke requires one final user-assistant exchange');
-    }
-    if (!nodes[0].content.includes(E2E_USER_SENTINEL)) throw new Error('e2e smoke user node must preserve its exact sentinel');
-    if (!nodes[1].content.includes(E2E_TOOL_SENTINEL) || !nodes[1].content.includes(E2E_FINAL_SENTINEL)) {
-      throw new Error('e2e smoke assistant node must preserve both exact sentinels');
-    }
-    if (nodes.some((node) => node.content.includes(DRAFT_SENTINEL))) {
-      throw new Error('e2e smoke draft sentinel still exists; refine the generated nodes before finishing');
-    }
-  }
-  const events = job.session.snapshotEvents();
-  assertMemoryImagesRetained(
-    job.targetSeqs.map((seq) => events[seq]?.data),
-    nodes.map((node) => node.content).join('\n'),
-    'turn compression',
-  );
-  validateProjectedToolProtocol(nodes, events);
-  const modelSource = job.targetSeqs.map((seq) => events[seq])
-    .find((event) => event?.type === 'assistant/message' && event.data?.message?.source?.kind === 'model')
-    ?.data?.message?.source;
-  for (const node of nodes) {
-    if (node.kind === 'assistant' && modelSource === undefined) throw new Error('assistant output has no original model source to inherit');
-    if (node.kind === 'tool') {
-      if (node.landingSeqs.length !== 1 || events[node.landingSeqs[0]]?.type !== 'tool/result') {
-        throw new Error('tool output must remain a one-to-one tool/result content rewrite');
-      }
-    }
-  }
-}
-
-function land(job: CompressionJob): void {
-  const session = job.session;
-  const current = session.surface.nodes;
-  const firstIndex = current.indexOf(job.targetSeqs[0]);
-  if (firstIndex < 0 || job.targetSeqs.some((seq, index) => current[firstIndex + index] !== seq)) {
-    throw new Error('target surface changed before landing');
-  }
-  const events = session.snapshotEvents();
-  const originalModelSource = job.targetSeqs.map((seq) => events[seq])
-    .find((event) => event?.type === 'assistant/message' && event.data?.message?.source?.kind === 'model')
-    ?.data?.message?.source;
-  let fallbackStep: number | undefined;
-  for (let index = job.targetSeqs.length - 1; index >= 0; index -= 1) {
-    const step = events[job.targetSeqs[index]]?.data?.step;
-    if (typeof step === 'number') {
-      fallbackStep = step;
-      break;
-    }
-  }
-  const marker = {
-    kind: 'plugin',
-    plugin: 'turn-memory',
-    phase: 'compression',
-    turn: job.turn,
-    draftId: job.id,
-    originalNodes: job.targetSeqs.length,
-    mutations: job.mutationCount,
-    workerAttempts: job.workerNumber,
-  };
-  const nodes = job.editor.snapshot();
-  if (nodes.every((node) => !node.changed)) {
-    appendTurnMarkerCopy(session, events[job.targetSeqs[0]], marker);
-    return;
-  }
-  const startSeq = job.targetSeqs[0];
-  const endSeq = job.targetSeqs[job.targetSeqs.length - 1];
-  const safeStepOf = (node: TurnNodeSnapshot): number => {
-    for (let index = node.sourceSeqs.length - 1; index >= 0; index -= 1) {
-      const candidate = events[node.sourceSeqs[index]]?.data?.step;
-      if (Number.isSafeInteger(candidate)) return candidate;
-    }
-    return Number.isSafeInteger(fallbackStep) ? (fallbackStep as number) : 0;
-  };
-  const onlyEditableKinds = nodes.filter((node) => node.changed)
-    .every((node) => node.kind === 'user' || node.kind === 'tool');
-  if (onlyEditableKinds) {
-    for (const node of nodes) {
-      if (!node.changed) continue;
-      const first = node.landingSeqs[0];
-      const last = node.landingSeqs[node.landingSeqs.length - 1];
-      const provenance = replacementEventSourceSeqs(node);
-      if (node.kind === 'user') {
-        appendReplacing(session, 'user/message', {
-          id: randomUUID(),
-          role: 'user',
-          content: [{ type: 'text', text: node.content }],
-          source: marker,
-        }, first, last, provenance);
-        continue;
-      }
-      const original = events[first];
-      const wrapper = original.data.message.content[0];
-      appendReplacing(session, 'tool/result', {
-        ...original.data,
-        message: {
-          ...original.data.message,
-          content: [{ ...wrapper, content: [{ type: 'text', text: node.content }] }],
-        },
-      }, first, last, provenance);
-    }
-    return;
-  }
-  const atTail = firstIndex + job.targetSeqs.length === current.length;
-  const tailLandable = atTail
-    && nodes[0].kind === 'user'
-    && nodes[nodes.length - 1].kind === 'assistant'
-    && originalModelSource !== undefined;
-  if (tailLandable) {
-    const head = nodes[0];
-    const headLanding = events[head.landingSeqs[0]];
-    appendReplacing(session, 'user/message', head.changed
-      ? {
-        id: randomUUID(),
-        role: 'user',
-        content: [{ type: 'text', text: head.content }],
-        source: marker,
-      }
-      : { ...headLanding.data, id: randomUUID(), source: marker },
-    startSeq, endSeq, [...new Set([...replacementEventSourceSeqs(head), ...job.targetSeqs])]);
-    for (const node of nodes.slice(1)) {
-      const landing = events[node.landingSeqs[0]];
-      if (!node.changed) {
-        if (node.kind === 'user') {
-          session.append('user/message', {
-            ...landing.data,
-            id: randomUUID(),
-            source: marker,
-          }, { surfaceOp: 'append' });
-          continue;
-        }
-        if (node.kind === 'assistant') {
-          session.append('assistant/message', {
-            turn: landing.data.turn,
-            step: landing.data.step,
-            message: { ...landing.data.message, id: randomUUID() },
-            source: marker,
-            stream: Array.isArray(landing.data.stream) ? [...landing.data.stream] : [],
-          }, { surfaceOp: 'append' });
-          continue;
-        }
-        session.append('tool/result', {
-          ...landing.data,
-          message: { ...landing.data.message, id: randomUUID() },
-        }, { surfaceOp: 'append' });
-        continue;
-      }
-      if (node.kind === 'user') {
-        session.append('user/message', {
-          id: randomUUID(),
-          role: 'user',
-          content: [{ type: 'text', text: node.content }],
-          source: marker,
-        }, { surfaceOp: 'append' });
-        continue;
-      }
-      if (node.kind === 'assistant') {
-        session.append('assistant/message', {
-          turn: job.turn,
-          step: safeStepOf(node),
-          message: {
-            id: randomUUID(),
-            role: 'assistant',
-            source: {
-              kind: 'model',
-              provider: originalModelSource.provider,
-              model: originalModelSource.model,
-            },
-            content: [{ type: 'text', text: node.content }],
-          },
-          source: marker,
-          stream: [],
-        }, { surfaceOp: 'append' });
-        continue;
-      }
-      const wrapper = landing.data.message.content[0];
-      session.append('tool/result', {
-        ...landing.data,
-        message: {
-          ...landing.data.message,
-          content: [{ ...wrapper, content: [{ type: 'text', text: node.content }] }],
-        },
-      }, { surfaceOp: 'append' });
-    }
-    return;
-  }
-  const checkpoint = nodes
-    .map((node) => (node.kind === 'tool' ? 'Tool result' : node.kind === 'assistant' ? 'Assistant' : 'User') + ': ' + node.content)
-    .join('\n\n');
-  appendReplacing(session, 'user/message', {
-    id: randomUUID(),
-    role: 'user',
-    content: [{ type: 'text', text: checkpoint }],
-    source: marker,
-  }, startSeq, endSeq, [...new Set([...nodes.flatMap((node) => node.sourceSeqs), ...job.targetSeqs])]);
 }
 
 function apply(ctx: any, config: PluginConfig = {}): void {
@@ -563,7 +353,8 @@ function apply(ctx: any, config: PluginConfig = {}): void {
         const workerMode = provider === 'fork' ? 'fork' : 'fresh-spawn';
         let run: any;
         try {
-          run = await ctx.subagents.start(provider, {
+          run = await startWorker(ctx.subagents, {
+            provider,
             label: 'turn-memory compression ' + job.turn + ' (' + workerMode + ' worker ' + job.workerNumber + ')',
             prompt: [{
               type: 'text',
@@ -756,12 +547,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
           if (user === undefined) {
             ctx.logger.warn('turn-memory: turn ' + String(turn) + ' has no user node for a durable pending marker; live processing remains available but cold recovery is not guaranteed');
           } else {
-            appendTurnMarkerCopy(session, user, {
-              kind: 'plugin',
-              plugin: 'turn-memory',
-              phase: 'pending',
-              turn,
-            });
+            appendTurnMarkerCopy(session, user, pendingTurnSource(turn));
             void ctx.sessions.flush(session).catch((error: unknown) => {
               ctx.logger.warn('turn-memory: pending marker flush failed for turn ' + String(turn) + ': '
                 + (error instanceof Error ? error.message : String(error)));

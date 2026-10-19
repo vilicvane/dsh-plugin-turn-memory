@@ -146,4 +146,13 @@ describe('buildCompressionPrompt', () => {
     assert.throws(() => renderPromptTemplate('{{#if missing}}x{{\/if}}', {}), /unknown prompt-template condition/);
     assert.throws(() => renderPromptTemplate('{{#if enabled}}x', { enabled: true }), /unsupported or unresolved/);
   });
+
+  it('inserts substituted values as literals, never as template syntax', () => {
+    const template = 'before {{value}}\n{{#if enabled}}inside {{value}}{{/if}}\nafter';
+    const literal = 'source says strict `{{...}}` interpolation is rejected';
+    assert.equal(renderPromptTemplate(template, { value: literal, enabled: true }),
+      'before ' + literal + '\ninside ' + literal + '\nafter');
+    assert.equal(renderPromptTemplate(template, { value: '{{#if nested}}', enabled: false }),
+      'before {{#if nested}}\nafter');
+  });
 });

@@ -2,12 +2,12 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { deriveEventMessage } from '@deepseek-ai/dsh-session';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
+import { continuationRequestOf, continuationTurnSource, isRuntimeContextSource } from './message-source.ts';
 import { measureSessionForCompaction } from './session-compaction.ts';
 import { isUserConversationSession } from './session-kind.ts';
 
 export const TURN_CONTINUATION_TOOL_NAME = 'continue_after_turn_compression';
 
-const SYSTEM_PROMPT_PLUGIN = '@deepseek-ai/dsh-system-prompt';
 const CONTINUATION_CONTEXT_NAME = 'turn-memory:long-turn-continuation';
 
 export interface TurnContinuationConfig {
@@ -43,9 +43,7 @@ function turnStartSeq(session: any, turn: number): number | undefined {
 }
 
 function isRuntimeContextSnapshot(event: any): boolean {
-  return event?.type === 'user/message'
-    && event.data?.source?.kind === 'plugin'
-    && event.data.source.plugin === SYSTEM_PROMPT_PLUGIN;
+  return event?.type === 'user/message' && isRuntimeContextSource(event.data?.source);
 }
 
 /** Count append-origin model-visible nodes in the open turn, excluding replaceable runtime snapshots. */
@@ -92,8 +90,7 @@ export function latestAnnouncedMilestone(session: any, turn: number): number {
   for (const event of session.snapshotEvents() as any[]) {
     if (event?.seq <= start
       || event?.type !== 'user/message'
-      || event.data?.source?.kind !== 'plugin'
-      || event.data.source.plugin !== SYSTEM_PROMPT_PLUGIN
+      || !isRuntimeContextSource(event.data?.source)
       || !Array.isArray(event.data.source.sections)) continue;
     for (const section of event.data.source.sections) {
       if (section?.name !== CONTINUATION_CONTEXT_NAME || typeof section.text !== 'string') continue;
@@ -109,20 +106,22 @@ export function continuationRequestForTurn(session: any, turn: number): TurnCont
   if (start === undefined) return undefined;
   const end = session.snapshotEvents().findLast((event: any) =>
     event?.type === 'turn/end' && event.data?.turn === turn)?.seq ?? Number.POSITIVE_INFINITY;
+  // 0.2 carries the outcome on the tool-role message itself: `ContentBlockMap` has no
+  // `tool-result` block, so only `message.isError` marks a failed invocation.
   const successful = new Set<string>();
   for (const event of session.snapshotEvents() as any[]) {
-    const block = event?.data?.message?.content?.[0];
+    const message = event?.data?.message;
     if (event?.type === 'tool/result'
       && event.data?.turn === turn
-      && event.data?.message?.source?.kind === 'tool'
-      && typeof event.data.message.source.callId === 'string'
-      && block?.type === 'tool-result'
-      && block.isError !== true) successful.add(event.data.message.source.callId);
+      && message?.role === 'tool'
+      && message?.source?.kind === 'tool'
+      && typeof message.source.callId === 'string'
+      && message.isError !== true) successful.add(message.source.callId);
   }
   for (let index = session.snapshotEvents().length - 1; index >= 0; index -= 1) {
     const event = session.snapshotEvents()[index];
     if (event?.seq <= start || event?.seq >= end) continue;
-    if (event.type === 'tool/code-dispatch'
+    if (event.type === 'tool/ptc-dispatch'
       && event.data?.name === TURN_CONTINUATION_TOOL_NAME
       && event.data?.isError === false
       && typeof event.data?.subCallId === 'string') {
@@ -151,11 +150,7 @@ function requestFromArguments(requestId: string, turn: number, args: any): TurnC
 }
 
 function isContinuationMessage(message: any, requestId: string): boolean {
-  const source = message?.source;
-  return source?.kind === 'plugin'
-    && source.plugin === 'turn-memory'
-    && source.phase === 'continuation'
-    && source.requestId === requestId;
+  return continuationRequestOf(message?.source) === requestId;
 }
 
 /** Inbox insertion and claimed user/message both prove that a request was already delivered. */
@@ -167,6 +162,14 @@ export function continuationWasDelivered(session: any, requestId: string): boole
       && event.data.inserted.some((message: any) => isContinuationMessage(message, requestId))) return true;
   }
   return false;
+}
+
+/** A later turn already started, so this handoff can no longer be the next turn. */
+export function supersededByLaterTurn(session: any, turn: number): boolean {
+  return (session?.snapshotEvents() ?? []).some((event: any) =>
+    event?.type === 'turn/start'
+    && Number.isSafeInteger(event.data?.turn)
+    && event.data.turn > turn);
 }
 
 export function buildTurnContinuationContext(options: {
@@ -194,7 +197,7 @@ export function buildTurnContinuationContext(options: {
   ].join('\n');
 }
 
-export function buildTurnContinuationMessage(request: TurnContinuationRequest): any {
+export function buildTurnContinuationMessage(request: TurnContinuationRequest): ReturnType<typeof createUserMessage> {
   return createUserMessage({
     content: [{
       type: 'text',
@@ -205,15 +208,7 @@ export function buildTurnContinuationMessage(request: TurnContinuationRequest): 
         request.handoff,
       ].join('\n'),
     }],
-    source: {
-      kind: 'plugin',
-      plugin: 'turn-memory',
-      form: 'notice',
-      summary: 'Continue work after compressing turn ' + request.turn,
-      phase: 'continuation',
-      requestId: request.requestId,
-      fromTurn: request.turn,
-    },
+    source: continuationTurnSource(request.turn, request.requestId),
   });
 }
 
@@ -310,12 +305,22 @@ export class TurnContinuationController {
 
   needsDispatchAfterCompression(session: any, turn: number): boolean {
     const request = continuationRequestForTurn(session, turn);
-    return request !== undefined && !continuationWasDelivered(session, request.requestId);
+    return request !== undefined
+      && !continuationWasDelivered(session, request.requestId)
+      && !supersededByLaterTurn(session, turn);
   }
 
   async dispatchAfterCompression(agent: any, turn: number): Promise<boolean> {
     const request = continuationRequestForTurn(agent.session, turn);
     if (request === undefined || continuationWasDelivered(agent.session, request.requestId)) return false;
+    // Compression of an older turn may land after the session has already moved on —
+    // notably after a restart backfills turns that were never compressed. Dispatching
+    // that handoff then would start a stale turn and push every later handoff one turn
+    // further behind, so the newest turn owns the continuation instead.
+    if (supersededByLaterTurn(agent.session, turn)) {
+      this.ctx.logger.info('turn-memory: continuation for turn ' + turn + ' is superseded by a later turn; skipped');
+      return false;
+    }
     agent.followup(buildTurnContinuationMessage(request));
     try {
       await this.ctx.sessions.flush(agent.session);

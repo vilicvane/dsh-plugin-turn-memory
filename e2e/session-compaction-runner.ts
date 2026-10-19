@@ -6,6 +6,8 @@ import { resolve } from 'node:path';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { foldSurface } from '@deepseek-ai/dsh-session';
 
+import { compressionTurnSource } from '../lib/message-source.ts';
+
 const name = 'turn-memory-session-compaction-e2e-runner';
 const inject = ['agentDefaultModel', 'agentPresets', 'agents', 'compaction', 'sessionQuery', 'sessions', 'tokenMeter'];
 
@@ -43,15 +45,13 @@ function appendPostTurnAssistantReplacement(session: any): number {
     step: original.data.step,
     message: { ...original.data.message, id: randomUUID() },
     stream: Array.isArray(original.data.stream) ? [...original.data.stream] : [],
-    source: {
-      kind: 'plugin',
-      plugin: 'turn-memory',
-      phase: 'compression',
+    source: compressionTurnSource({
       turn: original.data.turn,
       draftId: randomUUID(),
       originalNodes: 1,
       mutations: 1,
-    },
+      workerAttempts: 0,
+    }),
   }, { surfaceOp: 'append' });
   return replacement.seq;
 }

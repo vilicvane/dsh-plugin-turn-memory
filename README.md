@@ -1,6 +1,6 @@
 # dsh-plugin-turn-memory
 
-Targets DSH `0.1.5-rc.2`, using `Session.snapshotEvents()` for history reads
+Targets DSH `0.2.1-rc.2`, using `Session.snapshotEvents()` for history reads
 and validated `SessionSeq` values for compaction ranges.
 
 The active implementation is being rebuilt from the researched agreements in
@@ -9,7 +9,7 @@ The active implementation is being rebuilt from the researched agreements in
 
 The plugin now has two coordinated layers:
 
-- completed-turn compression uses a parent `fork` and lands an N→M transcript rewrite;
+- completed-turn compression uses a parent `fork` and lands an N→M transcript rewrite; landing happens after `turn/end`, and the 0.2.1 V4 relational invariant only admits `user/message` there, so a rewritten user node lands as a 1:1 replacement while any changed assistant/tool node degrades to a single joined user checkpoint (see D-019 in `design.md`);
 - optional long-thought preprocessing starts asynchronous small-model recall hints as soon as each complete long reasoning block arrives, then gives successful hints to the normal main-model turn worker without replacing its raw parent context;
 - long root turns receive a model-visible handoff reminder and can continue in a fresh turn after their completed-turn compression lands;
 - optional root-session compaction provides `ctx.compaction`, processes a selected completed-history range through sequential main-model workers, and commits one standard durable checkpoint only after the host-owned working draft is complete.
@@ -173,7 +173,7 @@ Run the dedicated session-compaction E2E after changing pressure selection, segm
 pnpm e2e:session
 ```
 
-It disables the stock backend in the test overlay, creates three completed turns, injects the same post-turn assistant replacement produced by turn-memory, and first proves that upstream token-meter rejects that lifecycle shape. It then forces the first two turns into separate segments and calls the custom engine manually through its canonical-surface pricing fallback. With a one-failure budget, the first segment's fork is deliberately stopped after an accepted mutation; the test requires a fresh-spawn continuation to finish it, then requires the next segment to begin with a fork. Finally it verifies standard event adjacency, checkpoint provenance, the untouched retained tail, persistence, and a cold resume of the exact session.
+It disables the stock backend in the test overlay, creates three completed turns, injects a legacy-compat post-turn assistant replacement (the shape older turn-memory versions wrote, and which current production landing no longer emits because the V4 relational invariant rejects it), and first proves that upstream token-meter rejects that lifecycle shape. It then forces the first two turns into separate segments and calls the custom engine manually through its canonical-surface pricing fallback. With a one-failure budget, the first segment's fork is deliberately stopped after an accepted mutation; the test requires a fresh-spawn continuation to finish it, then requires the next segment to begin with a fork. Finally it verifies standard event adjacency, checkpoint provenance, the untouched retained tail, persistence, and a cold resume of the exact session.
 
 When production prompt behavior changes, also run the qualitative steer
 regression:

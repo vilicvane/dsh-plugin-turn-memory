@@ -47,16 +47,15 @@ export class WorkerToolScope {
   }
 
   /**
-   * Options that must travel together on every worker start. The child-local
-   * persona shadows an inherited preset persona before this scope installs its
-   * own complete section, preventing two effective complete sections.
+   * Agent options that must travel together on every worker activation. DSH 0.2
+   * dropped the one-shot start request and its per-child `persona`; the scope
+   * installs its own complete system-prompt section during `agent/created`,
+   * which replaces any inherited persona.
    */
   startOptions(): {
-    persona: string;
     agentOptions: { turnMemoryWorkerToolScope: string };
   } {
     return {
-      persona: WORKER_SYSTEM_PROMPT,
       agentOptions: this.agentOptions(),
     };
   }

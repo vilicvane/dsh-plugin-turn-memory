@@ -166,14 +166,11 @@ describe('turn continuation lifecycle', () => {
       step: 1,
       message: {
         id: 'result-continuation-1',
-        role: 'user',
+        role: 'tool',
         source: { kind: 'tool', callId: 'call-continuation-1' },
-        content: [{
-          type: 'tool-result',
-          toolCallId: 'call-continuation-1',
-          content: [{ type: 'text', text: result }],
-          isError: false,
-        }],
+        toolCallId: 'call-continuation-1',
+        content: [{ type: 'text', text: result }],
+        isError: false,
       },
     });
     const request = continuationRequestForTurn(session, 1);
@@ -218,6 +215,49 @@ describe('turn continuation lifecycle', () => {
     }), /root conversation/);
   });
 
+  test('does not dispatch a handoff superseded by a later turn', async () => {
+    const tools = new Map<string, any>();
+    let flushes = 0;
+    const ctx = {
+      tokenMeter: meter,
+      tools: { register: (tool: any) => tools.set(tool.name, tool) },
+      systemPrompt: { context() {} },
+      sessions: { flush: async () => { flushes += 1; } },
+      logger: { info() {}, warn() {} },
+    };
+    const controller = new TurnContinuationController(ctx, { reminderIntervalNodes: 1 });
+    const session = fixtureSession();
+    session.append('turn/start', { turn: 1 });
+    session.append('user/message', message('work'), 'append');
+    session.append('tool/call', {
+      turn: 1,
+      step: 1,
+      callId: 'call-superseded',
+      name: TURN_CONTINUATION_TOOL_NAME,
+      arguments: JSON.stringify({ handoff: 'Continue the older turn.' }),
+    });
+    session.append('tool/result', {
+      turn: 1,
+      step: 1,
+      message: {
+        id: 'result-superseded',
+        role: 'tool',
+        source: { kind: 'tool', callId: 'call-superseded' },
+        toolCallId: 'call-superseded',
+        content: [{ type: 'text', text: 'Continuation queued.' }],
+        isError: false,
+      },
+    });
+    session.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+    assert.equal(controller.needsDispatchAfterCompression(session, 1), true);
+    session.append('turn/start', { turn: 2 });
+    assert.equal(controller.needsDispatchAfterCompression(session, 1), false);
+    const delivered: any[] = [];
+    assert.equal(await controller.dispatchAfterCompression({ session, followup: (value: any) => delivered.push(value) }, 1), false);
+    assert.equal(delivered.length, 0);
+    assert.equal(flushes, 0);
+  });
+
   test('accepts and recovers detailed handoffs without an arbitrary length cap', async () => {
     const tools = new Map<string, any>();
     const ctx = {
@@ -255,14 +295,11 @@ describe('turn continuation lifecycle', () => {
       step: 1,
       message: {
         id: 'result-long-handoff',
-        role: 'user',
+        role: 'tool',
         source: { kind: 'tool', callId: 'call-long-handoff' },
-        content: [{
-          type: 'tool-result',
-          toolCallId: 'call-long-handoff',
-          content: [{ type: 'text', text: result }],
-          isError: false,
-        }],
+        toolCallId: 'call-long-handoff',
+        content: [{ type: 'text', text: result }],
+        isError: false,
       },
     });
     session.append('turn/end', { turn: 4, reason: { kind: 'completed' } });
@@ -270,20 +307,20 @@ describe('turn continuation lifecycle', () => {
     assert.equal(continuationRequestForTurn(session, 4)?.handoff, handoff.trim());
   });
 
-  test('recovers a successful Code Mode sub-dispatch as the same durable request', () => {
+  test('recovers a successful ptc-mode sub-dispatch as the same durable request', () => {
     const session = fixtureSession();
     session.append('turn/start', { turn: 3 });
-    session.append('tool/code-dispatch-start', {
+    session.append('tool/ptc-dispatch-start', {
       rootCallId: 'run-code-1',
       parentCallId: 'run-code-1',
-      subCallId: 'run-code-1:code:0',
+      subCallId: 'run-code-1:ptc:0',
       name: TURN_CONTINUATION_TOOL_NAME,
       arguments: { handoff: 'Resume the code-mode verification.' },
     });
-    session.append('tool/code-dispatch', {
+    session.append('tool/ptc-dispatch', {
       rootCallId: 'run-code-1',
       parentCallId: 'run-code-1',
-      subCallId: 'run-code-1:code:0',
+      subCallId: 'run-code-1:ptc:0',
       name: TURN_CONTINUATION_TOOL_NAME,
       arguments: { handoff: 'Resume the code-mode verification.' },
       isError: false,
@@ -293,9 +330,37 @@ describe('turn continuation lifecycle', () => {
 
     assert.deepEqual(continuationRequestForTurn(session, 3), {
       version: 1,
-      requestId: 'run-code-1:code:0',
+      requestId: 'run-code-1:ptc:0',
       turn: 3,
       handoff: 'Resume the code-mode verification.',
     });
+  });
+
+  test('ignores a failed tool result when recovering the durable request', () => {
+    const session = fixtureSession();
+    session.append('turn/start', { turn: 5 });
+    session.append('tool/call', {
+      turn: 5,
+      step: 1,
+      callId: 'call-failed-continuation',
+      name: TURN_CONTINUATION_TOOL_NAME,
+      arguments: JSON.stringify({ handoff: 'This must never be recovered.' }),
+    });
+    session.append('tool/result', {
+      turn: 5,
+      step: 1,
+      message: {
+        id: 'result-failed-continuation',
+        role: 'tool',
+        source: { kind: 'tool', callId: 'call-failed-continuation' },
+        toolCallId: 'call-failed-continuation',
+        content: [{ type: 'text', text: 'rejected' }],
+        isError: true,
+      },
+    });
+    session.append('turn/end', { turn: 5, reason: { kind: 'completed' } });
+
+    assert.equal(continuationRequestForTurn(session, 5), undefined,
+      'message-level isError must veto the request, not a legacy content block');
   });
 });

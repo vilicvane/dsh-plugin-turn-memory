@@ -40,13 +40,19 @@ export function renderPromptTemplate(template: string, values: Readonly<Record<s
     if (!Object.hasOwn(values, name)) throw new Error('unknown prompt-template condition ' + JSON.stringify(name));
     return values[name] ? body + suffix : '';
   });
-  const renderedValues = renderedConditionals.replace(valuePattern, (_match, name: string) => {
+  // Substitute values through single-use placeholders so model- or tool-authored
+  // text is inserted as literal content. Transcripts legitimately contain
+  // `{{...}}` (for example source-code excerpts) and must not be re-read as
+  // template syntax.
+  const tokens: string[] = [];
+  const staged = renderedConditionals.replace(valuePattern, (_match, name: string) => {
     if (!Object.hasOwn(values, name)) throw new Error('unknown prompt-template value ' + JSON.stringify(name));
-    return String(values[name]);
+    tokens.push(String(values[name]));
+    return '\u0001' + tokens.length + '\u0001';
   });
-  const unresolved = renderedValues.match(/{{[^\n]*}}/);
+  const unresolved = staged.match(/{{[^\n]*}}/);
   if (unresolved !== null) throw new Error('unsupported or unresolved prompt-template expression ' + JSON.stringify(unresolved[0]));
-  return renderedValues.trim();
+  return staged.replace(/\u0001(\d+)\u0001/g, (_match, index: string) => tokens[Number(index) - 1]).trim();
 }
 
 /** Render the complete model-facing contract for one turn-compression fork. */

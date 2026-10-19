@@ -19,8 +19,7 @@ describe('WorkerToolScope', () => {
     const startOptions = scope.startOptions();
 
     assert.deepEqual(globalRegistrations, []);
-    assert.equal(startOptions.persona,
-      'You are an isolated turn-memory worker. Follow the complete task contract in the current user message.');
+    assert.deepEqual(Object.keys(startOptions), ['agentOptions']);
     assert.deepEqual(startOptions.agentOptions, scope.agentOptions());
 
     const observed = (options: any) => {

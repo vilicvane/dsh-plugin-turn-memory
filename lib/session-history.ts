@@ -1,6 +1,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
 import { contentText, eventMemoryKind, reasoningStats } from './content.ts';
+import { turnMemoryMarkerOf, pluginSourceName } from './message-source.ts';
 import { collectMemoryImageAttachments, renderMemoryImageReference } from './memory-images.ts';
 
 export const READ_SESSION_HISTORY_TOOL_NAME = 'read_session_history';
@@ -74,7 +75,8 @@ function eventOrigin(event: any): string {
   const source = event?.data?.source ?? event?.data?.message?.source;
   if (source?.kind === 'user') return 'human';
   if (source?.kind === 'model') return 'model:' + String(source.provider ?? '?') + '/' + String(source.model ?? '?');
-  if (source?.kind === 'plugin') return 'plugin:' + String(source.plugin ?? '?');
+  const plugin = pluginSourceName(source);
+  if (plugin !== undefined) return 'plugin:' + plugin;
   if (event?.type === 'tool/result') return 'tool';
   return source?.kind === undefined ? 'unknown' : String(source.kind);
 }
@@ -123,10 +125,8 @@ export function renderRawSessionContent(value: unknown): string {
 function compressedTurnNumbers(session: any): Set<number> {
   const turns = new Set<number>();
   for (const event of session.snapshotEvents() as readonly any[]) {
-    const source = event?.data?.source;
-    if (source?.plugin === 'turn-memory' && source.phase === 'compression' && Number.isSafeInteger(source.turn)) {
-      turns.add(source.turn);
-    }
+    const marker = turnMemoryMarkerOf(event?.data?.source);
+    if (marker?.phase === 'compression') turns.add(marker.turn);
   }
   return turns;
 }

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { reasoningBlockTexts } from './content.ts';
+import { isCompactionCheckpointSource, turnMemoryMarkerOf, turnMemoryMarkerTurn } from './message-source.ts';
 import { appendReplacing } from './surface-op.ts';
 
 /** Return the latest durable turn/end for each completed turn, oldest first. */
@@ -22,9 +23,8 @@ export function completedTurnEnds(session: any): any[] {
 export function compressedTurnNumbers(session: any): Set<number> {
   const turns = new Set<number>();
   for (const event of session?.snapshotEvents() ?? []) {
-    const source = event?.data?.source;
-    if (source?.plugin !== 'turn-memory' || source.phase !== 'compression') continue;
-    if (Number.isSafeInteger(source.turn)) turns.add(source.turn);
+    const marker = turnMemoryMarkerOf(event?.data?.source);
+    if (marker?.phase === 'compression') turns.add(marker.turn);
   }
   return turns;
 }
@@ -38,11 +38,9 @@ export function compressedTurnNumbers(session: any): Set<number> {
 export function pendingTurnNumbers(session: any): Set<number> {
   const latestPhase = new Map<number, 'pending' | 'compression'>();
   for (const event of session?.snapshotEvents() ?? []) {
-    const source = event?.data?.source;
-    if (source?.plugin !== 'turn-memory'
-      || (source.phase !== 'pending' && source.phase !== 'compression')
-      || !Number.isSafeInteger(source.turn)) continue;
-    latestPhase.set(source.turn, source.phase);
+    const marker = turnMemoryMarkerOf(event?.data?.source);
+    if (marker === undefined) continue;
+    latestPhase.set(marker.turn, marker.phase);
   }
   return new Set([...latestPhase].filter(([, phase]) => phase === 'pending').map(([turn]) => turn));
 }
@@ -71,14 +69,14 @@ export function turnSurfaceSeqs(session: any, turn: number, startSeq: number, en
   return (session?.surface?.nodes ?? []).filter((seq: number) => {
     if (seq <= startSeq) return false;
     const event = session.snapshotEvents()[seq];
-    const source = event?.data?.source;
-    if (source?.plugin === 'compact') return false;
-    // DSH 0.1.5 makes the durable host-owned system prompt surface-eligible. It is
+    if (isCompactionCheckpointSource(event?.data?.source)) return false;
+    // DSH keeps the durable host-owned system prompt surface-eligible. It is
     // emitted after turn/start but sits at the surface head, is not part of the turn
     // transcript, and may only be rewritten as an exact system/message replacement.
     // Leaving it in the range would fail prepareJob's message-seed check.
     if (event?.type === 'system/message') return false;
-    if (source?.plugin === 'turn-memory' && Number.isSafeInteger(source.turn)) return source.turn === turn;
+    const markerTurn = turnMemoryMarkerTurn(event?.data?.source);
+    if (markerTurn !== undefined) return markerTurn === turn;
     return seq <= endSeq;
   });
 }

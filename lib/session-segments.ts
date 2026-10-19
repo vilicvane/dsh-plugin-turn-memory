@@ -1,4 +1,5 @@
 import { eventContentText, eventMemoryKind } from './content.ts';
+import { isCompactionCheckpointSource, pluginSourceName, turnMemoryMarkerTurn } from './message-source.ts';
 
 export interface PricedNode {
   seq: number;
@@ -34,10 +35,8 @@ function eventTurns(session: any): Map<number, number> {
   let openTurn: number | undefined;
   for (const event of session.snapshotEvents() as any[]) {
     if (event?.type === 'turn/start' && Number.isSafeInteger(event.data?.turn)) openTurn = event.data.turn;
-    const isCompactionCheckpoint = event?.data?.source?.plugin === 'compact';
-    const markerTurn = event?.data?.source?.plugin === 'turn-memory' && Number.isSafeInteger(event.data.source.turn)
-      ? event.data.source.turn
-      : undefined;
+    const isCompactionCheckpoint = isCompactionCheckpointSource(event?.data?.source);
+    const markerTurn = turnMemoryMarkerTurn(event?.data?.source);
     const explicitTurn = Number.isSafeInteger(event?.data?.turn) ? event.data.turn : undefined;
     const turn = isCompactionCheckpoint ? undefined : markerTurn ?? explicitTurn ?? openTurn;
     if (turn !== undefined) turns.set(event.seq, turn);
@@ -57,7 +56,8 @@ function eventOrigin(event: any): string {
   const source = event?.data?.source ?? event?.data?.message?.source;
   if (source?.kind === 'user') return 'human';
   if (source?.kind === 'model') return 'model:' + String(source.provider ?? '?') + '/' + String(source.model ?? '?');
-  if (source?.kind === 'plugin') return 'plugin:' + String(source.plugin ?? '?');
+  const plugin = pluginSourceName(source);
+  if (plugin !== undefined) return 'plugin:' + plugin;
   if (event?.type === 'tool/result') return 'tool';
   return source?.kind === undefined ? 'unknown' : String(source.kind);
 }

@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm';
 
 import { reasoningBlockTexts } from './content.ts';
+import { TURN_MEMORY_HINT_SOURCE } from './message-source.ts';
 import { isUserConversationSession } from './session-kind.ts';
 
 export interface ThoughtHintsConfig {
@@ -216,7 +217,7 @@ export class ThoughtHintsController {
       const system = readFileSync(promptUrl, 'utf8').trim();
       const message = createUserMessage({
         content: [{ type: 'text', text: thought }],
-        source: { kind: 'plugin', plugin: 'turn-memory' },
+        source: TURN_MEMORY_HINT_SOURCE,
       });
       for await (const chunk of this.ctx.llm.stream({
         provider: this.config.provider,

@@ -29,8 +29,10 @@ import {
 import type { PricedNode, SessionSegment } from './session-segments.ts';
 import type { SourceNodeRange } from './session-segments.ts';
 import { WorkerToolScope } from './worker-tools.ts';
+import { startWorker } from './subagent-activation.ts';
 import { assertMemoryImagesRetained } from './memory-images.ts';
 import { isUserConversationSession } from './session-kind.ts';
+import { isCompactionCheckpointSource, turnMemoryMarkerTurn } from './message-source.ts';
 
 export const SESSION_TOOL_NAMES = [
   'list_session_segments',
@@ -282,10 +284,9 @@ function assertNoActiveCompaction(session: any, stage: string): void {
 }
 
 function belongsToOpenTurn(event: any, openTurn: number, openTurnStart: number): boolean {
-  if (event?.data?.source?.plugin === 'compact') return false;
-  if (event?.data?.source?.plugin === 'turn-memory' && Number.isSafeInteger(event.data.source.turn)) {
-    return event.data.source.turn === openTurn;
-  }
+  if (isCompactionCheckpointSource(event?.data?.source)) return false;
+  const markerTurn = turnMemoryMarkerTurn(event?.data?.source);
+  if (markerTurn !== undefined) return markerTurn === openTurn;
   if (Number.isSafeInteger(event?.data?.turn)) return event.data.turn === openTurn;
   return event?.type === 'user/message' && event.seq > openTurnStart;
 }
@@ -637,7 +638,8 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
           const workerSignal = signal === undefined ? timeoutSignal : AbortSignal.any([signal, timeoutSignal]);
           const workerScope = this.workerTools.startOptions();
           try {
-            run = await (this.ctx as any).subagents.start(provider, {
+            run = await startWorker((this.ctx as any).subagents, {
+              provider,
               label: 'session memory ' + segment.id + ' (' + workerMode + ')',
               prompt: [{ type: 'text', text: buildSessionCompactionPrompt({
                 editor: job.editor,
@@ -650,7 +652,6 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
               }) }],
               parent: job.agent,
               signal: workerSignal,
-              persona: workerScope.persona,
               agentOptions: {
                 provider: target.provider,
                 model: target.model,

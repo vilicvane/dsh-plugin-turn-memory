@@ -27,6 +27,13 @@ opened after installation. UI-created lineage forks are user conversations and
 participate normally; internal subagents do not. A legacy turn-memory no-op
 whose current surface still contains raw reasoning is also migrated once.
 
+A queued compression that fails is retried twice in-process with a ten-second
+backoff; when those attempts are exhausted the turn keeps its pending marker and
+also receives a durable `turn-memory-failed` marker whose `reason` records why.
+The marker makes the failure visible in the session log (no log file is written
+on every deployment) and leaves the turn inside the cold-recovery boundary, so a
+later agent resume retries the compression instead of idling the session.
+
 ## Install
 
 Add the package to a DSH profile from GitHub:

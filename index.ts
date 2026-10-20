@@ -19,6 +19,7 @@ import { SessionMemoryCompactionEngine } from './lib/session-compaction.ts';
 import { startWorker } from './lib/subagent-activation.ts';
 import { land, validateLanding } from './lib/landing.ts';
 import {
+  failedTurnSource,
   isTurnMemorySource,
   pendingTurnSource,
 } from './lib/message-source.ts';
@@ -30,6 +31,7 @@ import {
   pendingTurnNumbers,
   turnHasUnrewrittenReasoning,
   turnCompressionBypassReason,
+  turnMarkerOriginal,
   turnSurfaceSeqs,
 } from './lib/turn-recovery.ts';
 import { WorkerToolScope } from './lib/worker-tools.ts';
@@ -55,6 +57,16 @@ export const TURN_TOOL_NAMES = [
 ];
 
 const DEFAULT_SURFACE_DUMP_DIR = fileURLToPath(new URL('.tmp/', import.meta.url));
+
+/**
+ * In-process retry budget for a queued turn whose compression attempt failed.
+ * A durable pending marker only brings such a turn back when the agent is
+ * recreated, so a transient failure (a concurrent session-compaction rewrite,
+ * a lost flush) would otherwise idle the session until a restart. Retries are
+ * bounded because worker failures already consumed `turnWorkerAttempts`.
+ */
+const TURN_FAILURE_RETRIES = 2;
+const TURN_FAILURE_RETRY_DELAY_MS = 10_000;
 
 interface PluginConfig {
   enabled?: boolean;
@@ -252,6 +264,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
   const jobs = new Map<string, CompressionJob>();
   const pendingTurns = new Map<string, Map<number, Set<string>>>();
   const pumps = new Map<string, Promise<void>>();
+  const turnFailures = new Map<string, Map<number, number>>();
   const stagedFinishes = new WeakMap<object, CompressionJob>();
   let disposed = false;
 
@@ -492,6 +505,80 @@ function apply(ctx: any, config: PluginConfig = {}): void {
     return added;
   };
 
+  /**
+   * One queued turn, end to end. Returns undefined when it is settled and a
+   * reason string when it is not, so every failure path reaches failTurn() and
+   * none of them can drop the queue entry.
+   */
+  const processTurn = async (agent: any, turn: number, sources: string): Promise<string | undefined> => {
+    const sessionId = String(agent.session.id);
+    if (compressedTurnNumbers(agent.session).has(turn) && !turnHasUnrewrittenReasoning(agent.session, turn)) {
+      thoughtHints?.discardTurn(sessionId, turn);
+      ctx.logger.info('turn-memory: turn ' + turn + ' is already compressed; removed duplicate queued work');
+      await turnContinuation?.dispatchAfterCompression(agent, turn);
+      return undefined;
+    }
+    const event = findCompletedTurnEnd(agent.session, turn);
+    if (event === undefined) return 'no durable turn/end in the session log';
+    const job = prepareJob(agent, event);
+    if (job === undefined) {
+      thoughtHints?.discardTurn(sessionId, turn);
+      return 'no eligible current surface range; it may already be shadowed by another rewrite';
+    }
+    if (thoughtHints !== undefined) {
+      job.thoughtHints = await thoughtHints.collectForTurn(job.session, turn, job.targetSeqs);
+      ctx.logger.info('turn-memory: turn ' + turn + ' collected ' + job.thoughtHints.length
+        + ' long-thought hint(s) before compression');
+    }
+    const bypassReason = turnCompressionBypassReason(job.editor.snapshot());
+    if (bypassReason !== undefined) {
+      ctx.logger.info('turn-memory: recording turn ' + turn + ' as a durable no-op without a worker: ' + bypassReason);
+      land(job);
+      if (!await persistLanding(job)) return 'the durable no-op marker was not persisted';
+      ctx.logger.info('turn-memory: turn ' + turn + ' no-op marker landed (' + job.targetSeqs.length
+        + ' nodes, workerAttempts=0)');
+      await turnContinuation?.dispatchAfterCompression(agent, turn);
+      return undefined;
+    }
+    jobs.set(sessionId, job);
+    ctx.logger.info('turn-memory: starting turn ' + turn + ' compression from ' + sources);
+    if (!await runCompression(job)) return 'compression did not land';
+    await turnContinuation?.dispatchAfterCompression(agent, turn);
+    return undefined;
+  };
+
+  const recordTurnFailure = async (session: any, turn: number, reason: string): Promise<void> => {
+    const original = turnMarkerOriginal(session, turn);
+    if (original === undefined) {
+      ctx.logger.warn('turn-memory: turn ' + turn + ' has no user node for a durable failure marker');
+      return;
+    }
+    appendTurnMarkerCopy(session, original, failedTurnSource(turn, reason));
+    await ctx.sessions.flush(session);
+  };
+
+  const failTurn = async (agent: any, sessionId: string, turn: number, reason: string): Promise<void> => {
+    let failures = turnFailures.get(sessionId);
+    if (failures === undefined) {
+      failures = new Map();
+      turnFailures.set(sessionId, failures);
+    }
+    const attempts = (failures.get(turn) ?? 0) + 1;
+    if (attempts <= TURN_FAILURE_RETRIES) {
+      failures.set(turn, attempts);
+      enqueueTurn(sessionId, turn, 'retry after failure');
+      ctx.logger.warn('turn-memory: turn ' + turn + ' of session ' + sessionId + ' failed (' + reason
+        + '); retrying in ' + TURN_FAILURE_RETRY_DELAY_MS + 'ms, attempt ' + attempts + '/' + TURN_FAILURE_RETRIES);
+      await new Promise<void>((settle) => setTimeout(settle, TURN_FAILURE_RETRY_DELAY_MS));
+      return;
+    }
+    failures.delete(turn);
+    if (failures.size === 0) turnFailures.delete(sessionId);
+    ctx.logger.warn('turn-memory: turn ' + turn + ' of session ' + sessionId + ' failed ' + attempts
+      + ' time(s); recording a durable failure marker: ' + reason);
+    await recordTurnFailure(agent.session, turn, reason);
+  };
+
   const drainTurns = async (sessionId: string): Promise<void> => {
     while (!disposed) {
       const turns = pendingTurns.get(sessionId);
@@ -509,50 +596,15 @@ function apply(ctx: any, config: PluginConfig = {}): void {
       const sources = [...(turns!.get(nextTurn) ?? [])].join(', ');
       turns!.delete(nextTurn);
       if (turns!.size === 0) pendingTurns.delete(sessionId);
-      if (compressedTurnNumbers(agent.session).has(nextTurn)
-        && !turnHasUnrewrittenReasoning(agent.session, nextTurn)) {
-        thoughtHints?.discardTurn(sessionId, nextTurn);
-        ctx.logger.info('turn-memory: turn ' + nextTurn + ' is already compressed; removed duplicate queued work');
-        await turnContinuation?.dispatchAfterCompression(agent, nextTurn);
+      const reason = await processTurn(agent, nextTurn, sources)
+        .catch((error: unknown) => error instanceof Error ? error.message : String(error));
+      if (reason === undefined) {
+        const failures = turnFailures.get(sessionId);
+        failures?.delete(nextTurn);
+        if (failures?.size === 0) turnFailures.delete(sessionId);
         continue;
       }
-      const event = findCompletedTurnEnd(agent.session, nextTurn);
-      if (event === undefined) {
-        ctx.logger.warn('turn-memory: queued turn ' + nextTurn + ' from ' + sources
-          + ' has no durable turn/end in session ' + sessionId);
-        continue;
-      }
-      try {
-        const job = prepareJob(agent, event);
-        if (job === undefined) {
-          thoughtHints?.discardTurn(sessionId, nextTurn);
-          ctx.logger.warn('turn-memory: turn ' + nextTurn + ' from ' + sources
-            + ' has no eligible current surface range; it may already be shadowed by another rewrite');
-          continue;
-        }
-        if (thoughtHints !== undefined) {
-          job.thoughtHints = await thoughtHints.collectForTurn(job.session, nextTurn, job.targetSeqs);
-          ctx.logger.info('turn-memory: turn ' + nextTurn + ' collected ' + job.thoughtHints.length
-            + ' long-thought hint(s) before compression');
-        }
-        const bypassReason = turnCompressionBypassReason(job.editor.snapshot());
-        if (bypassReason !== undefined) {
-          ctx.logger.info('turn-memory: recording turn ' + nextTurn + ' as a durable no-op without a worker: ' + bypassReason);
-          land(job);
-          if (!await persistLanding(job)) continue;
-          ctx.logger.info('turn-memory: turn ' + nextTurn + ' no-op marker landed (' + job.targetSeqs.length
-            + ' nodes, workerAttempts=0)');
-          await turnContinuation?.dispatchAfterCompression(agent, nextTurn);
-          continue;
-        }
-        jobs.set(sessionId, job);
-        ctx.logger.info('turn-memory: starting turn ' + nextTurn + ' compression from ' + sources);
-        const landed = await runCompression(job);
-        if (landed) await turnContinuation?.dispatchAfterCompression(agent, nextTurn);
-      } catch (error) {
-        ctx.logger.warn('turn-memory: could not prepare or process turn ' + nextTurn + ' from ' + sources + ': '
-          + (error instanceof Error ? error.message : String(error)));
-      }
+      await failTurn(agent, sessionId, nextTurn, reason);
     }
   };
 
@@ -591,9 +643,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
         if (Number.isSafeInteger(turn)
           && !compressedTurnNumbers(session).has(turn)
           && !pendingTurnNumbers(session).has(turn)) {
-          const start = session.snapshotEvents().findLast((candidate: any) => candidate.type === 'turn/start' && candidate.data?.turn === turn);
-          const targetSeqs = start === undefined ? [] : turnSurfaceSeqs(session, turn, start.seq, event.seq);
-          const user = targetSeqs.map((seq: number) => session.snapshotEvents()[seq]).find((candidate: any) => candidate?.type === 'user/message');
+          const user = turnMarkerOriginal(session, turn);
           if (user === undefined) {
             ctx.logger.warn('turn-memory: turn ' + String(turn) + ' has no user node for a durable pending marker; live processing remains available but cold recovery is not guaranteed');
           } else {
@@ -660,6 +710,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
     jobs.clear();
     pendingTurns.clear();
     pumps.clear();
+    turnFailures.clear();
   });
 }
 

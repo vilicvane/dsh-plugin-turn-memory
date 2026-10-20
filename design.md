@@ -521,3 +521,26 @@
 
 - 保存会让插件 fiber 重启，`latestAnnouncedMilestone`、后台 jobs 等内存态随之重置；应在两次压缩轮次之间修改。
 - 其余配置项仍只能改配置文件；客户端不内联默认值 30，字段为空即表示继承，避免 schema 默认值在两处漂移。
+
+## D-021：压缩失败不再静默丢弃队列
+
+状态：**已确认**
+
+### 约定
+
+- 每个排队 turn 的处理收进 `processTurn()` 单一失败出口：成功返回 `undefined`，失败返回一句原因（`no durable turn/end in the session log`、`no eligible current surface range…`、`the durable no-op marker was not persisted`、`compression did not land`），`drainTurns()` 只做 `await processTurn(...).catch(...)` 分流。原先位于 `try` 之外的 `compressedTurnNumbers()`／`findCompletedTurnEnd()` 也因此纳入同一出口，任何抛出都不会再让整个 pump 被静默终止。
+- 失败先进程内退避重试：`TURN_FAILURE_RETRIES = 2`、`TURN_FAILURE_RETRY_DELAY_MS = 10_000`，重试只是把 turn 重新 `enqueueTurn()` 后在同一 pump 内等待，因此 `pumps` 的「一个 session 一个 pump」语义不变，也不需要额外的定时器簿记。
+- 重试穷尽后写 durable `turn-memory-failed` 标记（`failedTurnSource(turn, reason)`，reason 经 `boundContextSummary()` 限长）：复用该 turn 的 user 锚点（`turnMarkerOriginal()`），用 `appendTurnMarkerCopy()` 做等内容替换，并 `ctx.sessions.flush()`。这样失败在会话日志里可见、可事后排查，而不再只依赖不落盘的 `ctx.logger.warn`。
+- `turn-memory-failed` 加入 `TURN_MEMORY_KINDS`，但不加入 `turnMemoryMarkerOf()`：前者让 `turnMemoryMarkerTurn()`／`isTurnMemorySource()`／`pluginSourceName()` 把该节点归入本 turn 的重写范围（后续 `land()` 会一并重写），后者让 `pendingTurnNumbers()` 仍把该 turn 视为 pending，于是 `agent/created` 的冷恢复边界保持不变。
+- `turn/end` 处理器改用 `turnMarkerOriginal(session, turn)` 取锚点，与失败标记共用同一套定位逻辑，不再各自重算 `turn/start` 与表面区间。
+
+### 可行性依据
+
+- 失败重试是安全的：`runCompression()` 只在 `land()` 之后才写会话，worker 与 editor 的变更都在 job 内，重试会用当前表面重建新 job；`turnWorkerAttempts` 的 worker 级重试已在 `runCompression()` 内部用尽，外层重试只覆盖「job 没走到 landing」这一层。
+- pending 标记先于失败标记写入（turn/end 处理器 → pump），而会话日志是 append-only：`pendingTurnNumbers()` 扫描全部事件，即使表面上该 user 节点的最新 source 已变成 failed，早先的 pending 事件依然让该 turn 留在冷恢复集合里。
+- 失败标记是等内容替换（`appendTurnMarkerCopy` 复制 `original.data.content`），所以热态与冷重载的 `deriveMessages()` 文本不变，测试覆盖了这一点。
+
+### 已知边界
+
+- 结构性失败（如 `targetSeqs` 为空、区间被别的重写覆盖）也会耗尽 2 次重试后才留标记，比原先多花两个 10 秒窗口；这些原因事后可从标记的 `reason` 读出。
+- 失败标记本身写入失败（flush 抛错）时只落到 pump 级 `catch`，仍是 warn；这种情形说明会话持久化已不可用，插件层无法再补救。

@@ -54,6 +54,17 @@ export function findCompletedTurnEnd(session: any, turn: number): any | undefine
   return found;
 }
 
+/** The user node this plugin copies to persist a lifecycle marker for one turn. */
+export function turnMarkerOriginal(session: any, turn: number): any | undefined {
+  const start = session.snapshotEvents()
+    .findLast((candidate: any) => candidate.type === 'turn/start' && candidate.data?.turn === turn);
+  const end = findCompletedTurnEnd(session, turn);
+  if (start === undefined || end === undefined) return undefined;
+  return turnSurfaceSeqs(session, turn, start.seq, end.seq)
+    .map((seq: number) => session.snapshotEvents()[seq])
+    .find((candidate: any) => candidate?.type === 'user/message');
+}
+
 /** Current-surface raw reasoning means an older completion marker no longer satisfies this implementation's contract. */
 export function turnHasUnrewrittenReasoning(session: any, turn: number): boolean {
   for (const seq of session?.surface?.nodes ?? []) {

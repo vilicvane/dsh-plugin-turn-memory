@@ -26,6 +26,13 @@ export interface TurnMemoryCompressionSource {
   readonly workerAttempts: number;
 }
 
+/** Surface marker saying the turn's compression gave up after failed retries. */
+export interface TurnMemoryFailureSource {
+  readonly kind: 'turn-memory-failed';
+  readonly turn: number;
+  readonly reason: string;
+}
+
 /** Host control context that resumes work after the turn was compressed. */
 export interface TurnMemoryContinuationSource {
   readonly kind: 'turn-memory-continuation';
@@ -46,6 +53,7 @@ declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     'turn-memory-pending': TurnMemoryPendingSource;
     'turn-memory-compression': TurnMemoryCompressionSource;
+    'turn-memory-failed': TurnMemoryFailureSource;
     'turn-memory-continuation': TurnMemoryContinuationSource;
     'turn-memory-hint': TurnMemoryHintSource;
   }
@@ -74,6 +82,14 @@ export function compressionTurnSource(input: CompressionTurnSourceInput): TurnMe
   };
 }
 
+export function failedTurnSource(turn: number, reason: string): TurnMemoryFailureSource {
+  return {
+    kind: 'turn-memory-failed',
+    turn,
+    reason: boundContextSummary(reason),
+  };
+}
+
 export function continuationTurnSource(turn: number, requestId: string): TurnMemoryContinuationSource {
   return {
     kind: 'turn-memory-continuation',
@@ -89,6 +105,7 @@ export const TURN_MEMORY_HINT_SOURCE: TurnMemoryHintSource = { kind: 'turn-memor
 const TURN_MEMORY_KINDS: ReadonlySet<string> = new Set([
   'turn-memory-pending',
   'turn-memory-compression',
+  'turn-memory-failed',
   'turn-memory-continuation',
   'turn-memory-hint',
 ]);

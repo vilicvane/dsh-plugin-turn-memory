@@ -19,11 +19,16 @@ export interface TurnContinuationConfig {
   reminderIntervalNodes?: number | Volatile<number>;
 }
 
+/**
+ * A durable "continue after this turn" request. It carries no payload: the next
+ * turn resumes from the compressed checkpoint, so the model no longer has to
+ * restate the turn in a handoff that would both duplicate that checkpoint and
+ * give the compression worker a second, competing account of the same work.
+ */
 export interface TurnContinuationRequest {
-  version: 1;
+  version: 2;
   requestId: string;
   turn: number;
-  handoff: string;
 }
 
 function isRootAgent(agent: any): boolean {
@@ -129,28 +134,19 @@ export function continuationRequestForTurn(session: any, turn: number): TurnCont
       && event.data?.name === TURN_CONTINUATION_TOOL_NAME
       && event.data?.isError === false
       && typeof event.data?.subCallId === 'string') {
-      const request = requestFromArguments(event.data.subCallId, turn, event.data.arguments);
-      if (request !== undefined) return request;
-      continue;
+      return requestFromCall(event.data.subCallId, turn);
     }
     if (event?.type !== 'tool/call'
       || event.data?.turn !== turn
       || event.data?.name !== TURN_CONTINUATION_TOOL_NAME
       || !successful.has(event.data?.callId)) continue;
-    try {
-      const request = requestFromArguments(event.data.callId, turn, JSON.parse(event.data.arguments));
-      if (request !== undefined) return request;
-    } catch {
-      continue;
-    }
+    return requestFromCall(event.data.callId, turn);
   }
   return undefined;
 }
 
-function requestFromArguments(requestId: string, turn: number, args: any): TurnContinuationRequest | undefined {
-  const handoff = typeof args?.handoff === 'string' ? args.handoff.trim() : '';
-  if (handoff === '') return undefined;
-  return { version: 1, requestId, turn, handoff };
+function requestFromCall(requestId: string, turn: number): TurnContinuationRequest {
+  return { version: 2, requestId, turn };
 }
 
 function isContinuationMessage(message: any, requestId: string): boolean {
@@ -168,7 +164,7 @@ export function continuationWasDelivered(session: any, requestId: string): boole
   return false;
 }
 
-/** A later turn already started, so this handoff can no longer be the next turn. */
+/** A later turn already started, so this continuation can no longer be the next turn. */
 export function supersededByLaterTurn(session: any, turn: number): boolean {
   return (session?.snapshotEvents() ?? []).some((event: any) =>
     event?.type === 'turn/start'
@@ -194,10 +190,10 @@ export function buildTurnContinuationContext(options: {
     contextStatus,
     'Stop this turn and hand off now.',
     '- If an atomic mutation is already in progress, finish only that mutation first. Do not start another.',
-    '- Call `' + TURN_CONTINUATION_TOOL_NAME
-      + '` with completed work, current state, and the exact next work.',
+    '- End the turn with a short wrap-up: what you completed, what is still pending, and the exact next work.',
+    '- Call `' + TURN_CONTINUATION_TOOL_NAME + '` (no arguments) once that wrap-up is written.',
     '- Continue without handing off only when the whole task will finish in the next few actions.',
-    'After the call, the host will compress this turn and continue the work automatically in a new turn.',
+    'After the call the host compresses this turn and continues the work automatically in a new turn.',
   ].join('\n');
 }
 
@@ -208,8 +204,7 @@ export function buildTurnContinuationMessage(request: TurnContinuationRequest): 
       text: [
         'Turn Memory automatic continuation after compressed turn ' + request.turn,
         'This is host control context, not new human input.',
-        'Resume the unfinished work now from the prior assistant handoff:',
-        request.handoff,
+        'Resume the unfinished work now from the compressed turn above.',
       ].join('\n'),
     }],
     source: continuationTurnSource(request.turn, request.requestId),
@@ -230,20 +225,14 @@ export class TurnContinuationController {
     }
     ctx.tools.register(defineTool({
       name: TURN_CONTINUATION_TOOL_NAME,
-      description: 'Call when the active Turn Memory continuation notice requires a handoff. Record completed work, current state, and exact next work; this ends the current turn, then the host compresses it and continues automatically in a new turn.',
-      parameters: {
-        handoff: {
-          type: 'string',
-          required: true,
-          description: 'Concise completed work, current state, unresolved dependencies, and exact next work for the next turn.',
-        },
-      },
+      description: 'Call, with no arguments, when the active Turn Memory continuation notice requires you to stop after wrapping up this turn. The host then compresses this turn and continues the work automatically in a new turn from that compressed memory; nothing you write here is carried over separately.',
+      parameters: {},
       output: {
         schema: { type: 'string' as const },
         render: (_args: unknown, value: string) => [{ type: 'text' as const, text: value }],
       },
       isConcurrencySafe: () => false,
-      execute: async (args: any, exec: any) => {
+      execute: async (_args: any, exec: any) => {
         const agent = exec.agent;
         if (!isRootAgent(agent)) throw new Error('turn continuation is available only in a root conversation');
         const turn = openTurnNumber(agent.session);
@@ -258,8 +247,6 @@ export class TurnContinuationController {
           throw new Error('turn continuation is not active: open turn nodes ' + openTurnNodes
             + ' are below first reminder milestone ' + this.reminderIntervalNodes);
         }
-        const handoff = typeof args.handoff === 'string' ? args.handoff.trim() : '';
-        if (handoff === '') throw new Error('turn continuation handoff must not be empty');
         exec.concludeTurn();
         return 'Continuation queued. This turn will end; after compression the host will start the next turn automatically.';
       },
@@ -325,8 +312,8 @@ export class TurnContinuationController {
     if (request === undefined || continuationWasDelivered(agent.session, request.requestId)) return false;
     // Compression of an older turn may land after the session has already moved on —
     // notably after a restart backfills turns that were never compressed. Dispatching
-    // that handoff then would start a stale turn and push every later handoff one turn
-    // further behind, so the newest turn owns the continuation instead.
+    // that continuation then would start a stale turn and push every later continuation
+    // one turn further behind, so the newest turn owns the continuation instead.
     if (supersededByLaterTurn(agent.session, turn)) {
       this.ctx.logger.info('turn-memory: continuation for turn ' + turn + ' is superseded by a later turn; skipped');
       return false;

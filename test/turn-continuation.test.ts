@@ -120,8 +120,10 @@ describe('turn continuation lifecycle', () => {
     assert.match(notice, /Estimated full context: 111 tokens/);
     assert.match(notice, /Next reminder milestone: 4 nodes/);
     assert.match(notice, /Stop this turn and hand off now/);
-    assert.match(notice, /Call `continue_after_turn_compression`/);
+    assert.match(notice, /short wrap-up: what you completed, what is still pending, and the exact next work/);
+    assert.match(notice, /Call `continue_after_turn_compression` \(no arguments\)/);
     assert.match(notice, /whole task will finish in the next few actions/);
+    assert.doesNotMatch(notice, /handoff/);
     assert.match(notice, new RegExp(TURN_CONTINUATION_TOOL_NAME));
     assert.doesNotMatch(notice, /<turn-memory-continuation|<assistant-self-check>/);
     assert.ok(notice.length < 900, 'continuation notice should stay concise');
@@ -150,9 +152,9 @@ describe('turn continuation lifecycle', () => {
       step: 1,
       callId: 'call-continuation-1',
       name: TURN_CONTINUATION_TOOL_NAME,
-      arguments: JSON.stringify({ handoff: 'Run the remaining verification.' }),
+      arguments: '{}',
     });
-    const result = await tool.execute({ handoff: 'Run the remaining verification.' }, {
+    const result = await tool.execute({}, {
       agent,
       callId: 'call-continuation-1',
       concludeTurn: () => { concluded = true; },
@@ -174,14 +176,15 @@ describe('turn continuation lifecycle', () => {
       },
     });
     const request = continuationRequestForTurn(session, 1);
-    assert.equal(request?.handoff, 'Run the remaining verification.');
+    assert.deepEqual(request, { version: 2, requestId: 'call-continuation-1', turn: 1 });
     assert.equal(contexts[0].text({ agent }), '');
     assert.equal(controller.needsDispatchAfterCompression(session, 1), true);
 
     assert.equal(await controller.dispatchAfterCompression(agent, 1), true);
     assert.equal(delivered.length, 1);
     assert.match(delivered[0].content[0].text, /not new human input/);
-    assert.match(delivered[0].content[0].text, /Resume the unfinished work now/);
+    assert.match(delivered[0].content[0].text, /Resume the unfinished work now from the compressed turn above/);
+    assert.doesNotMatch(delivered[0].content[0].text, /handoff/);
     assert.doesNotMatch(delivered[0].content[0].text, /<turn-memory-continuation/);
     assert.equal(continuationWasDelivered(session, request!.requestId), true);
     assert.equal(controller.needsDispatchAfterCompression(session, 1), false);
@@ -204,18 +207,18 @@ describe('turn continuation lifecycle', () => {
     session.append('turn/start', { turn: 1 });
     session.append('user/message', message('short'), 'append');
     const tool = tools.get(TURN_CONTINUATION_TOOL_NAME);
-    await assert.rejects(tool.execute({ handoff: 'next' }, {
+    await assert.rejects(tool.execute({}, {
       agent: { session }, concludeTurn() {},
     }), /below first reminder milestone/);
     session.header.parentSession = 'parent';
     session.header.origin = 'subagent';
     session.header.delegationDepth = 1;
-    await assert.rejects(tool.execute({ handoff: 'next' }, {
+    await assert.rejects(tool.execute({}, {
       agent: { session }, concludeTurn() {},
     }), /root conversation/);
   });
 
-  test('does not dispatch a handoff superseded by a later turn', async () => {
+  test('does not dispatch a continuation superseded by a later turn', async () => {
     const tools = new Map<string, any>();
     let flushes = 0;
     const ctx = {
@@ -234,7 +237,7 @@ describe('turn continuation lifecycle', () => {
       step: 1,
       callId: 'call-superseded',
       name: TURN_CONTINUATION_TOOL_NAME,
-      arguments: JSON.stringify({ handoff: 'Continue the older turn.' }),
+      arguments: '{}',
     });
     session.append('tool/result', {
       turn: 1,
@@ -258,7 +261,7 @@ describe('turn continuation lifecycle', () => {
     assert.equal(flushes, 0);
   });
 
-  test('accepts and recovers detailed handoffs without an arbitrary length cap', async () => {
+  test('records a payload-free request that does not depend on model prose', async () => {
     const tools = new Map<string, any>();
     const ctx = {
       tokenMeter: meter,
@@ -271,14 +274,14 @@ describe('turn continuation lifecycle', () => {
     const session = fixtureSession();
     session.append('turn/start', { turn: 4 });
     session.append('user/message', message('begin'), 'append');
-    const handoff = 'Detailed continuation state. '.repeat(100);
-    assert.ok(handoff.length > 2_000);
 
     let concluded = false;
     const tool = tools.get(TURN_CONTINUATION_TOOL_NAME);
-    const result = await tool.execute({ handoff }, {
+    assert.deepEqual(tool.parameters, { type: 'object', properties: {} },
+      'the continuation request takes no payload');
+    const result = await tool.execute({}, {
       agent: { session },
-      callId: 'call-long-handoff',
+      callId: 'call-payload-free',
       concludeTurn: () => { concluded = true; },
     });
     assert.equal(concluded, true);
@@ -286,25 +289,29 @@ describe('turn continuation lifecycle', () => {
     session.append('tool/call', {
       turn: 4,
       step: 1,
-      callId: 'call-long-handoff',
+      callId: 'call-payload-free',
       name: TURN_CONTINUATION_TOOL_NAME,
-      arguments: JSON.stringify({ handoff }),
+      arguments: '{}',
     });
     session.append('tool/result', {
       turn: 4,
       step: 1,
       message: {
-        id: 'result-long-handoff',
+        id: 'result-payload-free',
         role: 'tool',
-        source: { kind: 'tool', callId: 'call-long-handoff' },
-        toolCallId: 'call-long-handoff',
+        source: { kind: 'tool', callId: 'call-payload-free' },
+        toolCallId: 'call-payload-free',
         content: [{ type: 'text', text: result }],
         isError: false,
       },
     });
     session.append('turn/end', { turn: 4, reason: { kind: 'completed' } });
 
-    assert.equal(continuationRequestForTurn(session, 4)?.handoff, handoff.trim());
+    assert.deepEqual(continuationRequestForTurn(session, 4), {
+      version: 2,
+      requestId: 'call-payload-free',
+      turn: 4,
+    });
   });
 
   test('recovers a successful ptc-mode sub-dispatch as the same durable request', () => {
@@ -315,24 +322,23 @@ describe('turn continuation lifecycle', () => {
       parentCallId: 'run-code-1',
       subCallId: 'run-code-1:ptc:0',
       name: TURN_CONTINUATION_TOOL_NAME,
-      arguments: { handoff: 'Resume the code-mode verification.' },
+      arguments: {},
     });
     session.append('tool/ptc-dispatch', {
       rootCallId: 'run-code-1',
       parentCallId: 'run-code-1',
       subCallId: 'run-code-1:ptc:0',
       name: TURN_CONTINUATION_TOOL_NAME,
-      arguments: { handoff: 'Resume the code-mode verification.' },
+      arguments: {},
       isError: false,
       content: [{ type: 'text', text: 'queued' }],
     });
     session.append('turn/end', { turn: 3, reason: { kind: 'completed' } });
 
     assert.deepEqual(continuationRequestForTurn(session, 3), {
-      version: 1,
+      version: 2,
       requestId: 'run-code-1:ptc:0',
       turn: 3,
-      handoff: 'Resume the code-mode verification.',
     });
   });
 
@@ -344,7 +350,7 @@ describe('turn continuation lifecycle', () => {
       step: 1,
       callId: 'call-failed-continuation',
       name: TURN_CONTINUATION_TOOL_NAME,
-      arguments: JSON.stringify({ handoff: 'This must never be recovered.' }),
+      arguments: '{}',
     });
     session.append('tool/result', {
       turn: 5,

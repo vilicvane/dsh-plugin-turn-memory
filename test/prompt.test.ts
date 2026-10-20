@@ -57,7 +57,8 @@ describe('buildCompressionPrompt', () => {
     assert.match(prompt, /read_memory_image/);
     assert.match(prompt, /Host runtime snapshots, Turn Memory continuation notices/);
     assert.match(prompt, /scaffolding rather than human requests/);
-    assert.match(prompt, /intentional continuation should leave an assistant account/);
+    assert.match(prompt, /should leave an assistant account of completed work, pending items, and exact next work/);
+    assert.match(prompt, /unchecked todos, open questions, and the next concrete action must survive verbatim/);
     assert.match(prompt, /No earlier worker has stopped/);
     assert.match(prompt, /inherits the original completed turn, including its raw reasoning/);
     assert.doesNotMatch(prompt, /does not inherit the parent transcript/);

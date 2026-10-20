@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { defineTool } from '@deepseek-ai/dsh-tools';
+import z from '@deepseek-ai/schemastery';
 
 import { MemoryCoordinator } from './lib/coordinator.ts';
 import { assistantCompressionSeed, contentText } from './lib/content.ts';
@@ -33,7 +34,7 @@ import {
 } from './lib/turn-recovery.ts';
 import { WorkerToolScope } from './lib/worker-tools.ts';
 import { createReadMemoryImageTool } from './lib/memory-images.ts';
-import { TurnContinuationController } from './lib/turn-continuation.ts';
+import { DEFAULT_REMINDER_INTERVAL_NODES, TurnContinuationController } from './lib/turn-continuation.ts';
 import { ThoughtHintsController } from './lib/thought-hints.ts';
 import { isUserConversationSession } from './lib/session-kind.ts';
 import { createReadSessionHistoryTool, renderRawSessionContent } from './lib/session-history.ts';
@@ -70,6 +71,55 @@ interface PluginConfig {
   sessionHistory?: SessionHistoryConfig;
   sessionCompaction?: SessionCompactionConfig;
 }
+
+// Cordis reads this schema for profile validation and for the settings form that
+// writes the current profile patch. Only `turnContinuation.reminderIntervalNodes`
+// is volatile, so it is the only field the form exposes; everything else stays
+// editable through the Cordis configuration files.
+export const Config = z.object({
+  enabled: z.boolean(),
+  turnCompression: z.boolean(),
+  turnWorkerAttempts: z.number(),
+  e2eSmoke: z.boolean(),
+  e2eInterruptAfterFirstMutation: z.boolean(),
+  e2eDeferTurnCompressionUntilResume: z.boolean(),
+  previewChars: z.number(),
+  maxReadChars: z.number(),
+  surfaceDumpDir: z.string(),
+  turnContinuation: z.object({
+    enabled: z.boolean(),
+    reminderIntervalNodes: z.number().step(1).min(1).default(DEFAULT_REMINDER_INTERVAL_NODES).volatile(),
+  }),
+  thoughtHints: z.object({
+    enabled: z.boolean(),
+    provider: z.string(),
+    model: z.string(),
+    minimumChars: z.number(),
+    maxTokens: z.number(),
+    timeoutMs: z.number(),
+  }),
+  sessionHistory: z.object({
+    enabled: z.boolean(),
+    maxReadChars: z.number(),
+    catalogTurns: z.number(),
+  }),
+  sessionCompaction: z.object({
+    enabled: z.boolean(),
+    auto: z.boolean(),
+    thresholdRatio: z.number(),
+    retainRatio: z.number(),
+    retainTokens: z.number(),
+    segmentTokens: z.number(),
+    previewChars: z.number(),
+    maxReadChars: z.number(),
+    warmupChars: z.number(),
+    workerMaxTokens: z.number(),
+    workerAttempts: z.number(),
+    workerTimeoutMs: z.number(),
+    compactionRetries: z.number(),
+    e2eInterruptSessionAfterFirstMutation: z.boolean(),
+  }),
+});
 
 interface CompressionJob {
   id: string;

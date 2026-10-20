@@ -6,13 +6,17 @@
   "author": "vilicvane",
   "type": "module",
   "files": [
+    "client.js",
+    "client/*.ts",
     "index.ts",
     "lib/*.ts",
     "e2e/*.ts",
-    "prompts/*.md"
+    "prompts/*.md",
+    "scripts/build-client.mjs"
   ],
   "exports": {
     ".": "./index.ts",
+    "./client": "./client.js",
     "./e2e-runner": "./e2e/runner.ts",
     "./prompt-eval-runner": "./e2e/prompt-eval-runner.ts",
     "./prompt-matrix-runner": "./e2e/prompt-matrix-runner.ts",
@@ -20,6 +24,7 @@
     "./package.json": "./package.json"
   },
   "dependencies": {
+    "@deepseek-ai/cosmokit": "1.8.6",
     "@deepseek-ai/dsh-agent": "0.2.1-rc.2",
     "@deepseek-ai/dsh-attachment": "0.2.1-rc.2",
     "@deepseek-ai/dsh-compaction": "0.2.1-rc.2",
@@ -27,17 +32,42 @@
     "@deepseek-ai/dsh-session": "0.2.1-rc.2",
     "@deepseek-ai/dsh-system-prompt": "0.2.1-rc.2",
     "@deepseek-ai/dsh-token-meter": "0.2.1-rc.2",
-    "@deepseek-ai/dsh-tools": "0.2.1-rc.2"
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2",
+    "@deepseek-ai/schemastery": "3.18.5"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/dsh-client-locale": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-plugin-manager": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-renderer": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-settings": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.1-rc.2",
     "@types/node": "^26.2.0",
+    "@types/react": "~18.3.1",
+    "esbuild": "^0.25.0",
+    "react": "^18.2.0",
     "typescript": "^7.0.2"
   },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
   "scripts": {
+    "build": "pnpm build:client",
+    "build:client": "node scripts/build-client.mjs",
+    "check:client": "node scripts/build-client.mjs --check",
     "test": "node --test \"test/*.test.ts\"",
     "typecheck": "tsc --noEmit",
-    "check": "pnpm test && pnpm typecheck",
+    "check": "pnpm check:client && pnpm test && pnpm typecheck",
     "e2e": "bash scripts/e2e-smoke.sh",
     "e2e:prompt": "bash scripts/e2e-prompt.sh",
     "e2e:prompt:repeat": "node scripts/repeat-prompt-eval.mjs",

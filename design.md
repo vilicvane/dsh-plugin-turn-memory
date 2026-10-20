@@ -497,3 +497,27 @@
 - 若要在保留完整结构的前提下落地已结束 turn，只能在 turn 仍开放时完成压缩（落地生命周期变更），或由上游格式新增不受 step 绑定的 replacement 类型；两者都超出插件自身范围。当前实现选择只写合法 event，把结构信息降级进 checkpoint 文本。
 - checkpoint 形态不再受“目标区间必须位于 surface 尾部”的限制，也不再需要继承原 model source。
 
+## D-020：Nodes 阈值经由 volatile Config 与浏览器半边提供可视化配置
+
+状态：**已确认**
+
+### 约定
+
+- 插件导出 schemastery `Config`，逐字段声明 `PluginConfig` 的全部键；只有 `turnContinuation.reminderIntervalNodes` 标 `.volatile()`（`z.number().step(1).min(1).default(DEFAULT_REMINDER_INTERVAL_NODES)`）。其余字段一律不加 `.volatile()`，也不加 `.default()`，因为 `apply()` 依赖 `=== true`／`!== false` 区分「未配置」与「显式关闭」。
+- `lib/turn-continuation.ts` 的 `reminderIntervalNodes` 类型为 `number | Volatile<number>`：普通配置来自 YAML，设置表单写入的是 volatile 包装。controller 每次读取都经私有 getter 解包，因此表单保存后的新值立刻生效，同时保持构造函数对正安全整数的校验与既有报错文案。
+- 浏览器半边注册 list 型槽 `plugins.item`，`id` 取 settings namespace 本身（`turn-memory`，即 profile entry id），`order` 为 40，`label` 取自 locale 的 `title` 键，并用 `ctx.configForms.whileServed([NS], …)` 包裹：只有 Host 端确实为该 namespace 提供服务时卡片才存在。页面使用页面 owner 传入的 `form`（`state`／`mutate`）自行持有 draft：空文本表示清除覆盖、继承 schema 默认 30，保存时写 `{ op: 'unset' | 'set', path: ['turnContinuation', 'reminderIntervalNodes'] }` 并带上当前 `revision`。
+- 客户端 bundle 由 `scripts/build-client.mjs` 用 esbuild 打成 `window.__ModuleLoader__.load({ id, factory })` 包裹的 CJS，`pnpm check:client` 在提交前校验产物未过期；`package.json` 的 `dsh.client.inject` 列出 locale、ui-plugin-manager、ui-renderer、ui-settings、ui-slots 五个包名。
+
+### 可行性依据
+
+- `@deepseek-ai/dsh-settings` 的 `describe()` 只投影 `volatileForm(schema)` 非空的 profile entry，且支持嵌套 object 内的 volatile 叶子，因此 `turnContinuation.reminderIntervalNodes` 能成为唯一表单字段；`plainConfig()` 递归解包 volatile，客户端拿到的已是普通数字。写入走 `@deepseek-ai/dsh-config-editor`，按 revision 做冲突检测并原子改写当前 profile 的 `cordis.patch.yml`。
+- `.volatile()` 会把校验结果包成 cosmokit 的 `Volatile<T>`，官方插件（如 agent-loop 的 `maxParallelToolCalls`）同样以 `.get()` 消费，故 host 侧类型与读取方式与上游一致。
+- 已安装的 Web 客户端没有 `autoGenerate` 消费方，因此第三方插件必须自带浏览器半边。`plugins.item` 由官方设置页按 namespace 逐个占用（一个 companion 包对应一个 host namespace），本包正是 `turn-memory` namespace 的 companion；`dsh-client-ui-renderer/client` 提供 `ctx.slots` 的 Context 增补，`dsh-client-ui-settings/client` 提供 `ctx.configForms` 增补，`PropsLocale` 由注册时的 `locale: NS` 注入 `t`。
+- item 的 `id` 必须等于 settings namespace：页面 owner 以 `configForms.get(item.id)` 取 form，`describe()` 中没有同名 namespace 时传给槽位的 `form` 为 undefined，这就是卡片与表单同时出现的前提。
+- 行级配置页不可达：host `listBundles()` 只枚举 profile 声明的 bundles、声明了 `dsh.bundle.patch` 的清单、install anchor 与官方 catalog；仅作为 profile 依赖（`link:`）且无 bundle 声明的包被静默跳过，因此「已安装插件」里没有它的 bundle 详情页，也就没有 row 可挂 `plugins.row.config`。补一个 `dsh.bundle` 清单虽然能被列出，但 profile 已经 `insert` 了同一 row id，会造成重复行，故不采用。
+- `SettingsFormModel` 的字段名只对应 section 顶层 key，无法表达嵌套路径 `turnContinuation.reminderIntervalNodes`；`plugins.item` 的契约也明确自定义页自行持有 draft 与校验展示，因此页面用 `SettingsForm` + `SettingsValueField` 自己管理文本、dirty 与 invalid。
+
+### 已知边界
+
+- 保存会让插件 fiber 重启，`latestAnnouncedMilestone`、后台 jobs 等内存态随之重置；应在两次压缩轮次之间修改。
+- 其余配置项仍只能改配置文件；客户端不内联默认值 30，字段为空即表示继承，避免 schema 默认值在两处漂移。

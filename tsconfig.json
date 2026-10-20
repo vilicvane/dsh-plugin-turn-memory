@@ -3,7 +3,7 @@
     "target": "es2023",
     "module": "nodenext",
     "moduleResolution": "nodenext",
-    "lib": ["es2023"],
+    "lib": ["es2023", "dom", "dom.iterable"],
     "strict": true,
     "noImplicitAny": false,
     "noEmit": true,
@@ -11,7 +11,7 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": ["node", "react"]
   },
-  "include": ["index.ts", "lib/**/*.ts", "test/**/*.ts", "e2e/**/*.ts"]
+  "include": ["index.ts", "client/**/*.ts", "lib/**/*.ts", "test/**/*.ts", "e2e/**/*.ts"]
 }

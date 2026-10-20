@@ -1,3 +1,4 @@
+import type { Volatile } from '@deepseek-ai/cosmokit';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { deriveEventMessage } from '@deepseek-ai/dsh-session';
 import { defineTool } from '@deepseek-ai/dsh-tools';
@@ -10,9 +11,12 @@ export const TURN_CONTINUATION_TOOL_NAME = 'continue_after_turn_compression';
 
 const CONTINUATION_CONTEXT_NAME = 'turn-memory:long-turn-continuation';
 
+export const DEFAULT_REMINDER_INTERVAL_NODES = 30;
+
 export interface TurnContinuationConfig {
   enabled?: boolean;
-  reminderIntervalNodes?: number;
+  /** Plain number in Cordis YAML; the live settings form writes a volatile wrapper. */
+  reminderIntervalNodes?: number | Volatile<number>;
 }
 
 export interface TurnContinuationRequest {
@@ -213,18 +217,17 @@ export function buildTurnContinuationMessage(request: TurnContinuationRequest): 
 }
 
 export class TurnContinuationController {
-  readonly reminderIntervalNodes: number;
   private readonly ctx: any;
+  private readonly reminderInterval: number | Volatile<number>;
   private readonly warnedMeasurements = new WeakSet<object>();
   private readonly warnedContextMeasurements = new WeakSet<object>();
 
   constructor(ctx: any, config: TurnContinuationConfig = {}) {
-    const reminderIntervalNodes = config.reminderIntervalNodes ?? 30;
-    if (!Number.isSafeInteger(reminderIntervalNodes) || reminderIntervalNodes <= 0) {
+    this.ctx = ctx;
+    this.reminderInterval = config.reminderIntervalNodes ?? DEFAULT_REMINDER_INTERVAL_NODES;
+    if (!Number.isSafeInteger(this.reminderIntervalNodes) || this.reminderIntervalNodes <= 0) {
       throw new Error('turn continuation reminderIntervalNodes must be a positive safe integer');
     }
-    this.ctx = ctx;
-    this.reminderIntervalNodes = reminderIntervalNodes;
     ctx.tools.register(defineTool({
       name: TURN_CONTINUATION_TOOL_NAME,
       description: 'Call when the active Turn Memory continuation notice requires a handoff. Record completed work, current state, and exact next work; this ends the current turn, then the host compresses it and continues automatically in a new turn.',
@@ -266,6 +269,13 @@ export class TurnContinuationController {
       order: 160,
       text: (assembly: any) => this.contextFor(assembly.agent),
     });
+  }
+
+  /** A settings-form write swaps the wrapped value, so every read takes the current one. */
+  private get reminderIntervalNodes(): number {
+    return typeof this.reminderInterval === 'number'
+      ? this.reminderInterval
+      : this.reminderInterval.get();
   }
 
   contextFor(agent: any): string {

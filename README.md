@@ -152,6 +152,39 @@ The main tool catalog also exposes `read_session_history` by default. With no `t
 
 Provider-confirmed context overflow has a fixed one-shot recovery policy: compact once and replay the failed main-model request only after a durable surface replacement was committed. If that replay also overflows, the provider error is preserved rather than starting another compaction loop. This is independent of `sessionCompaction.compactionRetries`, which controls additional successful pressure compactions when one checkpoint still leaves the session above the configured threshold.
 
+### Configuring the threshold from the Web UI
+
+`turnContinuation.reminderIntervalNodes` is the plugin's only volatile field, so
+it is the only setting the Web UI can edit live. Every other key above still
+requires the profile's `cordis.patch.yml`.
+
+Open **Plugins** in the sidebar and pick the **Turn Memory** card under the
+built-in plugin settings. Change the number and press **Save**; leaving the
+field empty (or pressing its reset control) inherits the default of `30`.
+
+The card is a browser-half contribution of this package, not an entry in the
+bundle list: a plugin that is only a profile dependency (no `dsh.bundle` patch)
+never shows up under installed bundles, so it has no row and no row-level
+configure page.
+
+Saving writes the row's `config` in the active profile's `cordis.patch.yml`
+(`$DSH_HOME/profiles/web/cordis.patch.yml` for the Web profile) under a revision
+guard: a concurrent edit elsewhere is reported instead of being overwritten.
+The equivalent file edit is:
+
+```yaml
+- id: turn-memory
+  name: dsh-plugin-turn-memory
+  config:
+    # ... the profile's existing keys ...
+    turnContinuation:
+      reminderIntervalNodes: 40
+```
+
+A save restarts the plugin's fiber, so in-memory state such as the milestones
+already announced in the current turn and any queued follow-up is reset. Change
+the interval between compression rounds rather than during one.
+
 ## Verification workflow
 
 Run the fast deterministic checks after every edit:

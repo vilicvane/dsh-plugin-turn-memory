@@ -3,7 +3,11 @@ import { describe, test } from 'node:test';
 
 import { measureSessionForCompaction } from '../lib/session-compaction.ts';
 
-function replacementEvent(seq: number, surfaceOp: any = { op: 'replace', startSeq: 0, endSeq: 0 }): any {
+function replacementEvent(
+  seq: number,
+  surfaceOp: any = { op: 'replace', startSeq: 0, endSeq: 0 },
+  source: any = { kind: 'plugin', plugin: 'turn-memory', phase: 'compression', turn: 1 },
+): any {
   const event: any = {
     type: 'assistant/message',
     seq,
@@ -16,7 +20,7 @@ function replacementEvent(seq: number, surfaceOp: any = { op: 'replace', startSe
         source: { kind: 'model', provider: 'test', model: 'test' },
         content: [{ type: 'text', text: 'compressed assistant memory' }],
       },
-      source: { kind: 'plugin', plugin: 'turn-memory', phase: 'compression', turn: 1 },
+      source,
     },
     surfaceOp,
   };
@@ -48,6 +52,32 @@ describe('measureSessionForCompaction', () => {
 
   test('reprices the canonical surface after an appended turn-memory assistant landing', () => {
     const event = replacementEvent(2, 'append');
+    const session = {
+      snapshotEvents(): readonly any[] { return this.events; }, eventAt(seq: number): any { return this.events[seq]; },
+      events: [undefined, undefined, event],
+      surface: { nodes: [2] },
+      requestHeader: () => ({ system: 'system', tools: [] }),
+    };
+    const meter = {
+      measure: () => { throw new Error('token meter: assistant/message at seq 2 has no matching step/start event'); },
+      estimateMessage: (message: any) => message.content[0].text.length + 4,
+    };
+
+    const result = measureSessionForCompaction(meter, session);
+
+    assert.equal(result.fallbackSeq, 2);
+    assert.deepEqual(result.measurement.nodes, [{ seq: 2, tokens: 31 }]);
+  });
+
+  test('reprices a DSH 0.2.1 kind-based compression landing', () => {
+    const event = replacementEvent(2, { op: 'append', startSeq: 1, endSeq: 1 }, {
+      kind: 'turn-memory-compression',
+      turn: 1,
+      draftId: 'draft',
+      originalNodes: 3,
+      mutations: 1,
+      workerAttempts: 1,
+    });
     const session = {
       snapshotEvents(): readonly any[] { return this.events; }, eventAt(seq: number): any { return this.events[seq]; },
       events: [undefined, undefined, event],

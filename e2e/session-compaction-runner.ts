@@ -6,8 +6,6 @@ import { resolve } from 'node:path';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { foldSurface } from '@deepseek-ai/dsh-session';
 
-import { compressionTurnSource } from '../lib/message-source.ts';
-
 const name = 'turn-memory-session-compaction-e2e-runner';
 const inject = ['agentDefaultModel', 'agentPresets', 'agents', 'compaction', 'sessionQuery', 'sessions', 'tokenMeter'];
 
@@ -30,32 +28,6 @@ async function completedTurn(agent: any, text: string): Promise<void> {
   await agent.whenIdle();
 }
 
-function appendPostTurnAssistantReplacement(session: any): number {
-  // DSH 0.1.5 forbids assistant/message from citing source events and from
-  // being the landing node of a surface replace, so the fixture appends a copy
-  // of the last assistant node instead. Copying the *last* assistant keeps the
-  // marker in the same surface unit as the retained tail turn (`data.source.turn`
-  // drives the unit key), so manual compaction still stops before that turn.
-  const lastAssistantSeq = [...session.surface.nodes].reverse()
-    .find((seq: number) => session.snapshotEvents()[seq]?.type === 'assistant/message');
-  assert.notEqual(lastAssistantSeq, undefined, 'compatibility fixture needs an assistant surface node');
-  const original = session.snapshotEvents()[lastAssistantSeq!];
-  const replacement = session.append('assistant/message', {
-    turn: original.data.turn,
-    step: original.data.step,
-    message: { ...original.data.message, id: randomUUID() },
-    stream: Array.isArray(original.data.stream) ? [...original.data.stream] : [],
-    source: compressionTurnSource({
-      turn: original.data.turn,
-      draftId: randomUUID(),
-      originalNodes: 1,
-      mutations: 1,
-      workerAttempts: 0,
-    }),
-  }, { surfaceOp: 'append' });
-  return replacement.seq;
-}
-
 function assertCompacted(session: any, result: any, phase: string): any {
   assert.deepEqual(foldSurface(session.snapshotEvents()).nodes, [...session.surface.nodes], phase + ': live surface differs from replay fold');
   const start = session.snapshotEvents()[result.startSeq];
@@ -66,7 +38,7 @@ function assertCompacted(session: any, result: any, phase: string): any {
   assert.equal(summary.type, 'compaction/summary', phase + ': missing summary event');
   assert.equal(replacement.type, 'user/message', phase + ': summary must be immediately followed by checkpoint replacement');
   assert.equal(end.type, 'compaction/end', phase + ': missing end marker');
-  assert.equal(replacement.data.source.plugin, 'compact', phase + ': checkpoint provenance is not standard compact source');
+  assert.equal(replacement.data.source.kind, 'compact-checkpoint', phase + ': checkpoint provenance is not standard compact source');
   assert.equal(replacement.data.source.compactionId, result.compactionId, phase + ': checkpoint compaction id mismatch');
   assert.deepEqual(replacement.sourceEventSeqs.slice(-result.shadowedSeqs.length), result.shadowedSeqs, phase + ': replacement lost exact shadowed provenance');
   const checkpoint = textOf(replacement);
@@ -101,7 +73,12 @@ async function run(ctx: any): Promise<void> {
       current: { ...selection },
       assembled: undefined,
     });
-    agentCtx.tools.restrict({ allow: [] });
+    // Leave eager tools in the parent history that the worker also presents: a fork
+    // worker inherits the parent's tool declarations, and DSH 0.2.1 declares tools
+    // added mid-history as deferred. With an empty parent catalog every worker tool
+    // would be deferred, which the provider rejects ("at least one tool must have
+    // defer_loading=false"). read_memory_image is shared by both catalogs.
+    agentCtx.tools.restrict({ allow: ['read_memory_image', 'read_session_history'] });
   };
 
   let liveHandle: any;
@@ -123,12 +100,10 @@ async function run(ctx: any): Promise<void> {
     await completedTurn(agent, GAMMA + ': This third turn must remain verbatim in the retained tail and must not be copied into the checkpoint.\n'
       + repetitive + '\nReply exactly: gamma recorded.');
 
-    const replacementSeq = appendPostTurnAssistantReplacement(agent.session);
-    assert.throws(
-      () => tokenMeter.measure(agent.session),
-      new RegExp('assistant/message at seq ' + replacementSeq + ' has no matching step/start event'),
-      'fixture no longer reproduces the upstream token-meter incompatibility',
-    );
+    // DSH 0.2.1 accepts a post-turn assistant append live but its v3->v4 loader
+    // rejects that shape on reload, so the fixture cannot be persisted end to end.
+    // measureSessionForCompaction()' cover for that shape lives in
+    // test/session-measurement.test.ts instead.
 
     const result = await compaction.compactNow(agent, new AbortController().signal);
     assert.notEqual(result, null, 'manual session compaction unexpectedly found no range');

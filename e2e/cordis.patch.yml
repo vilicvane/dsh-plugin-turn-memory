@@ -1,12 +1,8 @@
 # Overlay for the dedicated ~/.dsh/profiles/test-turn-memory profile.
+# Credentials and agent presets live in the shared profile.patch.yml overlay.
 - insert:
     - id: subagent-model-selection-settings
       name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings'
-    - id: agent-presets
-      name: '@deepseek-ai/dsh-agent-presets'
-      config:
-        default: minimal
-        includeUserRoot: false
 
 - id: turn-memory
   config:

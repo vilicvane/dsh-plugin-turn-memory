@@ -61,11 +61,51 @@ function textOf(event: any): string {
   return chunks.join('\n');
 }
 
+interface MemorySection {
+  role: 'user' | 'assistant' | 'tool';
+  text: string;
+}
+
+const SECTION_LABEL = /^(User|Assistant|Tool result):[ \t]*/gm;
+
+/**
+ * DSH 0.2.1 lands a compressed turn that changed assistant or tool nodes as a single
+ * user/message checkpoint whose body concatenates `User:`/`Assistant:`/`Tool result:`
+ * sections (turn-memory/lib/landing.ts), so scenarios assert on those sections rather
+ * than on surface node types.
+ */
+function memorySections(nodes: readonly any[]): MemorySection[] {
+  const sections: MemorySection[] = [];
+  for (const node of nodes) {
+    const text = textOf(node);
+    const surfaceRole: MemorySection['role'] | undefined = node.type === 'assistant/message'
+      ? 'assistant'
+      : node.type === 'tool/result' ? 'tool' : undefined;
+    if (surfaceRole !== undefined) {
+      sections.push({ role: surfaceRole, text });
+      continue;
+    }
+    const labels = [...text.matchAll(SECTION_LABEL)];
+    if (labels.length === 0) {
+      sections.push({ role: 'user', text });
+      continue;
+    }
+    const leading = text.slice(0, labels[0].index).trim();
+    if (leading.length > 0) sections.push({ role: 'user', text: leading });
+    labels.forEach((label, index) => {
+      const start = (label.index ?? 0) + label[0].length;
+      const end = index + 1 < labels.length ? labels[index + 1].index ?? text.length : text.length;
+      const role: MemorySection['role'] = label[1] === 'User' ? 'user' : label[1] === 'Assistant' ? 'assistant' : 'tool';
+      sections.push({ role, text: text.slice(start, end).trim() });
+    });
+  }
+  return sections.filter((section) => section.text.length > 0);
+}
+
 function compressionNodes(session: any): any[] {
   return session.surface.nodes
     .map((seq: number) => session.snapshotEvents()[seq])
-    .filter((event: any) => event?.data?.source?.plugin === 'turn-memory'
-      && event.data.source.phase === 'compression');
+    .filter((event: any) => event?.data?.source?.kind === 'turn-memory-compression');
 }
 
 async function waitForCompression(session: any, timeoutMs: number): Promise<any[]> {
@@ -88,7 +128,7 @@ function fixtureTurn(session: any): FixtureTurn {
   const original = session.snapshotEvents().filter((event: any) => event?.seq > start.seq
     && event.seq <= end.seq
     && surfaceTypes.has(event.type)
-    && event.surfaceOp === 'append');
+    && (event.surfaceOp === 'append' || event.surfaceOp?.op === 'append'));
   const originalSeqs = original.map((event: any) => event.seq);
   const originalUserSeqs = original
     .filter((event: any) => event.type === 'user/message' && event.data?.source?.kind === 'user')
@@ -97,7 +137,7 @@ function fixtureTurn(session: any): FixtureTurn {
   const currentNodes = session.surface.nodes
     .map((seq: number) => session.snapshotEvents()[seq])
     .filter((event: any) => originalSet.has(event.seq)
-      || (event?.data?.source?.plugin === 'turn-memory' && event.data.source.turn === end.data.turn));
+      || (event?.data?.source?.kind === 'turn-memory-compression' && event.data.source.turn === end.data.turn));
   return { originalSeqs, originalUserSeqs, currentNodes };
 }
 
@@ -121,20 +161,26 @@ function assertCommonCompression(
     fixture.currentNodes.length < fixture.originalSeqs.length,
     `${phase}: production prompt did not shorten the turn (${fixture.originalSeqs.length}->${fixture.currentNodes.length})`,
   );
+  assert.ok(fixture.currentNodes.length >= 1, `${phase}: compression produced no surface node`);
   assert.equal(fixture.currentNodes.at(0)?.type, 'user/message', `${phase}: compact surface must start with user`);
-  assert.equal(fixture.currentNodes.at(-1)?.type, 'assistant/message', `${phase}: compact surface must end with assistant`);
-  assert.ok(fixture.currentNodes.every((node) => textOf(node).trim().length > 0), `${phase}: compact surface has an empty node`);
-  // 0.1.5 forbids assistant/message as a surface replacement target, so the compressed
-  // turn lands as a whole-range user replacement followed by appended outputs.
-  assert.equal(compressed[0]?.surfaceOp?.op, 'replace', `${phase}: compressed range must start with a positional replacement`);
-  assert.equal(compressed.at(-1)?.surfaceOp, 'append', `${phase}: assistant output must be appended, not replaced`);
-  assert.equal(compressed.at(-1)?.sourceEventSeqs, undefined, `${phase}: append-origin assistant output must not cite source events`);
+  assert.ok(
+    fixture.currentNodes.every((node) => textOf(node).trim().length > 0),
+    `${phase}: compact surface has an empty node`,
+  );
+  assert.ok(
+    memorySections(fixture.currentNodes).some((section) => section.role !== 'user'),
+    `${phase}: compact surface retained no assistant or tool work`,
+  );
   for (const node of compressed) {
-    assert.equal(
-      node.data.source.originalNodes,
-      fixture.originalSeqs.length,
-      `${phase}: replacement marker has the wrong original node count`,
+    const op = node.surfaceOp?.op ?? node.surfaceOp;
+    assert.ok(op === 'replace' || op === 'append', `${phase}: compressed node must land as a replacement or append`);
+    assert.ok(
+      Number.isSafeInteger(node.data.source?.originalNodes) && node.data.source.originalNodes >= 1,
+      `${phase}: replacement marker has no original node count`,
     );
+    if (op === 'replace') {
+      assert.ok((node.sourceEventSeqs ?? []).length > 0, `${phase}: replacement must cite its shadowed provenance`);
+    }
   }
   return fixture;
 }
@@ -142,19 +188,19 @@ function assertCommonCompression(
 function assertTypoCorrection(session: any, compressed: any[], phase: string): FixtureTurn {
   const fixture = assertCommonCompression(session, compressed, phase, 6);
   assert.equal(fixture.originalUserSeqs.length, 2, `${phase}: fixture must contain initial request and correction`);
-  const userNodes = fixture.currentNodes.filter((node) => node.type === 'user/message');
-  assert.equal(userNodes.length, 1, `${phase}: typo correction must become one corrected user intent`);
-  assert.equal(userNodes[0].surfaceOp?.op, 'replace', `${phase}: corrected user intent must be a replacement`);
+  const sections = memorySections(fixture.currentNodes);
+  const users = sections.filter((section) => section.role === 'user');
+  assert.equal(users.length, 1, `${phase}: typo correction must become one corrected user intent`);
   for (const sourceSeq of fixture.originalUserSeqs) {
     assert.ok(
-      userNodes[0].sourceEventSeqs.includes(sourceSeq),
+      fixture.currentNodes.some((node) => (node.sourceEventSeqs ?? []).includes(sourceSeq)),
       `${phase}: corrected user intent omitted provenance ${sourceSeq}`,
     );
   }
-  const user = textOf(userNodes[0]).toLowerCase();
-  const retainedWork = fixture.currentNodes
-    .filter((node) => node.type !== 'user/message')
-    .map(textOf)
+  const user = users[0].text.toLowerCase();
+  const retainedWork = sections
+    .filter((section) => section.role !== 'user')
+    .map((section) => section.text)
     .join('\n')
     .toLowerCase();
   assert.match(user, /home/, `${phase}: corrected intent lost home`);
@@ -169,24 +215,25 @@ function assertTypoCorrection(session: any, compressed: any[], phase: string): F
 function assertGoalChange(session: any, compressed: any[], phase: string): FixtureTurn {
   const fixture = assertCommonCompression(session, compressed, phase, 7);
   assert.equal(fixture.originalUserSeqs.length, 2, `${phase}: fixture must contain initial and changed objectives`);
-  const userIndexes = fixture.currentNodes
-    .map((node, index) => node.type === 'user/message' ? index : -1)
+  const sections = memorySections(fixture.currentNodes);
+  const userIndexes = sections
+    .map((section, index) => section.role === 'user' ? index : -1)
     .filter((index) => index >= 0);
   assert.equal(userIndexes.length, 2, `${phase}: evidence-driven goal change must retain two user nodes`);
-  const firstUser = textOf(fixture.currentNodes[userIndexes[0]]).toLowerCase();
-  const secondUser = textOf(fixture.currentNodes[userIndexes[1]]).toLowerCase();
+  const firstUser = sections[userIndexes[0]].text.toLowerCase();
+  const secondUser = sections[userIndexes[1]].text.toLowerCase();
   assert.match(firstUser, /alpha/, `${phase}: original alpha objective was lost`);
   assert.match(secondUser, /beta/, `${phase}: changed beta objective was lost`);
   assert.match(secondUser, /决定|decision|change|switch|改/, `${phase}: second user node lost decision semantics`);
-  const beforeDecision = fixture.currentNodes
+  const beforeDecision = sections
     .slice(userIndexes[0] + 1, userIndexes[1])
-    .filter((node) => node.type !== 'user/message')
-    .map(textOf)
+    .filter((section) => section.role !== 'user')
+    .map((section) => section.text)
     .join('\n');
-  const afterDecision = fixture.currentNodes
+  const afterDecision = sections
     .slice(userIndexes[1] + 1)
-    .filter((node) => node.type !== 'user/message')
-    .map(textOf)
+    .filter((section) => section.role !== 'user')
+    .map((section) => section.text)
     .join('\n');
   assert.match(beforeDecision, /ALPHA-BLOCKED-41/, `${phase}: alpha evidence must precede the decision boundary`);
   assert.match(afterDecision, /BETA-READY-73/, `${phase}: beta result must follow the decision boundary`);
@@ -196,11 +243,12 @@ function assertGoalChange(session: any, compressed: any[], phase: string): Fixtu
 
 function assertImplementationDetail(session: any, compressed: any[], phase: string): FixtureTurn {
   const fixture = assertCommonCompression(session, compressed, phase, 6);
-  const userNodes = fixture.currentNodes.filter((node) => node.type === 'user/message');
-  assert.equal(userNodes.length, 1, `${phase}: implementation scenario must retain one user objective`);
-  const assistant = fixture.currentNodes
-    .filter((node) => node.type !== 'user/message')
-    .map(textOf)
+  const sections = memorySections(fixture.currentNodes);
+  const users = sections.filter((section) => section.role === 'user');
+  assert.equal(users.length, 1, `${phase}: implementation scenario must retain one user objective`);
+  const assistant = sections
+    .filter((section) => section.role !== 'user')
+    .map((section) => section.text)
     .join('\n');
   const required: Array<{ label: string; patterns: RegExp[] }> = [
     { label: 'implementation target lib/cobalt.ts', patterns: [/lib\/cobalt\.ts/i] },
@@ -249,7 +297,10 @@ function setupScenario(agentCtx: any, selection: any, scenario: Scenario, runtim
     current: { ...selection },
     assembled: undefined,
   });
-  agentCtx.tools.restrict({ allow: [] });
+  // Keep one eager tool that the compression worker also presents: a fork worker
+  // inherits the parent's declarations, and DSH 0.2.1 declares mid-history tool
+  // additions as deferred, which the provider rejects when nothing stays eager.
+  agentCtx.tools.restrict({ allow: ['read_memory_image'] });
   if (scenario === 'typo_correction') {
     agentCtx.tools.register(defineTool({
       name: 'inspect_home_fixture',

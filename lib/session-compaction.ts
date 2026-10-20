@@ -32,7 +32,7 @@ import { WorkerToolScope } from './worker-tools.ts';
 import { startWorker } from './subagent-activation.ts';
 import { assertMemoryImagesRetained } from './memory-images.ts';
 import { isUserConversationSession } from './session-kind.ts';
-import { isCompactionCheckpointSource, turnMemoryMarkerTurn } from './message-source.ts';
+import { isCompactionCheckpointSource, turnMemoryMarkerOf, turnMemoryMarkerTurn } from './message-source.ts';
 
 export const SESSION_TOOL_NAMES = [
   'list_session_segments',
@@ -188,12 +188,15 @@ function replacementAssistantSeq(error: unknown, session: any): number | undefin
   // compressed assistant landing is appended at the surface tail instead of
   // replacing its source nodes. Accept both the legacy replace form and the
   // append form; the phase check keeps the fallback scoped to compression
-  // markers (pending/continuation markers are user messages).
-  const landed = event?.surfaceOp === 'append' || event.surfaceOp?.op === 'replace';
+  // markers (pending/continuation markers are user messages). Provenance is
+  // read through the cross-generation helper so 0.2.1's kind-based source is
+  // recognized as well as the legacy plugin/phase form.
+  const landed = event?.surfaceOp === 'append'
+    || event?.surfaceOp?.op === 'append'
+    || event?.surfaceOp?.op === 'replace';
   if (event?.type !== 'assistant/message'
     || !landed
-    || event.data?.source?.plugin !== 'turn-memory'
-    || event.data?.source?.phase !== 'compression') return undefined;
+    || turnMemoryMarkerOf(event?.data?.source)?.phase !== 'compression') return undefined;
   return seq;
 }
 
@@ -291,6 +294,19 @@ function belongsToOpenTurn(event: any, openTurn: number, openTurnStart: number):
   return event?.type === 'user/message' && event.seq > openTurnStart;
 }
 
+/**
+ * DSH 0.2.1 keeps the request system prompt in surface slot 0 and rejects any
+ * surface replacement that shadows it unless the replacement is a system/message
+ * over exactly that node. Compaction therefore starts after that protected head:
+ * the node itself is never rewritten, while the compacted range still begins at a
+ * completed-turn boundary.
+ */
+function protectedSurfaceHeadLength(session: any): number {
+  const events = session.snapshotEvents();
+  const nodes = session.surface.nodes as readonly number[];
+  return nodes.length > 0 && events[nodes[0]]?.type === 'system/message' ? 1 : 0;
+}
+
 function completedPrefixLength(session: any): number {
   const state = inspectEntryState(session.snapshotEvents());
   if (state.openTurn === null || state.openTurnStart === undefined) return session.surface.nodes.length;
@@ -324,9 +340,10 @@ export function selectSessionCompactionRange(
     if (balanced && unitBoundary) break;
     endExclusive -= 1;
   }
-  if (endExclusive <= 0) return null;
-  if (!toolPairingBalancedBefore(session, SessionSeq(surface[0]))) throw new Error('session compaction: surface head is not tool-pairing balanced');
-  return { start: surface[0], end: surface[endExclusive - 1] };
+  const head = protectedSurfaceHeadLength(session);
+  if (endExclusive <= head) return null;
+  if (!toolPairingBalancedBefore(session, SessionSeq(surface[head]))) throw new Error('session compaction: surface head is not tool-pairing balanced');
+  return { start: surface[head], end: surface[endExclusive - 1] };
 }
 
 function validateSurfaceRegion(session: any, start: number, end: number): SurfaceSelection {
@@ -339,7 +356,7 @@ function validateSurfaceRegion(session: any, start: number, end: number): Surfac
   if (!toolPairingBalancedBefore(session, SessionSeq(start))) throw new Error('session compactRegion: start boundary splits a tool pair');
   if (!toolPairingBalancedAfter(session, SessionSeq(end))) throw new Error('session compactRegion: end boundary splits a tool pair');
   const unitKeys = sessionSurfaceUnitKeys(session, nodes);
-  if (startIndex > 0 && unitKeys[startIndex - 1] === unitKeys[startIndex]) {
+  if (startIndex > protectedSurfaceHeadLength(session) && unitKeys[startIndex - 1] === unitKeys[startIndex]) {
     throw new Error('session compactRegion: start boundary splits a completed turn');
   }
   if (endIndex + 1 < nodes.length && unitKeys[endIndex] === unitKeys[endIndex + 1]) {

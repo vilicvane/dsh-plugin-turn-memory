@@ -34,7 +34,7 @@ function textOf(event: any): string {
 function compressionNodes(session: any): any[] {
   return session.surface.nodes
     .map((seq: number) => session.snapshotEvents()[seq])
-    .filter((event: any) => event?.data?.source?.plugin === 'turn-memory' && event.data.source.phase === 'compression');
+    .filter((event: any) => event?.data?.source?.kind === 'turn-memory-compression');
 }
 
 async function waitForCompression(session: any, timeoutMs: number): Promise<any[]> {
@@ -56,7 +56,7 @@ function fixtureTurn(session: any): { originalSeqs: number[]; originalUserSeqs: 
   const original = session.snapshotEvents().filter((event: any) => event?.seq > start.seq
     && event.seq <= end.seq
     && surfaceTypes.has(event.type)
-    && event.surfaceOp === 'append');
+    && (event.surfaceOp === 'append' || event.surfaceOp?.op === 'append'));
   const originalSeqs = original.map((event: any) => event.seq);
   const originalUserSeqs = original
     .filter((event: any) => event.type === 'user/message' && event.data?.source?.kind === 'user')
@@ -65,7 +65,7 @@ function fixtureTurn(session: any): { originalSeqs: number[]; originalUserSeqs: 
   const currentNodes = session.surface.nodes
     .map((seq: number) => session.snapshotEvents()[seq])
     .filter((event: any) => originalSet.has(event.seq)
-      || (event?.data?.source?.plugin === 'turn-memory' && event.data.source.turn === end.data.turn));
+      || (event?.data?.source?.kind === 'turn-memory-compression' && event.data.source.turn === end.data.turn));
   return { originalSeqs, originalUserSeqs, currentNodes };
 }
 
@@ -83,17 +83,24 @@ function assertPromptCompression(session: any, nodes: any[], phase: string): voi
     assert.ok(userNodes[0].sourceEventSeqs.includes(sourceSeq), phase + ': corrected user intent provenance omitted user source ' + sourceSeq);
   }
 
-  // 0.1.5 forbids assistant/message as a surface replacement target, so the compressed
-  // turn lands as a whole-range user replacement followed by appended outputs.
-  assert.equal(nodes[0].surfaceOp?.op, 'replace', phase + ': compressed range must start with a positional replacement');
-  assert.equal(nodes.at(-1)?.surfaceOp, 'append', phase + ': assistant output must be appended, not replaced');
-  assert.equal(nodes.at(-1)?.sourceEventSeqs, undefined, phase + ': append-origin assistant output must not cite source events');
-  for (const node of nodes) {
-    assert.equal(node.data.source.originalNodes, fixture.originalSeqs.length, phase + ': replacement marker has the wrong original node count');
-  }
+  // DSH 0.2.1 lands a compressed turn that carries assistant or tool nodes as one plain
+  // user/message checkpoint shadowing the whole range (turn-memory/lib/landing.ts), so the
+  // compressed turn occupies exactly one replacement node.
+  assert.equal(nodes.length, 1, phase + ': compressed turn must land as one checkpoint node');
+  const checkpoint = nodes[0];
+  assert.equal(checkpoint.type, 'user/message', phase + ': checkpoint must be a user message');
+  assert.equal(checkpoint.surfaceOp?.op, 'replace', phase + ': checkpoint must replace the superseded range');
+  assert.equal(checkpoint.data.source.originalNodes, fixture.originalSeqs.length,
+    phase + ': replacement marker has the wrong original node count');
+  const provenance: number[] = checkpoint.sourceEventSeqs ?? [];
+  assert.ok(provenance.length >= checkpoint.data.source.originalNodes,
+    phase + ': checkpoint provenance must cover every shadowed node');
+  assert.equal(new Set(provenance).size, provenance.length, phase + ': checkpoint provenance must not repeat a source event');
 
   const user = textOf(userNodes[0]).toLowerCase();
-  const retainedWork = fixture.currentNodes.filter((node) => node.type !== 'user/message').map(textOf).join('\n').toLowerCase();
+  // The whole-range checkpoint is a user message, so its text is the only place the
+  // compressed turn's retained work can live.
+  const retainedWork = fixture.currentNodes.map(textOf).join('\n').toLowerCase();
   assert.match(user, /home/, phase + ': consolidated user intent lost home');
   assert.match(user, /playground/, phase + ': consolidated user intent lost the steer');
   assert.match(retainedWork, /\/repo/, phase + ': compression erased the failed detour');
@@ -120,7 +127,10 @@ async function run(ctx: any): Promise<void> {
       current: { ...selection },
       assembled: undefined,
     });
-    agentCtx.tools.restrict({ allow: [] });
+    // Keep one eager tool that the compression worker also presents: a fork worker
+    // inherits the parent's declarations, and DSH 0.2.1 declares mid-history tool
+    // additions as deferred, which the provider rejects when nothing stays eager.
+    agentCtx.tools.restrict({ allow: ['read_memory_image'] });
     agentCtx.tools.register(defineTool({
       name: 'inspect_home_fixture',
       description: 'Inspect the home-device declaration at the target named by the latest user message. Use /repo or playground exactly.',

@@ -1,10 +1,4 @@
-- insert:
-    - id: agent-presets
-      name: '@deepseek-ai/dsh-agent-presets'
-      config:
-        default: minimal
-        includeUserRoot: false
-
+# Credentials and agent presets live in the shared profile.patch.yml overlay.
 - id: compaction-basic
   disabled: true
 

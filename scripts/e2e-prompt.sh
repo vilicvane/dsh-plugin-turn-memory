@@ -36,6 +36,7 @@ DSH_TOOLS_MODE=native \
 TURN_MEMORY_E2E_ARTIFACT_DIR="$project_dir/.tmp" \
 timeout 540s "$dsh_bin" \
   --profile test-turn-memory \
+  --patch "$project_dir/e2e/profile.patch.yml" \
   --patch "$project_dir/e2e/prompt-eval.patch.yml" \
   "turn-memory production prompt evaluation" 2>&1 | tee "$log_file"
 status=${PIPESTATUS[0]}

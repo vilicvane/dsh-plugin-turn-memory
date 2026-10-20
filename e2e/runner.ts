@@ -43,7 +43,7 @@ function textOf(event: any): string {
 function compressionNodes(session: any): any[] {
   return session.surface.nodes
     .map((seq: number) => session.snapshotEvents()[seq])
-    .filter((event: any) => event?.data?.source?.plugin === 'turn-memory' && event.data.source.phase === 'compression');
+    .filter((event: any) => event?.data?.source?.kind === 'turn-memory-compression');
 }
 
 function assertInternalToolsHidden(session: any, phase: string): void {
@@ -54,13 +54,17 @@ function assertInternalToolsHidden(session: any, phase: string): void {
   for (const name of INTERNAL_TOOL_NAMES) {
     assert.ok(!visible.has(name), phase + ': internal worker tool leaked into the parent request header: ' + name);
   }
+  const continuationTool = (session.requestHeader()?.tools ?? [])
+    .find((tool: any) => tool.name === TURN_CONTINUATION_TOOL_NAME);
+  assert.deepEqual(continuationTool?.parameters, { type: 'object', properties: {} },
+    phase + ': the continuation request tool must be payload-free');
 }
 
 async function waitForCompression(session: any, timeoutMs: number): Promise<any[]> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const found = compressionNodes(session);
-    if (found.length === 2) return found;
+    if (found.length >= 1) return found;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error('timed out waiting for the turn-memory compression after ' + timeoutMs + 'ms');
@@ -71,8 +75,7 @@ async function waitForContinuation(session: any, timeoutMs: number): Promise<{ u
   while (Date.now() < deadline) {
     const user = session.snapshotEvents().find((event: any) =>
       event?.type === 'user/message'
-      && event.data?.source?.plugin === 'turn-memory'
-      && event.data.source.phase === 'continuation');
+      && event.data?.source?.kind === 'turn-memory-continuation');
     const assistant = user === undefined ? undefined : session.snapshotEvents().find((event: any) =>
       event?.type === 'assistant/message'
       && event.seq > user.seq
@@ -86,29 +89,27 @@ async function waitForContinuation(session: any, timeoutMs: number): Promise<{ u
 function assertProjection(session: any, nodes: any[], phase: string): void {
   const folded = foldSurface(session.snapshotEvents());
   assert.deepEqual(folded.nodes, [...session.surface.nodes], phase + ': live surface must equal full fold replay');
-  assert.equal(compressionNodes(session).length, 2, phase + ': expected exactly one compressed user-assistant exchange on surface');
-  assert.equal(nodes[0].type, 'user/message', phase + ': first compressed node must be a user message');
-  assert.equal(nodes[1].type, 'assistant/message', phase + ': second compressed node must be an assistant message');
-  // 0.1.5 forbids assistant/message as a surface replacement target, so the compressed
-  // turn lands as a whole-range user replacement followed by appended outputs.
-  assert.equal(nodes[0].surfaceOp?.op, 'replace', phase + ': compressed range must start with a positional replacement');
-  assert.equal(new Set(nodes[0].sourceEventSeqs).size, nodes[0].sourceEventSeqs.length,
+  // 0.2.1 lands a changed turn as one `user/message` checkpoint whenever any changed node
+  // is not a user node: the whole range is replaced by a single message whose text is the
+  // role-prefixed `User: … / Assistant: … / Tool result: …` collapse.
+  assert.equal(nodes.length, 1, phase + ': fixture turn must fold into a single checkpoint');
+  const checkpoint = nodes[0];
+  assert.equal(checkpoint.type, 'user/message', phase + ': compressed range must land as a user message');
+  assert.equal(checkpoint.surfaceOp?.op, 'replace', phase + ': compressed range must be a positional replacement');
+  assert.equal(new Set(checkpoint.sourceEventSeqs).size, checkpoint.sourceEventSeqs.length,
     phase + ': replacement source provenance must not contain duplicates');
-  assert.ok(nodes[0].sourceEventSeqs.length >= nodes[0].data.source.originalNodes,
-    phase + ': the head output must cite the complete joint semantic source range and its landing coverage');
-  assert.equal(nodes[1].surfaceOp, 'append', phase + ': the assistant output must be appended, not replaced');
-  assert.equal(nodes[1].sourceEventSeqs, undefined,
-    phase + ': append-origin assistant output must not cite source events (0.1.5 embeds its stream instead)');
-  for (const node of nodes) {
-    assert.ok(node.data.source.originalNodes >= 4, phase + ': fixture turn should exercise a four-node-or-larger joint rewrite');
-    assert.ok(node.data.source.mutations >= 2, phase + ': generated ids should have been edited again');
-    assert.equal(node.data.source.workerAttempts, 2,
-      phase + ': accepted progress should reset a one-attempt budget and allow a fresh-spawn recovery worker');
-    assert.ok(!textOf(node).includes(DRAFT_SENTINEL), phase + ': draft-pass sentinel leaked into final compression');
-  }
-  assert.ok(textOf(nodes[0]).includes(USER_SENTINEL), phase + ': initial user sentinel missing from compressed user node');
-  assert.ok(textOf(nodes[1]).includes(TOOL_SENTINEL), phase + ': tool-result sentinel missing from compressed assistant node');
-  assert.ok(textOf(nodes[1]).includes(FINAL_SENTINEL), phase + ': final assistant sentinel missing from compressed assistant node');
+  assert.ok(checkpoint.sourceEventSeqs.length >= checkpoint.data.source.originalNodes,
+    phase + ': the checkpoint must cite the complete joint semantic source range and its landing coverage');
+  assert.ok(checkpoint.data.source.originalNodes >= 4,
+    phase + ': fixture turn should exercise a four-node-or-larger joint rewrite');
+  assert.ok(checkpoint.data.source.mutations >= 2, phase + ': generated ids should have been edited again');
+  assert.equal(checkpoint.data.source.workerAttempts, 2,
+    phase + ': accepted progress should reset a one-attempt budget and allow a fresh-spawn recovery worker');
+  const checkpointText = textOf(checkpoint);
+  assert.ok(!checkpointText.includes(DRAFT_SENTINEL), phase + ': draft-pass sentinel leaked into final compression');
+  assert.ok(checkpointText.includes(USER_SENTINEL), phase + ': initial user sentinel missing from the checkpoint');
+  assert.ok(checkpointText.includes(TOOL_SENTINEL), phase + ': tool-result sentinel missing from the checkpoint');
+  assert.ok(checkpointText.includes(FINAL_SENTINEL), phase + ': final assistant sentinel missing from the checkpoint');
   const derivedText = session.deriveMessages().flatMap((message: any) => message.content ?? [])
     .filter((block: any) => block.type === 'text')
     .map((block: any) => block.text)
@@ -134,11 +135,18 @@ async function run(ctx: any): Promise<void> {
   const workerProviders: string[] = [];
   const disposeLifecycle = ctx.on('subagent/start', (info: any) => workerProviders.push(String(info.provider)));
   let fixtureCalls = 0;
-  const setup = async (agentCtx: any) => {
+  // The continuation notice is a runtime context. A scenario that does not exercise
+  // it must hide it, otherwise the model can request a handoff in the fixture turn and
+  // the host opens a follow-up turn whose compression legitimately changes the surface
+  // between the recovery and cold loads. The continuation scenario lifts the gate for
+  // the live turn that must hand off, then closes it again so the resumed turn finishes
+  // in one reply instead of chaining another handoff.
+  const runtimeContextGate = { enabled: true };
+  const createSetup = (contextNames: readonly string[]) => async (agentCtx: any) => {
     // rc.8's shipped minimal preset suppresses every runtime context, including
     // the continuation notice this scenario exercises. Use a runtime-enabled
     // shipped composition, then isolate the parent request to this fixture's
-    // persona, public tools, and the one context under test.
+    // persona, public tools, and the contexts under test.
     await agentPresets.mount(agentCtx, 'standard');
     agentCtx.systemPrompt.section({
       name: 'turn-memory:e2e-parent-persona',
@@ -150,7 +158,8 @@ async function run(ctx: any): Promise<void> {
       const assembled = await next();
       return {
         ...assembled,
-        contexts: assembled.contexts.filter((entry: any) => entry.name === CONTINUATION_CONTEXT_NAME),
+        contexts: assembled.contexts.filter((entry: any) =>
+          runtimeContextGate.enabled && contextNames.includes(entry.name)),
         tools: assembled.tools.filter((tool: any) => E2E_PARENT_TOOL_NAMES.has(tool.name)),
       };
     });
@@ -170,7 +179,8 @@ async function run(ctx: any): Promise<void> {
       },
     }));
   };
-
+  const setup = createSetup([]);
+  const continuationSetup = createSetup([CONTINUATION_CONTEXT_NAME]);
   let liveHandle: any;
   let recoveryHandle: any;
   let coldHandle: any;
@@ -227,9 +237,26 @@ async function run(ctx: any): Promise<void> {
     });
     await coldHandle.agent.whenIdle();
     const coldCompression = compressionNodes(coldHandle.agent.session);
-    assert.deepEqual(coldCompression.map((node) => node.seq), expectedCompressionSeqs,
-      'second cold load duplicated or changed recovered compression identities');
-    assertProjection(coldHandle.agent.session, coldCompression, 'cold');
+    const coldSeqs = coldCompression.map((node) => node.seq);
+    for (const seq of expectedCompressionSeqs) {
+      assert.ok(coldSeqs.includes(seq), 'second cold load dropped a recovered compression identity: ' + seq);
+    }
+    // A follow-up turn that the host opened after the recovered compression may itself be
+    // compressed before or during this load; that is new work, not a duplicated identity.
+    for (const node of coldCompression) {
+      const expected = compressed.find((entry) => entry.seq === node.seq);
+      if (expected === undefined) {
+        assert.ok(node.data.source.turn > compressed[0].data.source.turn,
+          'second cold load produced an unexpected earlier compression at seq ' + node.seq);
+        continue;
+      }
+      assert.equal(node.data.source.turn, expected.data.source.turn,
+        'second cold load changed a recovered compression turn at seq ' + node.seq);
+      assert.equal(node.data.source.originalNodes, expected.data.source.originalNodes,
+        'second cold load changed a recovered compression identity at seq ' + node.seq);
+    }
+    assertProjection(coldHandle.agent.session,
+      coldCompression.filter((node) => expectedCompressionSeqs.includes(node.seq)), 'cold');
     await sessions.flush(coldHandle.agent.session);
     const snapshot = await sessionQuery.readSurface(sessionId);
     const expectedSurfaceEvents = coldHandle.agent.session.surface.nodes
@@ -241,7 +268,7 @@ async function run(ctx: any): Promise<void> {
       sessionId: 'session-turn-memory-continuation-e2e-' + randomUUID(),
       meta: { cwd: process.cwd() },
       agentOptions: { provider: selection.provider, model: selection.model },
-      setup,
+      setup: continuationSetup,
     });
     await continuationLiveHandle.agent.whenIdle();
     continuationLiveHandle.agent.followup({
@@ -249,15 +276,24 @@ async function run(ctx: any): Promise<void> {
       role: 'user',
       content: [{
         type: 'text',
-        text: USER_SENTINEL + ': Call turn_memory_e2e_fixture exactly once. After it returns, the remaining work is: '
-          + FINAL_SENTINEL + ': reply with exactly ' + CONTINUATION_SENTINEL
-          + ' and do no other work. Follow any active Turn Memory continuation instruction before completing that remaining work.',
+        // The remaining work has to look genuinely long, otherwise the continuation notice's
+        // "finish in the next few actions" exemption lets the model skip the handoff call.
+        // The continued turn is the opposite case: the whole task finishes in one reply there,
+        // so the same exemption must stop it from handing off a second time.
+        text: USER_SENTINEL + ': Call turn_memory_e2e_fixture exactly once in this turn. Do not start the remaining'
+          + ' work here: it is a multi-step review that must run in the continued turn. End this turn by'
+          + ' calling continue_after_turn_compression exactly once, as the active Turn Memory continuation'
+          + ' instruction requires. In the continued turn the whole task finishes in a single reply: do not call'
+          + ' turn_memory_e2e_fixture again, do not hand off again, and reply with exactly ' + CONTINUATION_SENTINEL
+          + ': ' + FINAL_SENTINEL + '.',
       }],
       source: { kind: 'user' },
     });
     await continuationLiveHandle.agent.whenIdle();
     const continuationRequest = continuationRequestForTurn(continuationLiveHandle.agent.session, 1);
     assert.notEqual(continuationRequest, undefined, 'long live turn did not record a durable continuation request');
+    assert.equal(continuationRequest!.version, 2, 'continuation request must not carry model prose');
+    assert.ok(!('handoff' in continuationRequest!), 'continuation request must be payload-free');
     assert.equal(compressionNodes(continuationLiveHandle.agent.session).length, 0,
       'continuation fixture should defer live compression until recovery');
     const continuationSessionId = continuationLiveHandle.agent.session.id;
@@ -265,10 +301,14 @@ async function run(ctx: any): Promise<void> {
     await continuationLiveHandle.dispose();
     continuationLiveHandle = undefined;
 
+    // The durable request is already recorded, so the resumed turn no longer needs the
+    // notice; without it the model finishes the single remaining reply instead of asking
+    // for a second handoff (which the notice's milestone would otherwise invite).
+    runtimeContextGate.enabled = false;
     continuationRecoveryHandle = await agents.resume({
       resumeSessionId: continuationSessionId,
       agentOptions: { provider: selection.provider, model: selection.model },
-      setup,
+      setup: continuationSetup,
     });
     const continuationCompressed = await waitForCompression(continuationRecoveryHandle.agent.session, timeoutMs);
     assert.deepEqual(workerProviders, ['fork', 'spawn', 'fork', 'spawn'],
@@ -277,6 +317,11 @@ async function run(ctx: any): Promise<void> {
     const continued = await waitForContinuation(continuationRecoveryHandle.agent.session, timeoutMs);
     assert.match(textOf(continued.user), /not new human input/,
       'automatic follow-up did not disclose its plugin origin');
+    assert.equal(textOf(continued.user),
+      'Turn Memory automatic continuation after compressed turn ' + continuationRequest!.turn + '\n'
+      + 'This is host control context, not new human input.\n'
+      + 'Resume the unfinished work now from the compressed turn above.',
+      'automatic follow-up must be the fixed payload-free continuation message');
     assert.ok(continued.assistant.data.turn > continuationRequest!.turn,
       'automatic continuation did not open a later turn');
     await sessions.flush(continuationRecoveryHandle.agent.session);
@@ -289,7 +334,7 @@ async function run(ctx: any): Promise<void> {
     await mkdir(artifactDir, { recursive: true });
     await writeFile(surfacePath, JSON.stringify(snapshot, null, 2) + '\n', 'utf8');
     console.log('E2E_SESSION_ID=' + sessionId);
-    console.log('E2E_REPLACEMENT=' + compressed[0].data.source.originalNodes + '->2');
+    console.log('E2E_REPLACEMENT=' + compressed[0].data.source.originalNodes + '->' + compressed.length);
     console.log('E2E_MUTATIONS=' + compressed[0].data.source.mutations);
     console.log('E2E_WORKER_ATTEMPTS=' + compressed[0].data.source.workerAttempts);
     console.log('E2E_RECOVERY=agent-resume-backfill');

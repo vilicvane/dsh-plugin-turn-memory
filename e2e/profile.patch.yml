@@ -1,0 +1,22 @@
+# Shared overlay for the dedicated ~/.dsh/profiles/test-turn-memory profile.
+# dsh-base ships the credentials service disabled; the e2e agents need the stored API key.
+# DSH 0.2.1 replaced @deepseek-ai/dsh-agent-presets with a registry plus per-preset rows,
+# and the runners mount the `standard` and `minimal` presets by id.
+- id: credentials
+  disabled: false
+
+- insert:
+    - id: agent-preset-registry
+      name: '@deepseek-ai/dsh-agent-preset-registry'
+      config:
+        default: standard
+    - id: preset-standard
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: standard
+        plugins: []
+    - id: preset-minimal
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: minimal
+        plugins: []

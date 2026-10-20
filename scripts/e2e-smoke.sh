@@ -37,6 +37,7 @@ DSH_TOOLS_MODE=native \
 TURN_MEMORY_E2E_ARTIFACT_DIR="$project_dir/.tmp" \
 timeout "${TURN_MEMORY_E2E_SUITE_TIMEOUT_SECONDS:-600}s" "$dsh_bin" \
   --profile test-turn-memory \
+  --patch "$project_dir/e2e/profile.patch.yml" \
   --patch "$project_dir/e2e/cordis.patch.yml" \
   "turn-memory e2e smoke" 2>&1 | tee "$log_file"
 status=${PIPESTATUS[0]}

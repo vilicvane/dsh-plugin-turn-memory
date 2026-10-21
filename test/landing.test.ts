@@ -280,3 +280,183 @@ describe('compression landing', () => {
     assert.throws(() => land(job), /target surface changed before landing/);
   });
 });
+
+/** A completed turn that opened with the host continuation notice, not human input. */
+function continuationTurnSession(): any {
+  const session = fixtureSession();
+  session.append('turn/start', { turn: 1 });
+  session.append('user/message', {
+    id: 'u1',
+    role: 'user',
+    content: [{ type: 'text', text: 'Resume the unfinished work now from the compressed turn above.' }],
+    source: { kind: 'turn-memory-pending', form: 'notice', fromTurn: 0 },
+  }, { surfaceOp: 'append' });
+  session.append('step/start', { turn: 1, step: 1 });
+  session.append('assistant/message', {
+    turn: 1,
+    step: 1,
+    message: { id: 'a1', role: 'assistant', content: [{ type: 'text', text: 'continued work' }] },
+  }, { surfaceOp: 'append' });
+  session.append('step/end', { turn: 1, step: 1 });
+  session.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+  return session;
+}
+
+function continuationEditor(): TurnNodeEditor {
+  return new TurnNodeEditor([
+    { kind: 'user', content: 'Resume the unfinished work now from the compressed turn above.', sourceSeq: 1 },
+    { kind: 'assistant', content: 'continued work', sourceSeq: 3 },
+  ]);
+}
+
+/** Same as `continuationTurnSession`, but the segment ends on a real tool result. */
+function continuationToolTurnSession(): any {
+  const session = fixtureSession();
+  session.append('turn/start', { turn: 1 });
+  session.append('user/message', {
+    id: 'u1',
+    role: 'user',
+    content: [{ type: 'text', text: 'Resume the unfinished work now from the compressed turn above.' }],
+    source: { kind: 'turn-memory-continuation', form: 'notice', fromTurn: 0 },
+  }, { surfaceOp: 'append' });
+  session.append('step/start', { turn: 1, step: 1 });
+  session.append('assistant/message', {
+    turn: 1,
+    step: 1,
+    message: {
+      id: 'a1',
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'let me look' },
+        { type: 'tool-call', id: 'call-1', name: 'read_turn_nodes', arguments: { ids: ['n1'] } },
+      ],
+    },
+  }, { surfaceOp: 'append' });
+  session.append('tool/result', {
+    turn: 1,
+    step: 1,
+    message: {
+      id: 't1',
+      role: 'tool',
+      source: { callId: 'call-1' },
+      content: [{ type: 'text', text: 'tool output' }],
+    },
+  }, { surfaceOp: 'append' });
+  session.append('step/end', { turn: 1, step: 1 });
+  session.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+  return session;
+}
+
+function continuationToolEditor(): TurnNodeEditor {
+  return new TurnNodeEditor([
+    { kind: 'user', content: 'Resume the unfinished work now from the compressed turn above.', sourceSeq: 1 },
+    { kind: 'assistant', content: 'let me look', sourceSeq: 3, toolCallIds: ['call-1'] },
+    { kind: 'tool', content: 'tool output', sourceSeq: 4, toolResultCallId: 'call-1' },
+  ]);
+}
+
+/**
+ * A completed turn whose leading user message was rewritten by `turn/end` into a
+ * lifecycle marker copy (`turn-memory-pending` / `turn-memory-failed`) that keeps the
+ * shadowed seq in `sourceEventSeqs`. `origin` names what the copy replaced: a human
+ * message or a continuation notice.
+ */
+function markedTurnSession(markerKind: string, origin: 'human' | 'continuation'): any {
+  const human = origin === 'human';
+  const text = human ? 'original question' : 'Resume the unfinished work now from the compressed turn above.';
+  const session = fixtureSession();
+  session.append('turn/start', { turn: 1 });
+  session.append('user/message', {
+    id: 'u0',
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: human
+      ? { kind: 'user' }
+      : { kind: 'turn-memory-continuation', form: 'notice', fromTurn: 0 },
+  }, { surfaceOp: 'append' });
+  session.append('user/message', {
+    id: 'u1',
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: markerKind, turn: 1 },
+  }, { surfaceOp: { op: 'replace', startSeq: 1, endSeq: 1 }, sourceEventSeqs: [1] });
+  session.append('step/start', { turn: 1, step: 1 });
+  session.append('assistant/message', {
+    turn: 1,
+    step: 1,
+    message: { id: 'a1', role: 'assistant', content: [{ type: 'text', text: 'continued work' }] },
+  }, { surfaceOp: 'append' });
+  session.append('step/end', { turn: 1, step: 1 });
+  session.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+  return session;
+}
+
+function markedEditor(): TurnNodeEditor {
+  return new TurnNodeEditor([
+    { kind: 'user', content: 'original question', sourceSeq: 2 },
+    { kind: 'assistant', content: 'continued work', sourceSeq: 4 },
+  ]);
+}
+
+describe('logical-turn checkpoint shape', () => {
+  test('rejects a user-first draft for a segment with no human input', () => {
+    const session = continuationTurnSession();
+    const editor = continuationEditor();
+    editor.replace('n1', 'n1', [{ kind: 'user', content: 'invented user request' }]);
+    const job = jobFor(session, editor);
+    assert.throws(() => validateLanding(job, false), /must not start with a user node/);
+  });
+
+  test('lands an assistant-first checkpoint when the segment has no human input', () => {
+    const session = continuationTurnSession();
+    const editor = continuationEditor();
+    editor.replace('n1', 'n2', [{ kind: 'assistant', content: 'continued work summary' }]);
+    const job = jobFor(session, editor);
+    validateLanding(job, false);
+    land(job);
+    const [event] = landedEvents(session, 6);
+    assert.equal(event.type, 'user/message');
+    assert.ok(String(event.data.content[0].text).startsWith('Assistant: continued work summary'));
+  });
+
+  test('requires an assistant conclusion only when the segment closes the logical turn', () => {
+    const session = continuationToolTurnSession();
+    const editor = continuationToolEditor();
+    editor.replace('n1', 'n2', [{ kind: 'assistant', content: 'continued work summary' }]);
+    const job = jobFor(session, editor, [1, 3, 4]);
+    assert.throws(() => validateLanding(job, false), /must end with an assistant node/);
+    validateLanding(job, false, { closesLogicalTurn: false });
+    land(job);
+    const [event] = landedEvents(session, 7);
+    const text = String(event.data.content[0].text);
+    assert.ok(text.startsWith('Assistant: continued work summary'));
+    assert.ok(text.includes('Tool result: tool output'));
+  });
+
+  test('resolves a lifecycle marker copy back to the human message it replaced', () => {
+    const session = markedTurnSession('turn-memory-pending', 'human');
+    const editor = markedEditor();
+    editor.replace('n1', 'n2', [{ kind: 'assistant', content: 'continued work summary' }]);
+    const job = jobFor(session, editor, [2, 4]);
+    assert.throws(() => validateLanding(job, false), /must start with a user node/);
+  });
+
+  test('resolves a pending copy that replaced a continuation notice as scaffolding', () => {
+    const session = markedTurnSession('turn-memory-pending', 'continuation');
+    const editor = markedEditor();
+    editor.replace('n1', 'n2', [{ kind: 'assistant', content: 'continued work summary' }]);
+    const job = jobFor(session, editor, [2, 4]);
+    validateLanding(job, false);
+    land(job);
+    const [event] = landedEvents(session, 7);
+    assert.ok(String(event.data.content[0].text).startsWith('Assistant: continued work summary'));
+  });
+
+  test('resolves a failed-turn marker copy back to the human message it replaced', () => {
+    const session = markedTurnSession('turn-memory-failed', 'human');
+    const editor = markedEditor();
+    editor.replace('n1', 'n2', [{ kind: 'assistant', content: 'failed turn summary' }]);
+    const job = jobFor(session, editor, [2, 4]);
+    assert.throws(() => validateLanding(job, false), /must start with a user node/);
+  });
+});

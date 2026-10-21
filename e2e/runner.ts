@@ -60,30 +60,48 @@ function assertInternalToolsHidden(session: any, phase: string): void {
     phase + ': the continuation request tool must be payload-free');
 }
 
-async function waitForCompression(session: any, timeoutMs: number): Promise<any[]> {
+async function waitForCompression(session: any, timeoutMs: number, expected = 1): Promise<any[]> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const found = compressionNodes(session);
-    if (found.length >= 1) return found;
+    if (found.length >= expected) return found;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error('timed out waiting for the turn-memory compression after ' + timeoutMs + 'ms');
+  throw new Error('timed out waiting for ' + expected + ' turn-memory compression(s) after ' + timeoutMs + 'ms');
 }
 
-async function waitForContinuation(session: any, timeoutMs: number): Promise<{ user: any; assistant: any }> {
+/**
+ * Waits for the host-driven continuation turn to open. The continued turn is told nothing
+ * by the host beyond the fixed three-line message: whatever the compressed checkpoint
+ * preserved is the whole task. The assertion therefore stops at the mechanism (fixed
+ * message inside a turn after the compressed one) instead of requiring the model to
+ * reproduce a sentinel that the checkpoint may legitimately have compressed away.
+ * Note the event order: `followup` opens the turn first (`turn/start`) and the queued
+ * continuation message is spliced into it afterwards, so the enclosing `turn/start`
+ * precedes the continuation message rather than following it.
+ */
+async function waitForContinuation(session: any, timeoutMs: number, fromTurn: number): Promise<{ user: any; turnStart: any }> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const user = session.snapshotEvents().find((event: any) =>
+    const events = session.snapshotEvents();
+    const user = events.find((event: any) =>
       event?.type === 'user/message'
       && event.data?.source?.kind === 'turn-memory-continuation');
-    const assistant = user === undefined ? undefined : session.snapshotEvents().find((event: any) =>
-      event?.type === 'assistant/message'
-      && event.seq > user.seq
-      && textOf(event).includes(CONTINUATION_SENTINEL));
-    if (user !== undefined && assistant !== undefined) return { user, assistant };
+    const turnStart = user === undefined ? undefined : events.find((event: any) =>
+      event?.type === 'turn/start'
+      && event.seq <= user.seq
+      && (event.data?.turn ?? 0) > fromTurn);
+    if (user !== undefined && turnStart !== undefined) return { user, turnStart };
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error('timed out waiting for the automatic continuation turn after ' + timeoutMs + 'ms');
+}
+
+function assertCheckpointShape(event: any, phase: string, expected: 'User' | 'Assistant'): void {
+  const text = textOf(event);
+  assert.ok(text.length > 0, phase + ': checkpoint must not be empty');
+  assert.ok(text.startsWith(expected + ': '),
+    phase + ': checkpoint must start with "' + expected + ': " but starts with ' + JSON.stringify(text.slice(0, 40)));
 }
 
 function assertProjection(session: any, nodes: any[], phase: string): void {
@@ -313,8 +331,10 @@ async function run(ctx: any): Promise<void> {
     const continuationCompressed = await waitForCompression(continuationRecoveryHandle.agent.session, timeoutMs);
     assert.deepEqual(workerProviders, ['fork', 'spawn', 'fork', 'spawn'],
       'each turn job must begin with one fork and use a fresh spawn for its recovery worker');
-    assertProjection(continuationRecoveryHandle.agent.session, continuationCompressed, 'continuation recovery');
-    const continued = await waitForContinuation(continuationRecoveryHandle.agent.session, timeoutMs);
+    assertProjection(continuationRecoveryHandle.agent.session, [continuationCompressed[0]], 'continuation recovery');
+    assertCheckpointShape(continuationCompressed[0], 'continuation recovery', 'User');
+    const continued = await waitForContinuation(
+      continuationRecoveryHandle.agent.session, timeoutMs, continuationRequest!.turn);
     assert.match(textOf(continued.user), /not new human input/,
       'automatic follow-up did not disclose its plugin origin');
     assert.equal(textOf(continued.user),
@@ -322,8 +342,28 @@ async function run(ctx: any): Promise<void> {
       + 'This is host control context, not new human input.\n'
       + 'Resume the unfinished work now from the compressed turn above.',
       'automatic follow-up must be the fixed payload-free continuation message');
-    assert.ok(continued.assistant.data.turn > continuationRequest!.turn,
+    assert.ok(continued.turnStart.data.turn > continuationRequest!.turn,
       'automatic continuation did not open a later turn');
+
+    // The continued turn has no human input — its only user message is the host
+    // continuation — so the logical-turn shape rule requires an assistant-first
+    // checkpoint. Compression is deferred until a resume, which doubles as proof that
+    // the assistant-first checkpoint survives a cold load.
+    await continuationRecoveryHandle.agent.whenIdle();
+    await sessions.flush(continuationRecoveryHandle.agent.session);
+    await continuationRecoveryHandle.dispose();
+    continuationRecoveryHandle = undefined;
+    continuationRecoveryHandle = await agents.resume({
+      resumeSessionId: continuationSessionId,
+      agentOptions: { provider: selection.provider, model: selection.model },
+      setup: continuationSetup,
+    });
+    const shapedCompressed = await waitForCompression(continuationRecoveryHandle.agent.session, timeoutMs, 2);
+    assert.deepEqual(workerProviders, ['fork', 'spawn', 'fork', 'spawn', 'fork', 'spawn'],
+      'the continuation-only turn must run its own fork job and spawn recovery worker');
+    assertProjection(continuationRecoveryHandle.agent.session, [shapedCompressed[1]], 'continuation-only turn');
+    assertCheckpointShape(shapedCompressed[0], 'continuation recovery', 'User');
+    assertCheckpointShape(shapedCompressed[1], 'continuation-only turn', 'Assistant');
     await sessions.flush(continuationRecoveryHandle.agent.session);
     const continuationSnapshot = await sessionQuery.readSurface(continuationSessionId);
     const continuationSurfacePath = resolve(artifactDir, 'e2e-surface-' + continuationSessionId + '.json');
@@ -339,6 +379,7 @@ async function run(ctx: any): Promise<void> {
     console.log('E2E_WORKER_ATTEMPTS=' + compressed[0].data.source.workerAttempts);
     console.log('E2E_RECOVERY=agent-resume-backfill');
     console.log('E2E_CONTINUATION=compressed-then-followup');
+    console.log('E2E_SHAPES=human-user,' + 'continuation-only-assistant');
     console.log('E2E_CONTINUATION_SURFACE_PATH=' + continuationSurfacePath);
     console.log('E2E_SURFACE_PATH=' + surfacePath);
     console.log('E2E_RESULT=PASS');

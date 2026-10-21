@@ -59,6 +59,13 @@ describe('buildCompressionPrompt', () => {
     assert.match(prompt, /scaffolding rather than human requests/);
     assert.match(prompt, /should leave an assistant account of completed work, pending items, and exact next work/);
     assert.match(prompt, /unchecked todos, open questions, and the next concrete action must survive verbatim/);
+    assert.match(prompt, /Shape the final surface by the logical turn, not by this physical turn/);
+    assert.match(prompt, /carries genuine human input/);
+    assert.match(prompt, /must start with an assistant node, and no `User:` request may be invented/);
+    assert.match(prompt, /Only a turn that ends the logical turn must end with a non-empty assistant node/);
+    assert.match(prompt, /may end with the last real work node, including a tool result/);
+    assert.match(prompt, /Every node must be non-empty, and the final surface must use no more nodes than the original turn/);
+    assert.doesNotMatch(prompt, /must start with a user node, end with an assistant node/);
     assert.match(prompt, /No earlier worker has stopped/);
     assert.match(prompt, /inherits the original completed turn, including its raw reasoning/);
     assert.doesNotMatch(prompt, /does not inherit the parent transcript/);

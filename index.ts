@@ -36,7 +36,11 @@ import {
 } from './lib/turn-recovery.ts';
 import { WorkerToolScope } from './lib/worker-tools.ts';
 import { createReadMemoryImageTool } from './lib/memory-images.ts';
-import { DEFAULT_REMINDER_INTERVAL_NODES, TurnContinuationController } from './lib/turn-continuation.ts';
+import {
+  continuationRequestForTurn,
+  DEFAULT_REMINDER_INTERVAL_NODES,
+  TurnContinuationController,
+} from './lib/turn-continuation.ts';
 import { ThoughtHintsController } from './lib/thought-hints.ts';
 import { isUserConversationSession } from './lib/session-kind.ts';
 import { createReadSessionHistoryTool, renderRawSessionContent } from './lib/session-history.ts';
@@ -190,6 +194,15 @@ function seedOf(event: any): TurnNodeSeed | undefined {
     };
   }
   return undefined;
+}
+
+/**
+ * Shape rules follow the logical turn, not the physical turn compression produced.
+ * A durable continuation request means this segment hands off, so only the segment
+ * that closes the logical turn has to end with an assistant conclusion.
+ */
+function landingShape(job: CompressionJob): { closesLogicalTurn: boolean } {
+  return { closesLogicalTurn: continuationRequestForTurn(job.session, job.turn) === undefined };
 }
 
 function prepareJob(agent: any, event: any): CompressionJob | undefined {
@@ -365,7 +378,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
     isConcurrencySafe: () => false,
     async execute(_args, exec) {
       const job = jobFor(exec);
-      validateLanding(job, e2eSmoke);
+      validateLanding(job, e2eSmoke, landingShape(job));
       stagedFinishes.set(exec as object, job);
       exec.concludeTurn();
       return 'turn compression accepted for commit\n' + job.editor.structuralCatalog();
@@ -471,7 +484,7 @@ function apply(ctx: any, config: PluginConfig = {}): void {
         throw new Error('compression exhausted ' + turnNoProgressAttempts
           + ' consecutive no-progress worker attempts', { cause: lastError });
       }
-      validateLanding(job, e2eSmoke);
+      validateLanding(job, e2eSmoke, landingShape(job));
       land(job);
       if (!await persistLanding(job)) return false;
       ctx.logger.info('turn-memory: turn ' + job.turn + ' compression landed (' + job.targetSeqs.length + ' -> '

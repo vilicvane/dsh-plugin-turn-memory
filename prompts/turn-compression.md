@@ -19,7 +19,13 @@ Compress repeated self-talk, mechanical drafting, and derivations whose operatio
 
 Human intent, constraints, decisions, inspirations, and externally visible outcomes remain part of the causal conversation. A later correction has two different meanings: a typo or missing detail can reveal what the request meant from the start, while a response to new evidence can genuinely change the objective. Consolidate the former into the corrected intent; retain the latter as a causal decision boundary. Host runtime snapshots, Turn Memory continuation notices, and automatic continuation follow-ups are scaffolding rather than human requests. Preserve only task-relevant work or state they reveal, under the role that actually established it. A turn that ends with `continue_after_turn_compression` should leave an assistant account of completed work, pending items, and exact next work; the host protocol text itself is not carried over, because the next turn resumes from this compressed memory alone.
 
-The final surface must start with a user node, end with an assistant node, contain no empty node, and use no more nodes than the original turn.
+Shape the final surface by the logical turn, not by this physical turn. A logical turn begins with genuine human input and ends only when the assistant finishes it; a turn compressed at a continuation boundary is one physical segment of that longer logical turn, so it neither carries human input nor owes a conclusion.
+
+- If the compressed turn carries genuine human input (`user` or `user-approval`, including a mid-turn steer), it must start with a user node. A steer that only reveals or narrows the original intent may share one user node with the earlier message; if it replaces the earlier route, start from the merged intent and drop the assistant work that the steer made irrelevant.
+- If the compressed turn carries no human input — only the host continuation notice, runtime snapshots, and other scaffolding — it must start with an assistant node, and no `User:` request may be invented. Fold away the scaffolding user node by selecting it into the same replacement span; do not recreate its wording.
+- Only a turn that ends the logical turn must end with a non-empty assistant node. A turn that ends at a continuation boundary may end with the last real work node, including a tool result.
+
+Every node must be non-empty, and the final surface must use no more nodes than the original turn.
 
 ## Work from the authoritative surface
 

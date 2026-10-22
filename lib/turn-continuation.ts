@@ -11,7 +11,7 @@ export const TURN_CONTINUATION_TOOL_NAME = 'continue_after_turn_compression';
 
 const CONTINUATION_CONTEXT_NAME = 'turn-memory:long-turn-continuation';
 
-export const DEFAULT_REMINDER_INTERVAL_NODES = 30;
+export const DEFAULT_REMINDER_INTERVAL_NODES = 120;
 
 export interface TurnContinuationConfig {
   enabled?: boolean;
@@ -188,12 +188,11 @@ export function buildTurnContinuationContext(options: {
   return [
     'Turn Memory continuation required — ' + options.milestoneNodes + '-node milestone',
     contextStatus,
-    'Stop this turn and hand off now.',
-    '- If an atomic mutation is already in progress, finish only that mutation first. Do not start another.',
-    '- End the turn with a short wrap-up: what you completed, what is still pending, and the exact next work.',
-    '- Call `' + TURN_CONTINUATION_TOOL_NAME + '` (no arguments) once that wrap-up is written.',
-    '- Continue without handing off only when the whole task will finish in the next few actions.',
-    'After the call the host compresses this turn and continues the work automatically in a new turn.',
+    'This turn ends here; a fresh turn continues from the compressed memory.',
+    '- If an atomic mutation is already in progress, finish only that mutation first.',
+    '- End the turn with `' + TURN_CONTINUATION_TOOL_NAME + '` (no arguments) as the last action;'
+      + ' the host compresses this turn and continues from that memory in a new turn.',
+    '- If the whole task finishes in the next few actions, finish it within this turn.',
   ].join('\n');
 }
 
@@ -225,7 +224,7 @@ export class TurnContinuationController {
     }
     ctx.tools.register(defineTool({
       name: TURN_CONTINUATION_TOOL_NAME,
-      description: 'Call, with no arguments, when the active Turn Memory continuation notice requires you to stop after wrapping up this turn. The host then compresses this turn and continues the work automatically in a new turn from that compressed memory; nothing you write here is carried over separately.',
+      description: 'Call, with no arguments, as the last action of a turn when the active Turn Memory continuation notice requires a silent handoff. The host then compresses this turn and continues the work automatically in a new turn from that compressed memory; nothing you write here is carried over separately.',
       parameters: {},
       output: {
         schema: { type: 'string' as const },

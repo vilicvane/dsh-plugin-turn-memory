@@ -31,8 +31,8 @@ import {
   pendingTurnNumbers,
   turnHasUnrewrittenReasoning,
   turnCompressionBypassReason,
+  turnCompressionSpan,
   turnMarkerOriginal,
-  turnSurfaceSeqs,
 } from './lib/turn-recovery.ts';
 import { WorkerToolScope } from './lib/worker-tools.ts';
 import { createReadMemoryImageTool } from './lib/memory-images.ts';
@@ -145,6 +145,8 @@ interface CompressionJob {
   session: any;
   turn: number;
   targetSeqs: number[];
+  /** Host-owned surface nodes inside the target span; landed as shadowed provenance. */
+  hostSeqs: number[];
   editor: TurnNodeEditor;
   controller: AbortController;
   mutationCount: number;
@@ -211,12 +213,8 @@ function prepareJob(agent: any, event: any): CompressionJob | undefined {
   if (!Number.isSafeInteger(turn)) return undefined;
   const start = session.snapshotEvents().findLast((candidate: any) => candidate.type === 'turn/start' && candidate.data?.turn === turn);
   if (start === undefined) throw new Error('turn ' + turn + ' has a durable turn/end but no matching turn/start');
-  const targetSeqs = turnSurfaceSeqs(session, turn, start.seq, event.seq);
+  const { targetSeqs, hostSeqs } = turnCompressionSpan(session, turn, start.seq, event.seq);
   if (targetSeqs.length === 0) return undefined;
-  const firstIndex = session.surface.nodes.indexOf(targetSeqs[0]);
-  if (firstIndex < 0 || targetSeqs.some((seq: number, index: number) => session.surface.nodes[firstIndex + index] !== seq)) {
-    throw new Error('turn ' + turn + ' target is not a contiguous current surface range');
-  }
   const seeds = targetSeqs.map((seq: number) => seedOf(session.snapshotEvents()[seq]));
   if (seeds.some((seed: TurnNodeSeed | undefined) => seed === undefined)) {
     throw new Error('turn ' + turn + ' target contains a non-message surface node');
@@ -228,6 +226,7 @@ function prepareJob(agent: any, event: any): CompressionJob | undefined {
     session,
     turn,
     targetSeqs: [...targetSeqs],
+    hostSeqs: [...hostSeqs],
     editor: new TurnNodeEditor(seeds as TurnNodeSeed[]),
     controller: new AbortController(),
     mutationCount: 0,

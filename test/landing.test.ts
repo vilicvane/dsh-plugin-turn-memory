@@ -147,6 +147,50 @@ function jobFor(session: any, editor: TurnNodeEditor, targetSeqs: number[] = [1,
   };
 }
 
+/** A completed turn whose span also carries a host-owned tool-registry delta. */
+function hostNodeTurnSession(): any {
+  const session = fixtureSession();
+  session.append('turn/start', { turn: 1 });
+  session.append('user/message', {
+    id: 'u1',
+    role: 'user',
+    content: [{ type: 'text', text: 'original question' }],
+    source: { kind: 'user' },
+  }, { surfaceOp: 'append' });
+  session.append('step/start', { turn: 1, step: 1 });
+  session.append('assistant/message', {
+    turn: 1,
+    step: 1,
+    message: { id: 'a1', role: 'assistant', content: [{ type: 'text', text: 'first answer' }] },
+  }, { surfaceOp: 'append' });
+  session.append('developer/message', {
+    turn: 1,
+    step: 1,
+    message: {
+      id: 'd1',
+      role: 'developer',
+      source: { kind: 'tool-registry' },
+      content: [{ type: 'tool-addition', toolName: 'spawn_teammate' }],
+    },
+  }, { surfaceOp: 'append' });
+  session.append('assistant/message', {
+    turn: 1,
+    step: 1,
+    message: { id: 'a2', role: 'assistant', content: [{ type: 'text', text: 'final answer' }] },
+  }, { surfaceOp: 'append' });
+  session.append('step/end', { turn: 1, step: 1 });
+  session.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+  return session;
+}
+
+function hostNodeEditor(): TurnNodeEditor {
+  return new TurnNodeEditor([
+    { kind: 'user', content: 'original question', sourceSeq: 1 },
+    { kind: 'assistant', content: 'first answer', sourceSeq: 3 },
+    { kind: 'assistant', content: 'final answer', sourceSeq: 5 },
+  ]);
+}
+
 function landedEvents(session: any, from: number): any[] {
   return session.events.slice(from);
 }
@@ -398,6 +442,31 @@ function markedEditor(): TurnNodeEditor {
   ]);
 }
 
+describe('host-owned surface nodes', () => {
+  test('a checkpoint shadows the tool-registry delta inside its span', () => {
+    const session = hostNodeTurnSession();
+    const editor = hostNodeEditor();
+    editor.replace('n2', 'n3', [{ kind: 'assistant', content: 'merged answer' }]);
+    const job = { ...jobFor(session, editor, [1, 3, 5]), hostSeqs: [4] };
+    const from = session.events.length;
+    validateLanding(job, false);
+    land(job);
+
+    const [event] = landedEvents(session, from);
+    assert.deepEqual(event.surfaceOp, { op: 'replace', startSeq: 1, endSeq: 5 });
+    assert.ok(event.sourceEventSeqs.includes(4), 'landing provenance must cite the shadowed host node');
+    assert.deepEqual(session.surface.nodes, [event.seq]);
+  });
+
+  test('an unaccounted surface node still rejects the landing', () => {
+    const session = hostNodeTurnSession();
+    const editor = hostNodeEditor();
+    editor.replace('n2', 'n3', [{ kind: 'assistant', content: 'merged answer' }]);
+    const job = jobFor(session, editor, [1, 3, 5]);
+    assert.throws(() => land(job), /target surface changed before landing/);
+  });
+});
+
 describe('logical-turn checkpoint shape', () => {
   test('rejects a user-first draft for a segment with no human input', () => {
     const session = continuationTurnSession();
@@ -450,6 +519,48 @@ describe('logical-turn checkpoint shape', () => {
     land(job);
     const [event] = landedEvents(session, 7);
     assert.ok(String(event.data.content[0].text).startsWith('Assistant: continued work summary'));
+  });
+
+  test('restores an image marker the rewrite dropped instead of rejecting the draft', () => {
+    const session = fixtureSession();
+    session.append('turn/start', { turn: 1 });
+    session.append('user/message', {
+      id: 'u1',
+      role: 'user',
+      content: [
+        { type: 'text', text: 'compare with this sheet' },
+        { type: 'image', attachment: {
+          attachmentId: 'sha256:' + 'ab'.repeat(32),
+          mediaType: 'image/png',
+          bytes: 21749,
+          width: 1400,
+          height: 220,
+          name: 'sheet.png',
+        } },
+      ],
+      source: { kind: 'user' },
+    }, { surfaceOp: 'append' });
+    session.append('step/start', { turn: 1, step: 1 });
+    session.append('assistant/message', {
+      turn: 1,
+      step: 1,
+      message: { id: 'a1', role: 'assistant', content: [{ type: 'text', text: 'looks close' }] },
+    }, { surfaceOp: 'append' });
+    session.append('step/end', { turn: 1, step: 1 });
+    session.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+    const editor = new TurnNodeEditor([
+      { kind: 'user', content: 'compare with this sheet', sourceSeq: 1 },
+      { kind: 'assistant', content: 'looks close', sourceSeq: 3 },
+    ]);
+    editor.replace('n1', 'n1', [{ kind: 'user', content: 'compare with the attached sheet' }]);
+    const job = jobFor(session, editor, [1, 3]);
+    // The draft lost the marker; the host still lands it, so finishing never fails.
+    validateLanding(job, false);
+    land(job);
+    const [event] = landedEvents(session, 6);
+    const text = String(event.data.content[0].text);
+    assert.ok(text.includes('<memory-image ref="img-ababababab"'), text);
+    assert.ok(text.includes('compare with the attached sheet'), text);
   });
 
   test('resolves a failed-turn marker copy back to the human message it replaced', () => {

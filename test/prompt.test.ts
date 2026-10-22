@@ -35,7 +35,7 @@ describe('buildCompressionPrompt', () => {
     assert.match(prompt, /rejected alternatives and why/);
     assert.match(prompt, /When a steer reveals the original intended route/);
     assert.match(prompt, /Chronology is semantic/);
-    assert.match(prompt, /Do not keep the correction as a separate user node/);
+    assert.match(prompt, /carrying the corrected intent in that single node/);
     assert.match(prompt, /typo correction that only reveals the original intent is not such a boundary/);
     assert.match(prompt, /Select every current node whose information an output uses/);
     assert.match(prompt, /Adjacent same-role semantic nodes are allowed/);
@@ -46,7 +46,7 @@ describe('buildCompressionPrompt', () => {
     assert.match(prompt, /Audit the complete current surface/);
     assert.match(prompt, /Apply the rework test/);
     assert.match(prompt, /Preserve actual off-route assistant work/);
-    assert.match(prompt, /Never attribute assistant actions, tool outcomes/);
+    assert.match(prompt, /Attribute every fact to the role that established it/);
     assert.match(prompt, /`n\*` is an unchanged original node/);
     assert.match(prompt, /`r\*` is an accepted replacement/);
     assert.match(prompt, /`capacity=` is how many output nodes this node can still be split into/);
@@ -55,14 +55,17 @@ describe('buildCompressionPrompt', () => {
     assert.doesNotMatch(prompt, /lands=/);
     assert.match(prompt, /<memory-image ref="\.\.\."/);
     assert.match(prompt, /read_memory_image/);
+    assert.match(prompt, /short host-assigned `ref` such as `img-1a2b3c4d5e`/);
+    assert.match(prompt, /The host restores any image whose marker a rewrite drops/);
     assert.match(prompt, /Host runtime snapshots, Turn Memory continuation notices/);
     assert.match(prompt, /scaffolding rather than human requests/);
-    assert.match(prompt, /should leave an assistant account of completed work, pending items, and exact next work/);
+    assert.match(prompt, /hands off silently, so derive its completed work, pending items, and exact next work from the turn's own work/);
+    assert.match(prompt, /which makes this record their only copy/);
     assert.match(prompt, /unchecked todos, open questions, and the next concrete action must survive verbatim/);
     assert.match(prompt, /Shape the final surface by the logical turn, not by this physical turn/);
     assert.match(prompt, /carries genuine human input/);
-    assert.match(prompt, /must start with an assistant node, and no `User:` request may be invented/);
-    assert.match(prompt, /Only a turn that ends the logical turn must end with a non-empty assistant node/);
+    assert.match(prompt, /starts with an assistant node and reads as assistant memory/);
+    assert.match(prompt, /A turn that ends the logical turn ends with a non-empty assistant node/);
     assert.match(prompt, /may end with the last real work node, including a tool result/);
     assert.match(prompt, /Every node must be non-empty, and the final surface must use no more nodes than the original turn/);
     assert.doesNotMatch(prompt, /must start with a user node, end with an assistant node/);
@@ -125,7 +128,7 @@ describe('buildCompressionPrompt', () => {
     assert.match(prompt, /contains all 1 accepted replacement\(s\)/);
     assert.match(prompt, /does not inherit the parent transcript/);
     assert.match(prompt, /page a long selection by repeating the same ranges with the returned `offset`/);
-    assert.match(prompt, /do not rebuild from the original layout/);
+    assert.match(prompt, /building on the work already accepted/);
     assert.match(prompt, /r1 \| user .*changed/);
     assert.doesNotMatch(prompt, /No earlier worker has stopped/);
   });

@@ -75,17 +75,57 @@ export function turnHasUnrewrittenReasoning(session: any, turn: number): boolean
   return false;
 }
 
+/**
+ * Host-owned step events that can sit inside a turn's surface range without being part
+ * of the transcript: the durable system prompt and tool-registry deltas.
+ *
+ * They are appended by the runtime, not written by the conversation, so they carry no
+ * compressible message seed. Compression excludes them from the rewrite targets and
+ * shadows them when the checkpoint lands, which keeps the range contiguous.
+ */
+export function isHostOwnedSurfaceNode(event: any): boolean {
+  return event?.type === 'system/message' || event?.type === 'developer/message';
+}
+
+/**
+ * Resolve the compressible targets of one turn plus the host-owned nodes they span.
+ *
+ * `targetSeqs` are the rewritable message nodes; `hostSeqs` are the excluded host nodes
+ * that sit between them and must appear in the landing provenance so the checkpoint can
+ * shadow them. A surface node that is neither target nor host means the range is no
+ * longer a contiguous transcript slice.
+ */
+export function turnCompressionSpan(
+  session: any,
+  turn: number,
+  startSeq: number,
+  endSeq: number,
+): { targetSeqs: number[]; hostSeqs: number[] } {
+  const targetSeqs = turnSurfaceSeqs(session, turn, startSeq, endSeq);
+  if (targetSeqs.length === 0) return { targetSeqs, hostSeqs: [] };
+  const nodes: number[] = session?.surface?.nodes ?? [];
+  const first = nodes.indexOf(targetSeqs[0]);
+  const last = nodes.indexOf(targetSeqs[targetSeqs.length - 1]);
+  if (first < 0 || last < first) throw new Error('turn ' + turn + ' target is not a contiguous current surface range');
+  const inRange = nodes.slice(first, last + 1);
+  const targetSet = new Set(targetSeqs);
+  const hostSeqs = inRange.filter((seq: number) => !targetSet.has(seq));
+  const unexpected = hostSeqs.filter((seq: number) => !isHostOwnedSurfaceNode(session.snapshotEvents()[seq]));
+  if (unexpected.length > 0) throw new Error('turn ' + turn + ' target is not a contiguous current surface range');
+  return { targetSeqs, hostSeqs };
+}
+
 /** Select one turn's current surface, including a late turn-memory marker appended after turn/end. */
 export function turnSurfaceSeqs(session: any, turn: number, startSeq: number, endSeq: number): number[] {
   return (session?.surface?.nodes ?? []).filter((seq: number) => {
     if (seq <= startSeq) return false;
     const event = session.snapshotEvents()[seq];
     if (isCompactionCheckpointSource(event?.data?.source)) return false;
-    // DSH keeps the durable host-owned system prompt surface-eligible. It is
-    // emitted after turn/start but sits at the surface head, is not part of the turn
-    // transcript, and may only be rewritten as an exact system/message replacement.
-    // Leaving it in the range would fail prepareJob's message-seed check.
-    if (event?.type === 'system/message') return false;
+    // Host-owned step events stay surface-eligible but are not transcript nodes:
+    // the system prompt sits at the surface head, and tool-registry deltas arrive
+    // mid-turn. Neither carries a message seed, so a rewrite range excludes them and
+    // the landing shadows them through provenance.
+    if (isHostOwnedSurfaceNode(event)) return false;
     const markerTurn = turnMemoryMarkerTurn(event?.data?.source);
     if (markerTurn !== undefined) return markerTurn === turn;
     return seq <= endSeq;

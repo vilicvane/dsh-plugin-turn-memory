@@ -10,6 +10,7 @@ import {
   continuationWasDelivered,
   latestAnnouncedMilestone,
   openTurnNumber,
+  DEFAULT_REMINDER_INTERVAL_NODES,
 } from '../lib/turn-continuation.ts';
 
 function message(text: string, source: any = { kind: 'user' }): any {
@@ -119,10 +120,11 @@ describe('turn continuation lifecycle', () => {
     assert.match(notice, /Current open turn: 2 nodes/);
     assert.match(notice, /Estimated full context: 111 tokens/);
     assert.match(notice, /Next reminder milestone: 4 nodes/);
-    assert.match(notice, /Stop this turn and hand off now/);
-    assert.match(notice, /short wrap-up: what you completed, what is still pending, and the exact next work/);
-    assert.match(notice, /Call `continue_after_turn_compression` \(no arguments\)/);
-    assert.match(notice, /whole task will finish in the next few actions/);
+    assert.match(notice, /This turn ends here; a fresh turn continues from the compressed memory/);
+    assert.match(notice, /End the turn with `continue_after_turn_compression` \(no arguments\) as the last action/);
+    assert.match(notice, /the host compresses this turn and continues from that memory in a new turn/);
+    assert.doesNotMatch(notice, /wrap-up|progress summary/);
+    assert.match(notice, /whole task finishes in the next few actions, finish it within this turn/);
     assert.doesNotMatch(notice, /handoff/);
     assert.match(notice, new RegExp(TURN_CONTINUATION_TOOL_NAME));
     assert.doesNotMatch(notice, /<turn-memory-continuation|<assistant-self-check>/);
@@ -143,7 +145,7 @@ describe('turn continuation lifecycle', () => {
     }, 'append');
     const secondNotice = contexts[0].text({ agent });
     assert.match(secondNotice, /Turn Memory continuation required — 4-node milestone/);
-    assert.match(secondNotice, /Stop this turn and hand off now/);
+    assert.match(secondNotice, /This turn ends here; a fresh turn continues from the compressed memory/);
 
     let concluded = false;
     const tool = tools.get(TURN_CONTINUATION_TOOL_NAME);
@@ -369,4 +371,14 @@ describe('turn continuation lifecycle', () => {
     assert.equal(continuationRequestForTurn(session, 5), undefined,
       'message-level isError must veto the request, not a legacy content block');
   });
+});
+
+test('defaults the first continuation milestone to 120 open-turn nodes', () => {
+  assert.equal(DEFAULT_REMINDER_INTERVAL_NODES, 120);
+  assert.equal(continuationMilestone(119, DEFAULT_REMINDER_INTERVAL_NODES), 0,
+    'a 119-node open turn stays below the first milestone');
+  assert.equal(continuationMilestone(120, DEFAULT_REMINDER_INTERVAL_NODES), 120);
+  assert.equal(continuationMilestone(239, DEFAULT_REMINDER_INTERVAL_NODES), 120,
+    'milestones stay at 120 until the next full interval');
+  assert.equal(continuationMilestone(240, DEFAULT_REMINDER_INTERVAL_NODES), 240);
 });

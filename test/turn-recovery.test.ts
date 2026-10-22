@@ -9,6 +9,7 @@ import {
   pendingTurnNumbers,
   turnHasUnrewrittenReasoning,
   turnSurfaceSeqs,
+  turnCompressionSpan,
   turnCompressionBypassReason,
 } from '../lib/turn-recovery.ts';
 import { Session, foldSurface } from '@deepseek-ai/dsh-session';
@@ -144,6 +145,47 @@ describe('turn recovery event scans', () => {
     };
 
     assert.deepEqual(turnSurfaceSeqs(session, 1, 4, 16), [8, 9, 16]);
+  });
+
+  it('reports host-owned tool-registry deltas as shadowed span members', () => {
+    // DSH appends a developer/message whenever the tool registry changes mid-turn.
+    const events: any[] = [];
+    events[4] = { seq: 4, type: 'turn/start', data: { turn: 1 } };
+    events[7] = {
+      seq: 7,
+      type: 'system/message',
+      data: { turn: 1, step: 1, message: { role: 'system', content: [] } },
+    };
+    events[8] = { seq: 8, type: 'user/message', data: { turn: 1, content: [{ type: 'text', text: 'request' }] } };
+    events[9] = {
+      seq: 9,
+      type: 'assistant/message',
+      data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'work' }] } },
+    };
+    events[16] = {
+      seq: 16,
+      type: 'developer/message',
+      data: { turn: 1, step: 1, message: { role: 'developer', content: [{ type: 'tool-addition', toolName: 'x' }] } },
+    };
+    events[20] = { seq: 20, type: 'tool/result', data: { message: { content: [] } } };
+    const session = {
+      surface: { nodes: [7, 8, 9, 16, 20] },
+      snapshotEvents: () => events,
+      eventAt: (seq: number) => events[seq],
+    };
+
+    assert.deepEqual(turnSurfaceSeqs(session, 1, 4, 21), [8, 9, 20]);
+    assert.deepEqual(turnCompressionSpan(session, 1, 4, 21), { targetSeqs: [8, 9, 20], hostSeqs: [16] });
+
+    // A session-compaction checkpoint inside the span is neither a target nor a host
+    // node, so the range is no longer a contiguous transcript slice.
+    events[18] = {
+      seq: 18,
+      type: 'user/message',
+      data: { turn: 1, content: [{ type: 'text', text: 'compacted' }], source: { kind: 'compact-checkpoint', compactionId: 'c1' } },
+    };
+    session.surface.nodes = [7, 8, 9, 16, 18, 20];
+    assert.throws(() => turnCompressionSpan(session, 1, 4, 21), /not a contiguous current surface range/);
   });
 
   it('persists a semantic no-op as an idempotence marker without changing transcript text', () => {

@@ -30,7 +30,11 @@ import type { PricedNode, SessionSegment } from './session-segments.ts';
 import type { SourceNodeRange } from './session-segments.ts';
 import { WorkerToolScope } from './worker-tools.ts';
 import { startWorker } from './subagent-activation.ts';
-import { assertMemoryImagesRetained } from './memory-images.ts';
+import {
+  assertMemoryImagesRetained,
+  collectMemoryImageAttachmentsOf,
+  materializeMemoryImages,
+} from './memory-images.ts';
 import { isUserConversationSession } from './session-kind.ts';
 import { isCompactionCheckpointSource, turnMemoryMarkerOf, turnMemoryMarkerTurn } from './message-source.ts';
 
@@ -778,12 +782,14 @@ export class SessionMemoryCompactionEngine extends CompactionEngine {
         const currentPriced = currentMeasurement.nodes.slice(currentSelection.startIndex, currentSelection.endIndex + 1);
         if (!isDeepStrictEqual(currentPriced, selectedPriced)) throw new Error('session compaction selected span was repriced while workers ran');
       }
-      const checkpointText = job.editor.renderCheckpoint();
-      assertMemoryImagesRetained(
-        selection.shadowedSeqs.map((seq) => session.snapshotEvents()[seq]?.data),
-        checkpointText,
-        'session compaction',
+      const shadowedData = selection.shadowedSeqs.map((seq) => session.snapshotEvents()[seq]?.data);
+      // Image identity is host-owned here too: restore any marker a rewrite dropped
+      // instead of failing the compaction on a mistyped or omitted digest.
+      const checkpointText = materializeMemoryImages(
+        job.editor.renderCheckpoint(),
+        collectMemoryImageAttachmentsOf(shadowedData),
       );
+      assertMemoryImagesRetained(shadowedData, checkpointText, 'session compaction');
       const summary = [{ type: 'text' as const, text: checkpointText }];
       const checkpointMessage = createUserMessage({
         content: summary,

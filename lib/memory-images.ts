@@ -4,6 +4,12 @@ import type { ImageMediaType } from '@deepseek-ai/dsh-attachment';
 
 export const READ_MEMORY_IMAGE_TOOL_NAME = 'read_memory_image';
 
+const ATTACHMENT_ID_PREFIX = 'sha256:';
+/** Hexadecimal characters kept from the digest to build the short handle. */
+const ALIAS_HEX_LENGTH = 10;
+/** Shortest prefix accepted when a caller passes bare digest characters. */
+const MIN_PREFIX_LENGTH = 6;
+
 export interface MemoryImageAttachmentRef {
   attachmentId: string;
   mediaType: ImageMediaType;
@@ -38,10 +44,25 @@ function imageAttachmentRef(value: unknown): MemoryImageAttachmentRef | undefine
   };
 }
 
+/**
+ * Short host-assigned handle for one durable image attachment.
+ *
+ * The canonical attachment id is a 64-character sha256 digest, so asking a model to
+ * reproduce it verbatim is error-prone: one mistyped character makes the image look
+ * missing forever. The handle is derived from that digest, which keeps it stable,
+ * collision-safe enough for a session, and recoverable without any mutable registry.
+ */
+export function memoryImageAlias(attachmentId: string): string {
+  const hex = attachmentId.startsWith(ATTACHMENT_ID_PREFIX)
+    ? attachmentId.slice(ATTACHMENT_ID_PREFIX.length)
+    : attachmentId;
+  return 'img-' + hex.toLowerCase().slice(0, ALIAS_HEX_LENGTH);
+}
+
 /** Render one eager image block as a stable, model-readable lazy memory handle. */
 export function renderMemoryImageReference(ref: MemoryImageAttachmentRef): string {
   const attributes = [
-    'ref="' + xmlAttribute(ref.attachmentId) + '"',
+    'ref="' + xmlAttribute(memoryImageAlias(ref.attachmentId)) + '"',
     'media-type="' + xmlAttribute(ref.mediaType) + '"',
     'width="' + ref.width + '"',
     'height="' + ref.height + '"',
@@ -102,11 +123,74 @@ export function collectMemoryImageReferenceIds(value: unknown): Set<string> {
   return ids;
 }
 
+/** Digest characters of one canonical attachment id, or the id itself when unprefixed. */
+export function memoryImageDigest(attachmentId: string): string {
+  return (attachmentId.startsWith(ATTACHMENT_ID_PREFIX)
+    ? attachmentId.slice(ATTACHMENT_ID_PREFIX.length)
+    : attachmentId).toLowerCase();
+}
+
+/**
+ * Whether one marker `ref` addresses the given attachment.
+ *
+ * Accepts the short handle, the canonical id, and any unambiguous digest prefix, so a
+ * caller never has to reproduce 64 characters and older checkpoints keep resolving.
+ */
+export function memoryImageRefMatches(ref: string, attachmentId: string): boolean {
+  const normalized = ref.trim().toLowerCase();
+  if (normalized === '') return false;
+  if (normalized === attachmentId.toLowerCase()) return true;
+  if (normalized === memoryImageAlias(attachmentId)) return true;
+  const candidate = normalized.startsWith('img-')
+    ? normalized.slice('img-'.length)
+    : normalized.startsWith(ATTACHMENT_ID_PREFIX)
+      ? normalized.slice(ATTACHMENT_ID_PREFIX.length)
+      : normalized;
+  return candidate.length >= MIN_PREFIX_LENGTH && memoryImageDigest(attachmentId).startsWith(candidate);
+}
+
+function textAddressesAttachment(text: string, attachmentId: string): boolean {
+  for (const ref of memoryImageReferenceIds(text)) {
+    if (memoryImageRefMatches(ref, attachmentId)) return true;
+  }
+  return false;
+}
+
+/**
+ * Make every attachment of a source turn addressable in the given text.
+ *
+ * The host, not the model, owns image identity: a rewrite that drops or mangles a marker
+ * still keeps the image readable, and no checkpoint can be lost to a mistyped digest.
+ */
+export function materializeMemoryImages(
+  text: string,
+  attachments: readonly MemoryImageAttachmentRef[],
+): string {
+  const missing = attachments.filter((attachment) => !textAddressesAttachment(text, attachment.attachmentId));
+  if (missing.length === 0) return text;
+  const markers = [...new Map(missing.map((attachment) => [attachment.attachmentId, attachment])).values()]
+    .map((attachment) => renderMemoryImageReference(attachment));
+  const body = text.trim();
+  return body === '' ? markers.join('\n') : body + '\n\n' + markers.join('\n');
+}
+
+/** Attachments carried by the given event data values, in first-seen order. */
+export function collectMemoryImageAttachmentsOf(values: readonly unknown[]): MemoryImageAttachmentRef[] {
+  const byId = new Map<string, MemoryImageAttachmentRef>();
+  for (const value of values) {
+    for (const attachment of collectMemoryImageAttachments(value)) {
+      if (!byId.has(attachment.attachmentId)) byId.set(attachment.attachmentId, attachment);
+    }
+  }
+  return [...byId.values()];
+}
+
 export function assertMemoryImagesRetained(source: unknown, outputText: string, stage: string): void {
-  const retained = memoryImageReferenceIds(outputText);
-  const missing = [...collectMemoryImageReferenceIds(source)].filter((ref) => !retained.has(ref));
+  const missing = collectMemoryImageAttachments(source)
+    .filter((attachment) => !textAddressesAttachment(outputText, attachment.attachmentId));
   if (missing.length > 0) {
-    throw new Error(stage + ' omitted lazy image reference(s): ' + missing.join(', '));
+    throw new Error(stage + ' omitted lazy image reference(s): '
+      + missing.map((attachment) => renderMemoryImageReference(attachment)).join(', '));
   }
 }
 
@@ -126,14 +210,29 @@ function candidateSessions(ctx: any, exec: any): any[] {
   return sessions;
 }
 
-function referencedAttachment(ctx: any, exec: any, ref: string): MemoryImageAttachmentRef | undefined {
+/** Every image attachment readable from the current session and its active parents. */
+function readableAttachments(ctx: any, exec: any): MemoryImageAttachmentRef[] {
+  const values: unknown[] = [];
   for (const session of candidateSessions(ctx, exec)) {
-    for (const event of session.snapshotEvents() as readonly any[]) {
-      const found = collectMemoryImageAttachments(event?.data).find((candidate) => candidate.attachmentId === ref);
-      if (found !== undefined) return found;
-    }
+    for (const event of session.snapshotEvents() as readonly any[]) values.push(event?.data);
   }
-  return undefined;
+  return collectMemoryImageAttachmentsOf(values);
+}
+
+/**
+ * Resolve one caller-supplied handle against the readable attachments.
+ *
+ * Exact canonical ids win; otherwise the short handle or a digest prefix resolves when it
+ * is unambiguous, which is what keeps a mistyped or abbreviated ref recoverable.
+ */
+function referencedAttachment(
+  attachments: readonly MemoryImageAttachmentRef[],
+  ref: string,
+): MemoryImageAttachmentRef | undefined {
+  const exact = attachments.find((candidate) => candidate.attachmentId.toLowerCase() === ref.toLowerCase());
+  if (exact !== undefined) return exact;
+  const matches = attachments.filter((candidate) => memoryImageRefMatches(ref, candidate.attachmentId));
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 async function assertImageCapableRoute(ctx: any, exec: any, ref: string): Promise<void> {
@@ -155,12 +254,12 @@ async function assertImageCapableRoute(ctx: any, exec: any, ref: string): Promis
 export function createReadMemoryImageTool(ctx: any): any {
   return defineTool({
     name: READ_MEMORY_IMAGE_TOOL_NAME,
-    description: 'Load the pixels for one <memory-image ref="..." /> retained in compressed conversation memory. Use only when the textual memory is insufficient and visual inspection is necessary.',
+    description: 'Load the pixels for one image retained in compressed conversation memory. Use it when the textual memory is insufficient and visual inspection is necessary.',
     parameters: {
       ref: {
         type: 'string',
         required: true,
-        description: 'Exact ref attribute copied from a <memory-image /> marker in conversation memory.',
+        description: 'The short ref attribute of a <memory-image /> marker, for example img-1a2b3c4d5e.',
       },
     },
     output: {
@@ -199,14 +298,18 @@ export function createReadMemoryImageTool(ctx: any): any {
     async execute(args: { ref: string }, exec: any) {
       const ref = args.ref.trim();
       if (ref === '') throw new Error('memory image ref must be a non-empty string');
-      const attachment = referencedAttachment(ctx, exec, ref);
+      const attachments = readableAttachments(ctx, exec);
+      const attachment = referencedAttachment(attachments, ref);
       if (attachment === undefined) {
-        throw new Error('memory image ref is not present in this session or its active root parent: ' + JSON.stringify(ref));
+        const handles = attachments.map((candidate) => memoryImageAlias(candidate.attachmentId)
+          + (candidate.name === undefined ? '' : ' (' + candidate.name + ')'));
+        throw new Error('no single memory image matches ref ' + JSON.stringify(ref)
+          + '; available handles: ' + (handles.length === 0 ? '(none)' : handles.join(', ')));
       }
-      const attachments = ctx.get('attachments');
-      if (attachments === undefined) throw new Error('cannot read memory image: no attachment service is mounted');
+      const store = ctx.get('attachments');
+      if (store === undefined) throw new Error('cannot read memory image: no attachment service is mounted');
       await assertImageCapableRoute(ctx, exec, ref);
-      const stored = await attachments.readImage(attachment, exec.signal);
+      const stored = await store.readImage(attachment, exec.signal);
       return { image: stored.ref };
     },
   });

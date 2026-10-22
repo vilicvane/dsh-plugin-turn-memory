@@ -9,7 +9,11 @@ import { randomUUID } from 'node:crypto';
 
 import { replacementEventSourceSeqs } from './editor.ts';
 import { appendLanding, assertLandingEventsSafe } from './landing-guard.ts';
-import { assertMemoryImagesRetained } from './memory-images.ts';
+import {
+  assertMemoryImagesRetained,
+  collectMemoryImageAttachmentsOf,
+  materializeMemoryImages,
+} from './memory-images.ts';
 import { compressionTurnSource, isTurnMemorySource } from './message-source.ts';
 import {
   DRAFT_SENTINEL,
@@ -27,6 +31,8 @@ export interface LandingJob {
   session: any;
   turn: number;
   targetSeqs: number[];
+  /** Host-owned surface nodes inside the span; the checkpoint shadows them too. */
+  hostSeqs?: number[];
   editor: TurnNodeEditor;
   mutationCount: number;
   workerNumber: number;
@@ -150,9 +156,11 @@ export function validateLanding(
       throw new Error('e2e smoke draft sentinel still exists; refine the generated nodes before finishing');
     }
   }
+  // The host owns image identity, so validation runs on the materialized memory rather
+  // than on the worker's draft: a dropped marker is restored, never rejected.
   assertMemoryImagesRetained(
     job.targetSeqs.map((seq) => events[seq]?.data),
-    nodes.map((node) => node.content).join('\n'),
+    landingNodeTexts(job, events).join('\n'),
     'turn compression',
   );
   // A landing that keeps every changed node a user node rewrites those nodes as
@@ -162,6 +170,25 @@ export function validateLanding(
   if (nodes.every((node) => !node.changed || node.kind === 'user')) {
     validateProjectedToolProtocol(nodes, events);
   }
+}
+
+/**
+ * Final node texts with every image of the segment addressable.
+ *
+ * Image identity is host-owned: each node keeps the markers it already carries, and any
+ * image whose marker the rewrite dropped is appended to the node whose sources carried it.
+ * Leftovers land on the final node so no attachment of the segment is ever lost.
+ */
+function landingNodeTexts(job: LandingJob, events: readonly any[]): string[] {
+  const texts = job.editor.snapshot().map((node) => materializeMemoryImages(
+    node.content,
+    collectMemoryImageAttachmentsOf(node.sourceSeqs.map((seq) => events[seq]?.data)),
+  ));
+  const segmentAttachments = collectMemoryImageAttachmentsOf(job.targetSeqs.map((seq) => events[seq]?.data));
+  if (texts.length > 0 && segmentAttachments.length > 0) {
+    texts[texts.length - 1] = materializeMemoryImages(texts[texts.length - 1], segmentAttachments);
+  }
+  return texts;
 }
 
 function emitLanding(job: LandingJob, marker: any, events: readonly any[]): void {
@@ -179,36 +206,72 @@ function emitLanding(job: LandingJob, marker: any, events: readonly any[]): void
   // replacement requires an open turn. A changed user node can therefore still land as
   // one user/message replacement; a changed assistant or tool node, or any structural
   // merge/split, has to collapse into one user/message checkpoint.
+  const texts = landingNodeTexts(job, events);
   if (nodes.every((node) => !node.changed || node.kind === 'user')) {
-    for (const node of nodes) {
+    for (const [index, node] of nodes.entries()) {
       if (!node.changed) continue;
       const first = node.landingSeqs[0];
       const last = node.landingSeqs[node.landingSeqs.length - 1];
       appendLanding(session, 'user/message', {
         id: randomUUID(),
         role: 'user',
-        content: [{ type: 'text', text: node.content }],
+        content: [{ type: 'text', text: texts[index] }],
         source: marker,
-      }, first, last, replacementEventSourceSeqs(node));
+      }, first, last, [...new Set([
+        ...replacementEventSourceSeqs(node),
+        ...hostSeqsWithin(session, first, last, job.hostSeqs ?? []),
+      ])]);
     }
     return;
   }
   const checkpoint = nodes
-    .map((node) => (node.kind === 'tool' ? 'Tool result' : node.kind === 'assistant' ? 'Assistant' : 'User') + ': ' + node.content)
+    .map((node, index) => (node.kind === 'tool' ? 'Tool result' : node.kind === 'assistant' ? 'Assistant' : 'User') + ': ' + texts[index])
     .join('\n\n');
   appendLanding(session, 'user/message', {
     id: randomUUID(),
     role: 'user',
     content: [{ type: 'text', text: checkpoint }],
     source: marker,
-  }, startSeq, endSeq, [...new Set([...nodes.flatMap((node) => node.sourceSeqs), ...job.targetSeqs])]);
+  }, startSeq, endSeq, [...new Set([
+    ...nodes.flatMap((node) => node.sourceSeqs),
+    ...job.targetSeqs,
+    ...(job.hostSeqs ?? []),
+  ])]);
+}
+
+/**
+ * Host-owned nodes that sit between two landing seqs and therefore get shadowed by the
+ * replacement. The invariant requires every shadowed surface node in `sourceEventSeqs`.
+ */
+function hostSeqsWithin(
+  session: any,
+  first: number,
+  last: number,
+  hostSeqs: readonly number[],
+): number[] {
+  if (hostSeqs.length === 0) return [];
+  const nodes: number[] = session.surface.nodes;
+  const start = nodes.indexOf(first);
+  const end = nodes.indexOf(last);
+  if (start < 0 || end < start) return [];
+  const hostSet = new Set(hostSeqs);
+  return nodes.slice(start, end + 1).filter((seq: number) => hostSet.has(seq));
 }
 
 export function land(job: LandingJob): void {
   const session = job.session;
   const current = session.surface.nodes;
+  const hostSeqs = job.hostSeqs ?? [];
+  const targetSet = new Set(job.targetSeqs);
+  const hostSet = new Set(hostSeqs);
   const firstIndex = current.indexOf(job.targetSeqs[0]);
-  if (firstIndex < 0 || job.targetSeqs.some((seq, index) => current[firstIndex + index] !== seq)) {
+  const lastIndex = current.indexOf(job.targetSeqs[job.targetSeqs.length - 1]);
+  if (firstIndex < 0 || lastIndex < firstIndex) throw new Error('target surface changed before landing');
+  const span: number[] = current.slice(firstIndex, lastIndex + 1);
+  const landed = span.filter((seq: number) => targetSet.has(seq));
+  if (landed.length !== job.targetSeqs.length
+    || landed.some((seq: number, index: number) => seq !== job.targetSeqs[index])
+    || span.some((seq: number) => !targetSet.has(seq) && !hostSet.has(seq))) {
     throw new Error('target surface changed before landing');
   }
   const events = session.snapshotEvents();

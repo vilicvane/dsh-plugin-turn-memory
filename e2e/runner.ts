@@ -297,13 +297,16 @@ async function run(ctx: any): Promise<void> {
         // The remaining work has to look genuinely long, otherwise the continuation notice's
         // "finish in the next few actions" exemption lets the model skip the handoff call.
         // The continued turn is the opposite case: the whole task finishes in one reply there,
-        // so the same exemption must stop it from handing off a second time.
-        text: USER_SENTINEL + ': Call turn_memory_e2e_fixture exactly once in this turn. Do not start the remaining'
-          + ' work here: it is a multi-step review that must run in the continued turn. End this turn by'
-          + ' calling continue_after_turn_compression exactly once, as the active Turn Memory continuation'
-          + ' instruction requires. In the continued turn the whole task finishes in a single reply: do not call'
-          + ' turn_memory_e2e_fixture again, do not hand off again, and reply with exactly ' + CONTINUATION_SENTINEL
-          + ': ' + FINAL_SENTINEL + '.',
+        // so the same exemption must stop it from handing off a second time. Name the two turns
+        // explicitly, otherwise a model that just called the fixture reads its own first turn as
+        // the continued one and finishes the whole task instead of handing off.
+        text: USER_SENTINEL + ': This is the first turn and nothing has been compressed yet.'
+          + ' Call turn_memory_e2e_fixture exactly once in this turn, then end this turn by calling'
+          + ' continue_after_turn_compression exactly once, as the active Turn Memory continuation'
+          + ' instruction requires. The remaining work (a multi-step review) runs in the continued turn'
+          + ' that follows the compression, not here. Only in that continued turn does the whole task'
+          + ' finish in a single reply: do not call turn_memory_e2e_fixture again, do not hand off'
+          + ' again, and reply with exactly ' + CONTINUATION_SENTINEL + ': ' + FINAL_SENTINEL + '.',
       }],
       source: { kind: 'user' },
     });

@@ -13,7 +13,7 @@ Preserve causal order, attribution, and epistemic status. Retain information tha
 
 Compress repetitive execution, adjacent working fragments, progress chatter, stale runtime snapshots, and instructions whose only purpose was to elicit an already-recorded reply. When transient context caused a failure or decision, retain the consequence and relevant condition rather than the entire scaffold.
 
-A source node with `kind=user` is not necessarily human input. Use `origin`: `human` is actual user intent, while `plugin:*` may be injected context or an earlier checkpoint. Attribute runtime and plugin scaffolding to the host side, keeping human nodes for human intent. A later result may resolve an earlier hypothesis; keep the earlier uncertainty visible as the state it was. Use only assigned canonical source and current working memory.
+A source node with `kind=user` is not necessarily human input. Use `origin`: `human` is actual user intent, `host:*` is harness bookkeeping that arrives on the user side (runtime snapshots, notices, skill text), and `plugin:*` is an earlier checkpoint or another plugin's message. Attribute `host:*` to the host side and keep human nodes for human intent; a `host:*` notice may still quote an external result, so preserve the fact it reports. A later result may resolve an earlier hypothesis; keep the earlier uncertainty visible as the state it was. Use only assigned canonical source and current working memory.
 
 ## Preserve lazy image memory
 

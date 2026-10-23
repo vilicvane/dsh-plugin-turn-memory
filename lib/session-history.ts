@@ -1,7 +1,8 @@
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
 import { contentText, eventMemoryKind, reasoningStats } from './content.ts';
-import { turnMemoryMarkerOf, pluginSourceName } from './message-source.ts';
+import { turnMemoryMarkerOf } from './message-source.ts';
+import { describeEventOrigin } from './provenance.ts';
 import { collectMemoryImageAttachments, renderMemoryImageReference } from './memory-images.ts';
 
 export const READ_SESSION_HISTORY_TOOL_NAME = 'read_session_history';
@@ -69,16 +70,6 @@ function eventContent(event: any): unknown {
 
 function xmlAttribute(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
-}
-
-function eventOrigin(event: any): string {
-  const source = event?.data?.source ?? event?.data?.message?.source;
-  if (source?.kind === 'user') return 'human';
-  if (source?.kind === 'model') return 'model:' + String(source.provider ?? '?') + '/' + String(source.model ?? '?');
-  const plugin = pluginSourceName(source);
-  if (plugin !== undefined) return 'plugin:' + plugin;
-  if (event?.type === 'tool/result') return 'tool';
-  return source?.kind === undefined ? 'unknown' : String(source.kind);
 }
 
 /** Render the original durable block order, including reasoning that ordinary surface text omits. */
@@ -179,11 +170,12 @@ export function renderSessionTurnHistory(session: any, turn: number): string {
   const span = completedTurnSpans(session).find((candidate) => candidate.turn === turn);
   if (span === undefined) throw new Error('completed session turn ' + turn + ' was not found');
   const current = new Set<number>(session.surface?.nodes ?? []);
+  const events = session.snapshotEvents();
   const nodes = spanEvents(session, span).map((event) => {
     const seq = Number(event.seq);
     return '<session-history-node seq="' + seq
       + '" kind="' + eventMemoryKind(event)
-      + '" origin="' + xmlAttribute(eventOrigin(event))
+      + '" origin="' + xmlAttribute(describeEventOrigin(event, events))
       + '" surface="' + (current.has(seq) ? 'current' : 'shadowed') + '">\n'
       + renderRawSessionContent(eventContent(event))
       + '\n</session-history-node>';

@@ -1,5 +1,6 @@
 import { eventContentText, eventMemoryKind } from './content.ts';
-import { isCompactionCheckpointSource, pluginSourceName, turnMemoryMarkerTurn } from './message-source.ts';
+import { isCompactionCheckpointSource, turnMemoryMarkerTurn } from './message-source.ts';
+import { describeEventOrigin, isReSuppliedHostContext, resolveLifecycleSource } from './provenance.ts';
 
 export interface PricedNode {
   seq: number;
@@ -52,30 +53,9 @@ function renderTurnRange(turns: readonly number[]): string {
   return first === last ? 'turn=' + first : 'turns=' + first + '..' + last;
 }
 
-/**
- * Host-injected context that every step re-supplies: runtime snapshots, workspace
- * instructions, and skill catalogs. They are scaffolding rather than conversation
- * memory, so a session checkpoint must neither quote nor summarize them.
- */
-const SCAFFOLDING_SOURCE_KINDS = new Set([
-  'agent-instructions',
-  'runtime-context',
-  'skill-catalog',
-  'time-context',
-]);
-
-function isScaffoldingNode(event: any): boolean {
-  return SCAFFOLDING_SOURCE_KINDS.has(event?.data?.source?.kind);
-}
-
-function eventOrigin(event: any): string {
-  const source = event?.data?.source ?? event?.data?.message?.source;
-  if (source?.kind === 'user') return 'human';
-  if (source?.kind === 'model') return 'model:' + String(source.provider ?? '?') + '/' + String(source.model ?? '?');
-  const plugin = pluginSourceName(source);
-  if (plugin !== undefined) return 'plugin:' + plugin;
-  if (event?.type === 'tool/result') return 'tool';
-  return source?.kind === undefined ? 'unknown' : String(source.kind);
+/** Whether one surface node is host context that carries no conversation-specific information. */
+function isScaffoldingNode(event: any, events: readonly any[]): boolean {
+  return isReSuppliedHostContext(resolveLifecycleSource(event, events));
 }
 
 /** Stable semantic unit keys for current surface positions; equal adjacent keys belong to one completed turn. */
@@ -97,9 +77,10 @@ export function buildSessionSegments(
   if (pricedNodes.length === 0) throw new Error('session segmentation requires at least one selected surface node');
   if (!Number.isSafeInteger(maxTokens) || maxTokens <= 0) throw new Error('segment maxTokens must be positive');
   const turnBySeq = eventTurns(session);
+  const events = session.snapshotEvents();
   const units: TurnUnit[] = [];
   for (const priced of pricedNodes) {
-    const event = session.snapshotEvents()[priced.seq];
+    const event = events[priced.seq];
     if (event === undefined || event.seq !== priced.seq) throw new Error('session compaction: surface seq ' + priced.seq + ' has no matching event');
     if (eventMemoryKind(event) === undefined) {
       // DSH 0.2.1 appends the step's system/developer prompt as a surface node.
@@ -109,7 +90,7 @@ export function buildSessionSegments(
       if (event?.type === 'system/message' || event?.type === 'developer/message') continue;
       throw new Error('session compaction: surface seq ' + priced.seq + ' is not a message node');
     }
-    if (isScaffoldingNode(event)) continue;
+    if (isScaffoldingNode(event, events)) continue;
     const turn = turnBySeq.get(priced.seq);
     const key = turn === undefined ? 'standalone:' + priced.seq : 'turn:' + turn;
     const last = units[units.length - 1];
@@ -169,12 +150,13 @@ export function renderSegmentCatalog(
 
 export function renderSegmentSource(session: any, segment: SessionSegment): string {
   const turnBySeq = eventTurns(session);
+  const events = session.snapshotEvents();
   return segment.seqs.map((seq, index) => {
-    const event = session.snapshotEvents()[seq];
+    const event = events[seq];
     const kind = eventMemoryKind(event);
     const turn = turnBySeq.get(seq);
     return [
-      '<source-node id="' + segment.id + 'n' + (index + 1) + '" kind="' + kind + '" origin="' + eventOrigin(event) + '"' + (turn === undefined ? '' : ' turn="' + turn + '"') + '>',
+      '<source-node id="' + segment.id + 'n' + (index + 1) + '" kind="' + kind + '" origin="' + describeEventOrigin(event, events) + '"' + (turn === undefined ? '' : ' turn="' + turn + '"') + '>',
       eventContentText(event),
       '</source-node>',
     ].join('\n');
@@ -183,14 +165,15 @@ export function renderSegmentSource(session: any, segment: SessionSegment): stri
 
 export function renderSegmentNodeDirectory(session: any, segment: SessionSegment, previewChars = 120): string {
   const turnBySeq = eventTurns(session);
+  const events = session.snapshotEvents();
   return segment.seqs.map((seq, index) => {
-    const event = session.snapshotEvents()[seq];
+    const event = events[seq];
     const text = eventContentText(event);
     const turn = turnBySeq.get(seq);
     return [
       segment.id + 'n' + (index + 1),
       String(eventMemoryKind(event)),
-      'origin=' + eventOrigin(event),
+      'origin=' + describeEventOrigin(event, events),
       turn === undefined ? 'standalone' : 'turn=' + turn,
       text.length + ' chars',
       'preview=' + JSON.stringify(preview(text, previewChars)),
@@ -233,11 +216,12 @@ export function readSessionSourceNodes(
     }
   }
   const turnBySeq = eventTurns(session);
+  const events = session.snapshotEvents();
   const rendered = selected.map((node) => {
-    const event = session.snapshotEvents()[node.seq];
+    const event = events[node.seq];
     const turn = turnBySeq.get(node.seq);
     return [
-      '<source-node id="' + node.id + '" kind="' + eventMemoryKind(event) + '" origin="' + eventOrigin(event) + '"' + (turn === undefined ? '' : ' turn="' + turn + '"') + '>',
+      '<source-node id="' + node.id + '" kind="' + eventMemoryKind(event) + '" origin="' + describeEventOrigin(event, events) + '"' + (turn === undefined ? '' : ' turn="' + turn + '"') + '>',
       eventContentText(event),
       '</source-node>',
     ].join('\n');

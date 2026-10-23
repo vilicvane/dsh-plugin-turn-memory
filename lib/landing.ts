@@ -14,7 +14,8 @@ import {
   collectMemoryImageAttachmentsOf,
   materializeMemoryImages,
 } from './memory-images.ts';
-import { compressionTurnSource, isTurnMemorySource } from './message-source.ts';
+import { compressionTurnSource } from './message-source.ts';
+import { isInjectedHostSource, resolveLifecycleSource } from './provenance.ts';
 import {
   DRAFT_SENTINEL,
   E2E_FINAL_SENTINEL,
@@ -48,72 +49,12 @@ export interface LandingShape {
   closesLogicalTurn: boolean;
 }
 
-/** Host-injected user messages that are never a human request. */
-const HOST_SCAFFOLDING_KINDS: ReadonlySet<string> = new Set([
-  'agent-instructions',
-  'runtime-context',
-  'skill-catalog',
-  'time-context',
-  'skill-invocation',
-  'tool-jobs',
-]);
-
-/** Context forms that mark an injected message rather than human input. */
-const HOST_SCAFFOLDING_FORMS: ReadonlySet<string> = new Set([
-  'instructions',
-  'catalog',
-  'snapshot',
-  'notice',
-]);
-
-/**
- * Whether one user/message source is host scaffolding rather than human input.
- *
- * Steering is ordinary human input carried by a plain `user` source, so a steered
- * segment still counts as human: the merged intent belongs in a user node even when
- * the segment opened with a continuation notice. Unknown kinds stay human, which
- * keeps the stricter user-first shape for anything this plugin does not recognize.
- */
-export function isHostScaffoldingSource(source: any): boolean {
-  if (source === null || typeof source !== 'object') return false;
-  if (isTurnMemorySource(source)) return true;
-  if (HOST_SCAFFOLDING_KINDS.has(source.kind)) return true;
-  if (typeof source.form === 'string' && HOST_SCAFFOLDING_FORMS.has(source.form)) return true;
-  return false;
-}
-
-/** Lifecycle marker kinds that copy an existing message instead of adding a new one. */
-const LIFECYCLE_MARKER_KINDS: ReadonlySet<string> = new Set([
-  'turn-memory-pending',
-  'turn-memory-failed',
-]);
-
-/**
- * Resolve the message a lifecycle marker copy replaced.
- *
- * `turn/end` rewrites the turn's leading user message into a `turn-memory-pending` copy
- * carrying the marker source, so the recorded source alone no longer says whether the
- * human or the host opened the turn. The copy keeps the shadowed seq in
- * `sourceEventSeqs`, so provenance (and steering added later in the turn) stays readable.
- */
-export function resolveHumanSource(event: any, events: readonly any[]): any {
-  let current = event;
-  for (let depth = 0; current !== undefined && depth < 8; depth += 1) {
-    const source = current?.data?.source;
-    if (!LIFECYCLE_MARKER_KINDS.has(source?.kind)) return source;
-    const originSeq = Array.isArray(current?.sourceEventSeqs) ? current.sourceEventSeqs[0] : undefined;
-    if (!Number.isSafeInteger(originSeq) || events[originSeq] === undefined) return source;
-    current = events[originSeq];
-  }
-  return current?.data?.source;
-}
-
 /** Whether the compressed segment carries any human input at all. */
 export function turnHasHumanInput(job: LandingJob, events: readonly any[]): boolean {
   for (const seq of job.targetSeqs) {
     const event = events[seq];
     if (event?.type !== 'user/message') continue;
-    if (!isHostScaffoldingSource(resolveHumanSource(event, events))) return true;
+    if (!isInjectedHostSource(resolveLifecycleSource(event, events))) return true;
   }
   return false;
 }
